@@ -158,46 +158,55 @@ def sky_unit(azimuth, elevation):
 
 
 def classify_sky(positions, horizon):
-    """Sample body disks against terrain; also test Earth occulting the Sun.
+    """Test each centre, then four limb points only when the centre is blocked.
 
-    Partial visibility is approximate at the DEM/profile sampling resolution.
-    These geometric tests do not model the illuminated phase of Earth's disk.
+    A clear centre counts as visible. The four extra points are an approximate
+    test for partial visibility and may miss thin crescents or terrain gaps.
+    Earth's illuminated phase is not modelled.
     """
     result = {}
+    bearings = np.arange(360)
     earth_center = sky_unit(positions["Earth"]["az"], positions["Earth"]["el"])
-    earth_radius = np.radians(positions["Earth"]["radius"])
-    # Centre plus two rings: check interior and limb, including narrow crescents.
-    theta = np.tile(np.linspace(0, 2 * np.pi, 48, endpoint=False), 2)
-    fractions = np.repeat([0.5, 1.0], 48)
-    theta, fractions = np.r_[0, theta], np.r_[0, fractions]
+    earth_radius = np.radians(np.asarray(positions["Earth"]["radius"]))
+    earth_limit = np.cos(earth_radius)
     for name in ("Sun", "Earth"):
         body = {key: np.asarray(value).copy() for key, value in positions[name].items()}
         az, el = np.radians(body["az"]), np.radians(body["el"])
         centre = sky_unit(body["az"], body["el"])
-        horizontal = np.stack((np.cos(az), -np.sin(az), np.zeros_like(az)), axis=-1)
-        vertical = np.stack((-np.sin(el) * np.sin(az), -np.sin(el) * np.cos(az), np.cos(el)), axis=-1)
-        rho = np.radians(body["radius"])[:, None] * fractions[None, :]
-        rays = (np.cos(rho)[..., None] * centre[:, None, :]
-                + np.sin(rho)[..., None] * (
-                    np.cos(theta)[None, :, None] * vertical[:, None, :]
-                    + np.sin(theta)[None, :, None] * horizontal[:, None, :]))
-        ray_az = np.degrees(np.arctan2(rays[..., 0], rays[..., 1])) % 360.0
-        ray_el = np.degrees(np.arctan2(rays[..., 2], np.hypot(rays[..., 0], rays[..., 1])))
-        terrain = np.interp(ray_az, np.arange(360), horizon, period=360)
-        terrain_clear = ray_el > terrain
-        clear = terrain_clear.copy()
+        terrain = np.interp(body["az"], bearings, horizon, period=360)
+        terrain_clear = body["el"] > terrain
+        earth_clear = np.ones(len(el), dtype=bool)
         if name == "Sun":
-            separation = np.arccos(np.clip(np.sum(rays * earth_center[:, None, :], axis=-1), -1, 1))
-            clear &= separation > earth_radius[:, None]
-        visible = clear.any(axis=1)
-        full = clear.all(axis=1)
-        state = np.full(len(visible), "Hidden by terrain", dtype=object)
+            earth_clear = np.sum(centre * earth_center, axis=-1) < earth_limit
+        center_clear = terrain_clear & earth_clear
+        visible = center_clear.copy()
+        state = np.full(len(el), "Hidden by terrain", dtype=object)
         if name == "Sun":
-            state[terrain_clear.any(axis=1) & ~visible] = "Eclipsed by Earth"
-        state[visible & ~full] = "Partly visible"
-        state[full] = "Visible"
-        body.update(visible=visible, state=state,
-                    terrain=np.interp(body["az"], np.arange(360), horizon, period=360))
+            state[terrain_clear & ~earth_clear] = "Eclipsed by Earth"
+        state[center_clear] = "Visible"
+
+        # Chunk the exceptional samples to keep memory bounded for long intervals.
+        blocked = np.flatnonzero(~center_clear)
+        for offset in range(0, len(blocked), 8192):
+            idx = blocked[offset:offset + 8192]
+            a, e = az[idx], el[idx]
+            horizontal = np.stack((np.cos(a), -np.sin(a), np.zeros_like(a)), axis=-1)
+            vertical = np.stack((-np.sin(e) * np.sin(a), -np.sin(e) * np.cos(a), np.cos(e)), axis=-1)
+            rho = np.radians(body["radius"][idx])[:, None, None]
+            tangents = np.stack((vertical, -vertical, horizontal, -horizontal), axis=1)
+            rays = np.cos(rho) * centre[idx, None, :] + np.sin(rho) * tangents
+            ray_az = np.degrees(np.arctan2(rays[..., 0], rays[..., 1])) % 360.0
+            ray_el = np.degrees(np.arctan2(rays[..., 2], np.hypot(rays[..., 0], rays[..., 1])))
+            ray_terrain_clear = ray_el > np.interp(ray_az, bearings, horizon, period=360)
+            ray_clear = ray_terrain_clear.copy()
+            if name == "Sun":
+                ray_clear &= np.sum(rays * earth_center[idx, None, :], axis=-1) < earth_limit[idx, None]
+                terrain_any = terrain_clear[idx] | ray_terrain_clear.any(axis=1)
+                state[idx[terrain_any]] = "Eclipsed by Earth"
+            partial = ray_clear.any(axis=1)
+            visible[idx[partial]] = True
+            state[idx[partial]] = "Partly visible"
+        body.update(visible=visible, state=state, terrain=terrain)
         result[name] = body
     return result
 
@@ -1256,7 +1265,7 @@ class MoonWindow:
                 lines.append("Visible samples: " + "  |  ".join(counts))
             if self._sky_status:
                 lines.append(self._sky_status)
-            lines.append("Partial visibility is approximate; terrain horizon sampled at 1 deg.")
+            lines.append("Center visible = visible; partial is approximate (4 limb points).")
         self.stats.SetInput("\n".join(lines))
 
     def request_sky_update(self):
