@@ -33,6 +33,22 @@ def load_color_texture(path):
     texture_data.GetPointData().SetScalars(pixels)
     return rgb, texture_data
 
+TERRAIN_MAX_PITCH = 89.0       # degrees up / down in the terrain view (never past the zenith or nadir)
+TERRAIN_LOOK_INVERT_Y = False  # True: dragging up looks up (flight-simulator style) instead of down
+
+
+def terrain_grid_axis(half_width_km, side):
+    """Grid lines from -half_width to +half_width (side must be odd): dense near 0, coarser far away.
+
+    Spacing grows with distance (about 4 m next to the observer, 2 km at the rim), and a line sits
+    exactly at 0 so one vertex is the ground point below the observer.
+    """
+    if side % 2 == 0:
+        raise ValueError("The terrain grid needs an odd number of lines.")
+    t = np.arange(-(side // 2), side // 2 + 1) / (side // 2)
+    return half_width_km * t * np.abs(t)
+
+
 class GlobeMixin:
     def _init_globe(self):
         """Create the Moon mesh, texture, horizon/observer/grid actors, pole marks and the picker."""
@@ -130,6 +146,7 @@ class GlobeMixin:
         self.grid_caption = self.make_text(0.025, 0.23, 14)
         # Comparison points: a coloured surface mark and a screen-space number each (refresh_point_marks).
         self.point_marks = []
+        self._terrain_heading = self._terrain_pitch = 0.0  # terrain view look direction, degrees
         self._points_note = ""
         self.points_caption = self.make_text(0.025, 0.26, 14)
         # North and south pole marks: a point on the surface and a screen-space letter.
@@ -423,7 +440,7 @@ class GlobeMixin:
     def constrain_camera(self):
         camera = self.renderer.GetActiveCamera()
         if self._terrain_view:
-            camera.SetClippingRange(0.25 / MOON_RADIUS_M, 4.0)
+            camera.SetClippingRange(*self.terrain_clipping())
             return
         position = np.array(camera.GetPosition())
         radius = float(np.linalg.norm(position))
@@ -524,9 +541,15 @@ class GlobeMixin:
             self.window.Render()
 
     def make_terrain_actor(self, half_width_km=250.0, side=501):
-        """Build a local physical-elevation mesh centered on the observer."""
+        """Local terrain mesh around the observer, in metres: x east, y north, z up.
+
+        The origin is the ground point below the observer, so the eye is at (0, 0, eye height). Working
+        in metres around the camera (instead of in unit-sphere coordinates) keeps the 32-bit vertex
+        precision at centimetres, and the grid is dense near the observer so the ground under and
+        around the camera follows the elevation map smoothly. Returns (actor, ground elevation in m).
+        """
         from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
-        axis = np.linspace(-half_width_km, half_width_km, side)
+        axis = terrain_grid_axis(half_width_km, side)
         east_km, north_km = np.meshgrid(axis, axis)
         distance = np.hypot(east_km, north_km)
         lat0, lon0 = np.radians([self.lat, self.lon])
@@ -536,14 +559,16 @@ class GlobeMixin:
         theta = distance * 1000.0 / MOON_RADIUS_M
         # sinc(theta / pi) / radius avoids division by zero at the observer.
         scale = np.sinc(theta / np.pi) * 1000.0 / MOON_RADIUS_M
-        xyz = (np.cos(theta)[..., None] * up + scale[..., None] *
-               (north_km[..., None] * north + east_km[..., None] * east))
-        lat = np.degrees(np.arctan2(xyz[..., 2], np.hypot(xyz[..., 0], xyz[..., 1])))
-        lon = np.degrees(np.arctan2(xyz[..., 1], xyz[..., 0]))
-        radius = 1.0 + sample_dem_bilinear(lat, lon) / MOON_RADIUS_M
-        xyz *= radius[..., None]
+        direction = (np.cos(theta)[..., None] * up + scale[..., None] *
+                     (north_km[..., None] * north + east_km[..., None] * east))
+        lat = np.degrees(np.arctan2(direction[..., 2], np.hypot(direction[..., 0], direction[..., 1])))
+        lon = np.degrees(np.arctan2(direction[..., 1], direction[..., 0]))
+        ground_m = float(sample_dem_bilinear(self.lat, self.lon))
+        radius_m = MOON_RADIUS_M + sample_dem_bilinear(lat, lon)
+        relative = direction * radius_m[..., None] - up * (MOON_RADIUS_M + ground_m)
+        local = np.stack((relative @ east, relative @ north, relative @ up), axis=-1)
         points = self.vtk.vtkPoints()
-        points.SetData(numpy_to_vtk(xyz.reshape(-1, 3).astype(np.float32), deep=True))
+        points.SetData(numpy_to_vtk(local.reshape(-1, 3).astype(np.float32), deep=True))
         indices = np.arange(side * side).reshape(side, side)
         cells_np = np.column_stack((indices[:-1, :-1].ravel(), indices[:-1, 1:].ravel(),
                                     indices[1:, 1:].ravel(), indices[1:, :-1].ravel()))
@@ -553,8 +578,9 @@ class GlobeMixin:
                       numpy_to_vtkIdTypeArray(cells_np.astype(np.int64).ravel(), deep=True))
         # Unwrap longitude around the observer to avoid a visible texture seam.
         lon_unwrapped = self.lon + (lon - self.lon + 180.0) % 360.0 - 180.0
+        # Same convention as the globe mesh: the first image row is north, so v = (90 - lat) / 180.
         uv = np.column_stack(((lon_unwrapped.ravel() + 180.0) / 360.0,
-                              (lat.ravel() + 90.0) / 180.0)).astype(np.float32)
+                              (90.0 - lat.ravel()) / 180.0)).astype(np.float32)
         data = self.vtk.vtkPolyData()
         data.SetPoints(points)
         data.SetPolys(cells)
@@ -566,7 +592,26 @@ class GlobeMixin:
         actor.SetTexture(self.texture)
         actor.GetProperty().LightingOff()
         actor.PickableOff()
-        return actor, up, north
+        return actor, ground_m
+
+    def terrain_clipping(self):
+        """Clipping range in metres. Nothing is nearer than the ground below the eye, so near can be large."""
+        return min(max(0.05, 0.4 * float(terrain.EYE_HEIGHT_M)), 5.0), 4.0e5
+
+    def place_terrain_camera(self):
+        """Eye at the current eye height, looking along (heading, pitch); the view-up stays vertical.
+
+        Looking around only changes two angles (heading from north, pitch above the horizon), so the
+        camera can never roll or tilt sideways and the ground is always below the eye.
+        """
+        camera = self.renderer.GetActiveCamera()
+        heading, pitch = np.radians(self._terrain_heading), np.radians(self._terrain_pitch)
+        forward = np.array([np.cos(pitch) * np.sin(heading), np.cos(pitch) * np.cos(heading), np.sin(pitch)])
+        eye = np.array([0.0, 0.0, float(terrain.EYE_HEIGHT_M)])
+        camera.SetPosition(*eye)
+        camera.SetFocalPoint(*(eye + forward * 10.0))
+        camera.SetViewUp(0.0, 0.0, 1.0)
+        camera.SetClippingRange(*self.terrain_clipping())
 
     def toggle_terrain_view(self, render=True):
         """Switch between the globe and a look-around view at the observer."""
@@ -574,26 +619,30 @@ class GlobeMixin:
             return
         camera = self.renderer.GetActiveCamera()
         if not self._terrain_view:
-            actor, up, north = self.make_terrain_actor()
+            actor, _ = self.make_terrain_actor()
             self._terrain_saved_camera = (camera.GetPosition(), camera.GetFocalPoint(),
                                           camera.GetViewUp(), camera.GetViewAngle())
-            self._terrain_actor = actor
-            self.renderer.AddActor(actor)
+            # Never RemoveActor() the terrain actor: VTK then releases the GPU copy of the shared
+            # texture, and re-uploading the full-size texture (with mipmaps) takes about 2 seconds
+            # when returning to the globe. Keep one hidden actor and only swap its mesh.
+            if self._terrain_actor is None:
+                self._terrain_actor = actor
+                self.renderer.AddActor(actor)
+            else:
+                self._terrain_actor.GetMapper().SetInputData(actor.GetMapper().GetInput())
+                self._terrain_actor.SetVisibility(True)
             self.moon.SetVisibility(False)
             self.horizon.SetVisibility(False)
             self.observer.SetVisibility(False)
             self._terrain_view = True
-            position = up * (1.0 + (float(sample_dem_bilinear(self.lat, self.lon)) + 2.0) / MOON_RADIUS_M)
-            camera.SetPosition(*position)
-            camera.SetFocalPoint(*(position + north * 0.01))
-            camera.SetViewUp(*up)
+            self._terrain_heading, self._terrain_pitch = 0.0, 0.0  # start looking north at the horizon
             camera.SetViewAngle(75)
-            self.constrain_camera()
+            self.place_terrain_camera()
             self.help.SetInput("Terrain view: left-drag to look   |   Wheel: field of view\n"
-                               "V: return to globe   |   G: coordinates   |   T: time interval")
+                               "V: return to globe   |   G: coordinates   |   T: time interval\n"
+                               "E: eye height")
         else:
-            self.renderer.RemoveActor(self._terrain_actor)
-            self._terrain_actor = None
+            self._terrain_actor.SetVisibility(False)
             self._terrain_view = False
             self.moon.SetVisibility(True)
             self.horizon.SetVisibility(True)
@@ -609,12 +658,15 @@ class GlobeMixin:
             self.window.Render()
 
     def terrain_look(self, dx, dy, render=True):
+        """Drag to look around: the scene follows the mouse. Heading wraps, pitch stops at +/-89 degrees."""
         camera = self.renderer.GetActiveCamera()
         height = max(self.window.GetSize()[1], 1)
         speed = np.degrees(2 * np.tan(np.radians(camera.GetViewAngle()) / 2) / height)
-        camera.Yaw(dx * speed)
-        camera.Pitch(-dy * speed)
-        camera.OrthogonalizeViewUp()
+        vertical = -1.0 if TERRAIN_LOOK_INVERT_Y else 1.0
+        self._terrain_heading = (self._terrain_heading - dx * speed) % 360.0
+        self._terrain_pitch = float(np.clip(self._terrain_pitch - vertical * dy * speed,
+                                            -TERRAIN_MAX_PITCH, TERRAIN_MAX_PITCH))
+        self.place_terrain_camera()
         if render:
             self.window.Render()
 

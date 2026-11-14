@@ -90,7 +90,7 @@ class HudMixin:
     GLOBE_HELP = ("Left-drag: orbit   |   Middle/Shift-drag: pan\n"
                   "Ctrl-drag: orbit cursor point   |   Wheel: zoom   |   Click: select\n"
                   "G: coordinates   |   T: time interval (2+ points: compare)   |   V: terrain view\n"
-                  "R: reset   |   F: fullscreen   |   Esc: close\n"
+                  "R: reset   |   F: fullscreen   |   E: eye height\n"
                   "Cyan: local horizon   |   Orange: observer   |   Relief: 3x\n"
                   "L: lat/lon grid (auto detail)   |   Red N / blue S: poles\n"
                   "Shift+click / A: add comparison point   |   P: manage, save, load points")

@@ -11,7 +11,7 @@ Ctrl-left-drag (or Ctrl-middle-drag) orbits the terrain point under the cursor.
 Click the Moon to select an observer.
 Zoom stops above the terrain. The inset shows all 360 horizon bearings.
 Prepared maps are saved beside this script for later runs.
-Press G to enter latitude, longitude; L to hide/show the lat/lon grid (its spacing follows the zoom); V for terrain view; R to reset; F for fullscreen; Escape to close.
+Press G to enter latitude, longitude; L to hide/show the lat/lon grid (its spacing follows the zoom); V for terrain view; E to set the eye height; R to reset; F for fullscreen. Escape does nothing; close the window to quit.
 Sun/Earth positions use Skyfield (offline, limited date range) or JPL Horizons (internet, wide range);
 you pick the model in the time interval window, and only that model is queried. Time defaults to UTC now.
 Press T to choose a time range; this opens a fullscreen horizon + Sun/Earth graph.
@@ -255,6 +255,65 @@ class TimeIntervalDialog:
         self.window.grab_set()
         self.fields[0].focus_force()
         self.fields[0].selection_range(0, "end")
+
+
+class EyeHeightDialog:
+    """Observer eye height above the ground, in metres (opened with E)."""
+
+    def __init__(self, parent, value, on_submit):
+        import tkinter as tk
+        from tkinter import ttk
+
+        self.on_submit = on_submit
+        self.window = tk.Toplevel(parent)
+        self.window.title("Eye height")
+        self.window.resizable(False, False)
+        frame = ttk.Frame(self.window, padding=14)
+        frame.grid(sticky="nsew")
+        ttk.Label(frame, text=f"Eye height above the ground, in metres "
+                              f"({terrain.MIN_EYE_HEIGHT_M:g} to {terrain.MAX_EYE_HEIGHT_M:g})").grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        self.entry = ttk.Entry(frame, width=12)
+        self.entry.insert(0, f"{value:g}")
+        self.entry.grid(row=1, column=0, sticky="w")
+        ttk.Label(frame, text="m").grid(row=1, column=1, sticky="w", padx=(4, 12))
+        for column, preset in enumerate(("1", "2", "10", "100"), start=0):
+            ttk.Button(frame, text=f"{preset} m", width=6, command=lambda p=preset: self.use(p)).grid(
+                row=2, column=column, sticky="w", pady=(8, 0), padx=(0, 4))
+        ttk.Label(frame, justify="left", wraplength=360,
+                  text="Used for the terrain horizon, the panorama, the Sun / Earth altitude and the "
+                       "terrain view camera. The current point (or comparison) is recalculated.").grid(
+            row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        self.error = ttk.Label(frame, foreground="#c02020", wraplength=360)
+        self.error.grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 2))
+        bottom = ttk.Frame(frame)
+        bottom.grid(row=5, column=0, columnspan=4, sticky="e", pady=(6, 0))
+        ttk.Button(bottom, text="Cancel", command=self.window.destroy).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(bottom, text="Apply", command=self.apply).grid(row=0, column=1)
+        self.entry.bind("<Return>", self.apply)
+        self.entry.bind("<KP_Enter>", self.apply)
+        self.entry.bind("<Control-a>", lambda event: (event.widget.selection_range(0, "end"), "break")[-1])
+        self.window.bind("<Escape>", lambda event: self.window.destroy())
+        self.window.update_idletasks()
+        self.window.lift()
+        self.window.grab_set()
+        self.entry.focus_force()
+        self.entry.selection_range(0, "end")
+
+    def use(self, text):
+        self.entry.delete(0, "end")
+        self.entry.insert(0, text)
+        self.entry.focus_set()
+
+    def apply(self, event=None):
+        try:
+            self.on_submit(self.entry.get().strip().replace(",", "."))
+        except ValueError as error:
+            self.error.configure(text=str(error))
+            self.entry.focus_set()
+        else:
+            self.window.destroy()
+        return "break"
 
 
 class PointsDialog:
@@ -656,8 +715,7 @@ class MoonWindow(GlobeMixin, HudMixin):
                 key = (interactor.GetKeySym() or "").lower()
                 if owner.coordinate_editing:
                     return  # The native editor handles its own keyboard events.
-                elif key == "escape":
-                    owner.interactor.TerminateApp()
+                # Escape is deliberately ignored (it used to quit); close the window to leave the program.
                 elif owner._graph_expanded and key in ("up", "down", "prior", "next", "home", "end"):
                     owner.scroll_key(key)
                 elif owner._graph_expanded and key in ("left", "right"):
@@ -675,6 +733,8 @@ class MoonWindow(GlobeMixin, HudMixin):
                     owner.begin_coordinate_entry()
                 elif key == "t":
                     owner.begin_time_entry()
+                elif key == "e":
+                    owner.begin_eye_height_entry()
                 elif key == "s":
                     owner.begin_visibility_search()
                 elif key == "i":
@@ -1010,7 +1070,7 @@ class MoonWindow(GlobeMixin, HudMixin):
 
     @staticmethod
     def site_altitude_km(lat, lon):
-        return (float(sample_dem_bilinear(lat, lon)) + 2.0) / 1000.0
+        return (float(sample_dem_bilinear(lat, lon)) + terrain.EYE_HEIGHT_M) / 1000.0
 
     def sky_for_point(self, lon, lat, altitude, epochs, horizon, methods, progress):
         """Sun / Earth data of one point for every requested model: (data or None, error text or None)."""
@@ -1152,15 +1212,21 @@ class MoonWindow(GlobeMixin, HudMixin):
             # viewer and the search window remain responsive.
             self._visibility_dialog = SearchDialog(root, self.fetch_skyfield,
                                                     self._search_session, self.finish_visibility_search,
-                                                    existing_points=lambda: list(self._points))
+                                                    existing_points=lambda: list(self._points),
+                                                    on_apply=self.apply_visibility_search)
         except tk.TclError as error:
             print(f"Could not open visibility search: {error}", file=sys.stderr)
 
     def finish_visibility_search(self, dialog):
+        """The search window was closed: remember its results for the next time it is opened."""
         self._visibility_dialog = None
         if dialog.finished:
             self._search_session = {"results": dialog.results, "parameters": dialog.last_parameters,
                                     "cancelled": dialog.was_cancelled}
+        self.window.Render()
+
+    def apply_visibility_search(self, dialog):
+        """A button of the (still open) search window asked for markers / points / analysis."""
         if dialog.clear_markers:
             self.show_visibility_markers([])
             self._search_selected = None
@@ -1495,6 +1561,46 @@ class MoonWindow(GlobeMixin, HudMixin):
             self.coordinate_editing = False
             self.window.Render()
 
+    def begin_eye_height_entry(self):
+        if self.coordinate_editing:
+            return
+        try:
+            import tkinter as tk
+        except ImportError:
+            print("Eye height editing needs Tkinter (Debian/Ubuntu: python3-tk).", file=sys.stderr)
+            return
+        dialog = None
+        try:
+            root = self.get_native_root()
+            self.coordinate_editing = True
+            dialog = EyeHeightDialog(root, terrain.EYE_HEIGHT_M, self.set_eye_height)
+            root.wait_window(dialog.window)
+        except tk.TclError as error:
+            print(f"Could not open the eye height editor: {error}", file=sys.stderr)
+        finally:
+            if dialog is not None:
+                try:
+                    dialog.window.destroy()
+                except tk.TclError:
+                    pass
+            self.coordinate_editing = False
+            self.window.Render()
+
+    def set_eye_height(self, value):
+        """Change the observer eye height (m) and recalculate everything that depends on it."""
+        old = terrain.EYE_HEIGHT_M
+        new = terrain.set_eye_height(value)  # ValueError: shown by the dialog
+        if abs(new - old) < 1e-12:
+            return
+        if self._compare_active and self._graph_expanded:
+            self.request_sky_update()  # the worker recomputes every point's horizon and Sun / Earth data
+        else:
+            selected = self._search_selected  # select_location forgets it; the eye height does not change which point it is
+            self.select_location(self.lat, self.lon, render=False)
+            self._search_selected = selected
+        if self._terrain_view:
+            self.place_terrain_camera()
+
     def pump_coordinate_clipboard(self, obj=None, event=None):
         if self._coordinate_root is not None and not self.coordinate_editing and not self._tk_pump_active:
             self._tk_pump_active = True
@@ -1579,7 +1685,7 @@ class MoonWindow(GlobeMixin, HudMixin):
             f"Elevation {elevation:+,.0f} m    Slope {compute_slope_deg(lat, lon):.1f} deg\n"
             f"Horizon distance {np.min(distances):.1f} to {np.max(distances):.1f} km\n"
             f"Horizon angle {np.min(angles):+.2f} to {np.max(angles):+.2f} deg\n"
-            "360 bearings; 2 m eye height; terrain search to 250 km\n"
+            f"360 bearings; {terrain.EYE_HEIGHT_M:g} m eye height (E: change); terrain search to 250 km\n"
             f"Texture: {self.texture_dimensions[0]} x {self.texture_dimensions[1]}")
 
     # ------------------------------------------------------------------ point comparison
@@ -1786,7 +1892,7 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._sky_timer = self.interactor.CreateRepeatingTimer(100)
         self.poll_sky()
         self.window.Render()
-        # Explicitly handle window-manager close as well as Escape.
+        # Handle the window-manager close button (Escape no longer quits).
         exit_observer = self.interactor.AddObserver(
             "ExitEvent", lambda obj, event: obj.SetDone(True))
         try:

@@ -7,6 +7,8 @@ IMPORTANT: load_data() reassigns the module globals dem_km, H, W, R_MAX_M and CO
 Other files must `import terrain` and read `terrain.COLOR_PATH`; writing
 `from terrain import COLOR_PATH` would keep a stale copy. Functions and constants that are
 never reassigned (sample_dem_bilinear, MOON_RADIUS_M, ...) are safe to import by name.
+The same applies to EYE_HEIGHT_M: change it only through set_eye_height() and always read it as
+`terrain.EYE_HEIGHT_M`, so that every calculation uses the current observer eye height.
 """
 from contextlib import contextmanager
 import os
@@ -23,6 +25,21 @@ DEM_SOURCE_URL = "https://svs.gsfc.nasa.gov/vis/a000000/a004700/a004720/ldem_64.
 COLOR_SIZE = (27360, 13680)
 DEM_SIZE = (23040, 11520)
 MOON_RADIUS_M = 1_737_400.0
+EYE_HEIGHT_M = 2.0  # observer eye height above the ground (horizon, panorama, Sun/Earth altitude, terrain view)
+MIN_EYE_HEIGHT_M, MAX_EYE_HEIGHT_M = 0.1, 5000.0
+
+
+def set_eye_height(value):
+    """Set the observer eye height in metres above the ground; returns the stored value."""
+    global EYE_HEIGHT_M
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("Eye height must be a number of metres.") from None
+    if not np.isfinite(value) or not MIN_EYE_HEIGHT_M <= value <= MAX_EYE_HEIGHT_M:
+        raise ValueError(f"Eye height must be between {MIN_EYE_HEIGHT_M:g} and {MAX_EYE_HEIGHT_M:g} m.")
+    EYE_HEIGHT_M = value
+    return value
 RELIEF_EXAGGERATION = 3.0
 
 # Initialized by load_data(), so importing this module never downloads files.
@@ -211,7 +228,7 @@ def graticule_lines(step_deg, center_lat=0.0, center_lon=0.0, radius_deg=180.0):
     return minor, major
 
 
-def compute_horizon_360(lat_deg, lon_deg, eye_height_m=2.0, max_dist_km=250.0, step_km=0.5):
+def compute_horizon_360(lat_deg, lon_deg, eye_height_m=None, max_dist_km=250.0, step_km=0.5):
     """Terrain horizon for one observer, at every integer azimuth (north=0).
 
     Search every bearing independently. Cartesian great-circle propagation avoids
@@ -220,6 +237,8 @@ def compute_horizon_360(lat_deg, lon_deg, eye_height_m=2.0, max_dist_km=250.0, s
     """
     if not (-90 <= lat_deg <= 90) or not np.isfinite(lon_deg):
         raise ValueError("Observer coordinates must be finite, with latitude in [-90, 90].")
+    if eye_height_m is None:
+        eye_height_m = EYE_HEIGHT_M
     if eye_height_m <= 0 or step_km <= 0 or max_dist_km <= 0:
         raise ValueError("Eye height, search distance and sample step must be positive.")
     r_obs = MOON_RADIUS_M + float(sample_dem_bilinear(lat_deg, lon_deg)) + eye_height_m
@@ -273,7 +292,7 @@ def terrain_panorama_samples(lat_deg, lon_deg, texture_rgb, max_dist_km=250.0, s
     lat = np.degrees(np.arctan2(points[..., 2], np.hypot(points[..., 0], points[..., 1])))
     lon = np.degrees(np.arctan2(points[..., 1], points[..., 0]))
     ground_r = MOON_RADIUS_M + sample_dem_bilinear(lat, lon)
-    observer_r = MOON_RADIUS_M + float(sample_dem_bilinear(lat_deg, lon_deg)) + 2.0
+    observer_r = MOON_RADIUS_M + float(sample_dem_bilinear(lat_deg, lon_deg)) + EYE_HEIGHT_M
     angles = np.degrees(np.arctan2(ground_r * np.cos(theta)[None, :] - observer_r,
                                    ground_r * np.sin(theta)[None, :]))
     h, w = texture_rgb.shape[:2]

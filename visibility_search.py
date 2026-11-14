@@ -142,7 +142,7 @@ def optimistic_horizon_floor(observer_elevation_m, min_terrain_m, max_dist_km=25
     """
     theta = max_dist_km * 1000.0 / terrain.MOON_RADIUS_M
     ground_radius = terrain.MOON_RADIUS_M + min_terrain_m - 1.0
-    observer_radius = terrain.MOON_RADIUS_M + observer_elevation_m + 2.0
+    observer_radius = terrain.MOON_RADIUS_M + observer_elevation_m + terrain.EYE_HEIGHT_M
     angle = np.degrees(np.arctan2(ground_radius * np.cos(theta) - observer_radius,
                                   ground_radius * np.sin(theta)))
     return float(angle) - 1e-6
@@ -197,7 +197,7 @@ def search(points, epochs, min_sun, min_earth, fetch, cancel=None, progress=None
             progress(index, len(points), len(results), elapsed, lat, lon, filtered)
         try:
             elevation_m = float(terrain.sample_dem_bilinear(lat, lon))
-            altitude = (elevation_m + 2.0) / 1000.0
+            altitude = (elevation_m + terrain.EYE_HEIGHT_M) / 1000.0
             positions = fetch(lon, lat, altitude, epochs)
             if cancel is not None and cancel.is_set():
                 break
@@ -335,7 +335,7 @@ def optimistic_cell_ranges(cells, epochs, min_sun, min_earth, fetch, cancel=None
             progress(completed, total, len(eligible), center)
         height = float(terrain.sample_dem_bilinear(*center))
         try:
-            positions = fetch(center[1], center[0], (height + 2.0) / 1000.0, epochs)
+            positions = fetch(center[1], center[0], (height + terrain.EYE_HEIGHT_M) / 1000.0, epochs)
         except Exception as error:
             raise RuntimeError(f"Range estimate failed at latitude {center[0]:.3f}, longitude {center[1]:.3f}: {error}") from error
         if cancel is not None and cancel.is_set():
@@ -458,7 +458,7 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
                 if point not in checked:
                     elevation = float(terrain.sample_dem_bilinear(*point))
                     pos = (center_positions if point == center and center_positions is not None else
-                           fetch(point[1], point[0], (elevation + 2.0) / 1000.0, epochs))
+                           fetch(point[1], point[0], (elevation + terrain.EYE_HEIGHT_M) / 1000.0, epochs))
                     if point == center:
                         center_positions = pos
                     if cancel is not None and cancel.is_set():
@@ -490,7 +490,7 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
                 if point == center and screen_mode == 'Pessimistic center':
                     if center_positions is None:
                         elevation = float(terrain.sample_dem_bilinear(*center))
-                        center_positions = fetch(center[1], center[0], (elevation + 2.0) / 1000.0, epochs)
+                        center_positions = fetch(center[1], center[0], (elevation + terrain.EYE_HEIGHT_M) / 1000.0, epochs)
                     if cancel is not None and cancel.is_set():
                         break
                     can_meet_thresholds_without_horizon(epochs, center_positions, -90.0, 0.0, 0.0)
@@ -540,7 +540,7 @@ def search_optimistic_sectors(cells, epochs, min_sun, min_earth, fetch, cancel=N
             progress(index, total, len(results), time.monotonic() - start, *center, filtered)
         try:
             elevation = float(terrain.sample_dem_bilinear(*center))
-            positions = fetch(center[1], center[0], (elevation + 2.0) / 1000.0, epochs)
+            positions = fetch(center[1], center[0], (elevation + terrain.EYE_HEIGHT_M) / 1000.0, epochs)
             if cancel is not None and cancel.is_set():
                 break
             margin = min(180.0, (cell[1] - cell[0] + cell[3] - cell[2]) / 2.0 + 2.0)
@@ -592,11 +592,14 @@ def _search_worker(messages, cancel, cells, epochs, sun, earth, fetch, side, hor
 
 class SearchDialog:
     """Tk-only UI; all horizon and ephemeris work stays in a worker thread."""
-    def __init__(self, parent, fetch, previous=None, on_close=None, existing_points=None):
+    def __init__(self, parent, fetch, previous=None, on_close=None, existing_points=None, on_apply=None):
         import tkinter as tk
         from tkinter import ttk
         self.tk, self.ttk, self.fetch = tk, ttk, fetch
         self.on_close = on_close
+        # Called when a button wants the viewer to act (show on globe, add points, analyze, clear).
+        # The window stays open; only Close (or the window's own close button) closes it.
+        self.on_apply = on_apply
         self.existing_points = existing_points or (lambda: [])
         self._closed = False
         self.window = tk.Toplevel(parent)
@@ -944,7 +947,7 @@ class SearchDialog:
             self.marker_mode = self.view_mode.get()
             self.marker_results = self._marker_rows(members if self.marker_mode == 'Clusters' else None)
             self.show_matches = True
-            self.close()
+            self.apply_to_viewer('Shown on the globe.')
 
     def select_all(self, event=None):
         rows = self.table.get_children()
@@ -980,7 +983,8 @@ class SearchDialog:
         self.marker_mode = self.view_mode.get()
         self.marker_results = self._marker_rows()
         self.show_matches = True
-        self.close()
+        self.apply_to_viewer(f'Added {len(rows):,} point(s) to the comparison set; analysis opened.' if analyze
+                             else f'Added {len(rows):,} point(s) to the comparison set.')
 
     def analyze_selected(self):
         self.add_selected(analyze=True)
@@ -1031,11 +1035,26 @@ class SearchDialog:
         self.marker_mode = 'Clusters' if self.is_sector_results() else self.view_mode.get()
         self.marker_results = self._marker_rows()
         self.show_matches = True
-        self.close()
+        self.apply_to_viewer('All results shown on the globe.')
 
     def clear(self):
         self.clear_markers = True
-        self.close()
+        self.apply_to_viewer('Markers cleared.')
+
+    def apply_to_viewer(self, message=None):
+        """Let the viewer act on the one-shot request flags, then keep this window open."""
+        try:
+            if self.on_apply is not None:
+                self.on_apply(self)
+        finally:
+            # The request has been handed over; do not repeat it when the window is closed later.
+            self.show_matches = self.clear_markers = self.add_to_compare = self.analyze = False
+        if message and not (self.worker is not None and self.worker.is_alive()):
+            self.status.configure(text=message)
+        try:
+            self.window.lift()  # the viewer window may have been raised by its redraw
+        except self.tk.TclError:
+            pass
 
     def export(self):
         from tkinter import filedialog
