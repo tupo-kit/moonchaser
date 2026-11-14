@@ -1,6 +1,7 @@
 """Moon Horizon: a native desktop viewer, with no browser or web server.
 
-Install: python -m pip install numpy Pillow vtk
+Install: python -m pip install numpy Pillow vtk astroquery skyfield
+Coordinate editor: requires Tkinter (Linux package: python3-tk).
 Run:     python moon.py
 Texture: python moon.py --texture /path/to/moon_color_8k.jpg
 
@@ -11,12 +12,18 @@ Click the Moon to select an observer.
 Zoom stops above the terrain. The inset shows all 360 horizon bearings.
 Put moon_color_8k.jpg beside this script to use it automatically.
 Press G to enter latitude, longitude; R to reset; F for fullscreen; Escape to close.
+Sun/Earth positions use JPL Horizons over the internet. Time defaults to UTC now.
+Click Edit time interval (or T) to choose a range, then use Previous/Next samples.
 """
 
 import argparse
 import os
 import sys
 import urllib.request
+import queue
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 from PIL import Image
@@ -33,6 +40,127 @@ RELIEF_EXAGGERATION = 3.0
 dem_km = None
 H = W = 0
 R_MAX_M = MOON_RADIUS_M
+MAX_TIME_SAMPLES = 1000
+SKY_COLORS = {"Sun JPL": (1.0, 0.8, 0.12), "Earth JPL": (0.35, 0.65, 1.0), "Sun Skyfield": (1.0, 0.35, 0.1), "Earth Skyfield": (0.3, 1.0, 0.5)}
+
+
+def utc_now():
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def parse_utc(value):
+    try:
+        result = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("Use a UTC date/time such as 2026-11-14 12:30:00.") from None
+    if result.tzinfo is None:
+        result = result.replace(tzinfo=timezone.utc)
+    return result.astimezone(timezone.utc)
+
+
+def time_samples(start, stop, step_minutes):
+    start, stop = parse_utc(start), parse_utc(stop)
+    try:
+        step = float(step_minutes) * 60.0
+    except (ValueError, TypeError):
+        raise ValueError("Sample step must be a positive number of minutes.") from None
+    if not np.isfinite(step) or step <= 0:
+        raise ValueError("Sample step must be a positive number of minutes.")
+    duration = (stop - start).total_seconds()
+    if duration < 0:
+        raise ValueError("The interval end must not be before its start.")
+    count = int(np.floor(duration / step)) + 1
+    if count > MAX_TIME_SAMPLES:
+        raise ValueError(f"Use a larger step: at most {MAX_TIME_SAMPLES} samples are allowed.")
+    epochs = [start + timedelta(seconds=index * step) for index in range(count)]
+    if epochs[-1] < stop:
+        epochs.append(stop)
+    if len(epochs) > MAX_TIME_SAMPLES:
+        raise ValueError(f"Use a larger step: at most {MAX_TIME_SAMPLES} samples are allowed.")
+    return epochs
+
+
+def query_sky_positions(lon, lat, altitude_km, epochs):
+    """Apparent airless positions at the actual lunar observer, in UTC."""
+    try:
+        from astroquery.jplhorizons import Horizons
+        from astropy.time import Time
+    except ImportError:
+        raise RuntimeError("Install astroquery: python -m pip install astroquery") from None
+    julian_dates = np.atleast_1d(Time(epochs, scale="utc").jd).tolist()
+    location = {"lon": float(lon), "lat": float(lat),
+                "elevation": float(altitude_km), "body": 301}
+    result = {}
+    for name, body_id in (("Sun", 10), ("Earth", 399)):
+        chunks = {"az": [], "el": [], "radius": []}
+        # Keep individual request URLs small even for long intervals.
+        for first in range(0, len(julian_dates), 100):
+            obj = Horizons(id=body_id, id_type=None, location=location,
+                           epochs=julian_dates[first:first + 100])
+            obj.TIMEOUT = 30
+            eph = obj.ephemerides(quantities="4,13", refraction=False)
+            for key, column in (("az", "AZ"), ("el", "EL"), ("radius", "ang_width")):
+                values = np.asarray(np.ma.filled(np.ma.asarray(eph[column], dtype=float), np.nan))
+                if not np.isfinite(values).all():
+                    raise RuntimeError(f"JPL returned unavailable {name} coordinates.")
+                chunks[key].extend(values.tolist())
+        result[name] = {key: np.asarray(values, dtype=float) for key, values in chunks.items()}
+        result[name]["az"] %= 360.0
+        result[name]["radius"] /= 7200.0  # angular diameter in arcsec -> radius in degrees
+        if any(len(values) != len(epochs) for values in result[name].values()):
+            raise RuntimeError(f"JPL returned an incomplete {name} time series.")
+    return result
+
+
+def sky_unit(azimuth, elevation):
+    azimuth, elevation = np.radians(azimuth), np.radians(elevation)
+    return np.stack((np.cos(elevation) * np.sin(azimuth),
+                     np.cos(elevation) * np.cos(azimuth), np.sin(elevation)), axis=-1)
+
+
+def classify_sky(positions, horizon):
+    """Sample body disks against terrain; also test Earth occulting the Sun.
+
+    Partial visibility is approximate at the DEM/profile sampling resolution.
+    These geometric tests do not model the illuminated phase of Earth's disk.
+    """
+    result = {}
+    earth_center = sky_unit(positions["Earth"]["az"], positions["Earth"]["el"])
+    earth_radius = np.radians(positions["Earth"]["radius"])
+    # Centre plus two rings: check interior and limb, including narrow crescents.
+    theta = np.tile(np.linspace(0, 2 * np.pi, 48, endpoint=False), 2)
+    fractions = np.repeat([0.5, 1.0], 48)
+    theta, fractions = np.r_[0, theta], np.r_[0, fractions]
+    for name in ("Sun", "Earth"):
+        body = {key: np.asarray(value).copy() for key, value in positions[name].items()}
+        az, el = np.radians(body["az"]), np.radians(body["el"])
+        centre = sky_unit(body["az"], body["el"])
+        horizontal = np.stack((np.cos(az), -np.sin(az), np.zeros_like(az)), axis=-1)
+        vertical = np.stack((-np.sin(el) * np.sin(az), -np.sin(el) * np.cos(az), np.cos(el)), axis=-1)
+        rho = np.radians(body["radius"])[:, None] * fractions[None, :]
+        rays = (np.cos(rho)[..., None] * centre[:, None, :]
+                + np.sin(rho)[..., None] * (
+                    np.cos(theta)[None, :, None] * vertical[:, None, :]
+                    + np.sin(theta)[None, :, None] * horizontal[:, None, :]))
+        ray_az = np.degrees(np.arctan2(rays[..., 0], rays[..., 1])) % 360.0
+        ray_el = np.degrees(np.arctan2(rays[..., 2], np.hypot(rays[..., 0], rays[..., 1])))
+        terrain = np.interp(ray_az, np.arange(360), horizon, period=360)
+        terrain_clear = ray_el > terrain
+        clear = terrain_clear.copy()
+        if name == "Sun":
+            separation = np.arccos(np.clip(np.sum(rays * earth_center[:, None, :], axis=-1), -1, 1))
+            clear &= separation > earth_radius[:, None]
+        visible = clear.any(axis=1)
+        full = clear.all(axis=1)
+        state = np.full(len(visible), "Hidden by terrain", dtype=object)
+        if name == "Sun":
+            state[terrain_clear.any(axis=1) & ~visible] = "Eclipsed by Earth"
+        state[visible & ~full] = "Partly visible"
+        state[full] = "Visible"
+        body.update(visible=visible, state=state,
+                    terrain=np.interp(body["az"], np.arange(360), horizon, period=360))
+        result[name] = body
+    return result
 
 
 def download(url, path):
@@ -191,6 +319,7 @@ def compute_slope_deg(lat, lon):
 
 
 def parse_coordinates(text):
+    text = text.replace("\N{MINUS SIGN}", "-").replace("\N{EN DASH}", "-")
     parts = text.replace(",", " ").replace(";", " ").split()
     if len(parts) != 2:
         raise ValueError("Enter latitude, longitude; for example: -43.31, -11.36")
@@ -206,16 +335,214 @@ def parse_coordinates(text):
     return lat, (lon + 180.0) % 360.0 - 180.0
 
 
+class CoordinateDialog:
+    """Native text editing and clipboard support, opened only by G."""
+
+    def __init__(self, parent, initial_text, on_submit):
+        import tkinter as tk
+        from tkinter import ttk
+
+        self.tk = tk
+        self.on_submit = on_submit
+        self.window = tk.Toplevel(parent)
+        self.window.title("Go to coordinates")
+        self.window.resizable(False, False)
+        frame = ttk.Frame(self.window, padding=14)
+        frame.grid(sticky="nsew")
+        ttk.Label(frame, text="Latitude, longitude (signed or 0 to 360)").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        self.text = tk.Text(frame, width=44, height=2, wrap="word", font="TkFixedFont",
+                            undo=True, autoseparators=True, maxundo=100,
+                            exportselection=False, padx=7, pady=7)
+        self.text.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.text.insert("1.0", initial_text)
+        self.text.edit_reset()
+        self.error = tk.StringVar(master=self.window)
+        ttk.Label(frame, textvariable=self.error, foreground="#c02020", wraplength=430).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        ttk.Button(frame, text="Cancel", command=self.window.destroy).grid(
+            row=3, column=0, sticky="e", padx=(0, 8))
+        ttk.Button(frame, text="Go", command=self.submit).grid(row=3, column=1, sticky="e")
+        self.text.bind("<Return>", self.submit)
+        self.text.bind("<KP_Enter>", self.submit)
+        self.window.bind("<Escape>", lambda event: self.window.destroy())
+
+        # Handle selection replacement consistently on X11, Windows, and macOS.
+        self.text.bind("<<Paste>>", self.paste)
+        self.text.bind("<<Copy>>", self.copy)
+        self.text.bind("<<Cut>>", self.cut)
+        self.text.bind("<<Undo>>", self.undo)
+        self.text.bind("<<Redo>>", self.redo)
+        shortcuts = {"a": self.select_all, "c": self.copy, "x": self.cut,
+                     "v": self.paste, "z": self.undo, "y": self.redo}
+        for modifier in (("Control", "Command") if sys.platform == "darwin" else ("Control",)):
+            for key, handler in shortcuts.items():
+                self.text.bind(f"<{modifier}-Key-{key}>", handler)
+            self.text.bind(f"<{modifier}-Shift-Key-Z>", self.redo)
+        self.text.bind("<Shift-Insert>", self.paste)
+        self.menu = tk.Menu(self.window, tearoff=False)
+        for label, handler in (("Undo", self.undo), ("Redo", self.redo),
+                               ("Cut", self.cut), ("Copy", self.copy),
+                               ("Paste", self.paste), ("Select all", self.select_all)):
+            self.menu.add_command(label=label, command=handler)
+        self.text.bind("<Button-3>", self.show_menu)
+        if sys.platform == "darwin":
+            self.text.bind("<Control-Button-1>", self.show_menu)
+        self.window.protocol("WM_DELETE_WINDOW", self.window.destroy)
+        self.window.update_idletasks()
+        self.window.lift()
+        self.window.grab_set()
+        self.text.focus_force()
+        self.select_all()
+
+    def select_all(self, event=None):
+        self.text.tag_add("sel", "1.0", "end-1c")
+        self.text.mark_set("insert", "end-1c")
+        return "break"
+
+    def replace_selection(self, value):
+        self.text.edit_separator()
+        automatic = self.text.cget("autoseparators")
+        self.text.configure(autoseparators=False)
+        try:
+            if self.text.tag_ranges("sel"):
+                self.text.delete("sel.first", "sel.last")
+            self.text.insert("insert", value)
+            self.text.see("insert")
+        finally:
+            self.text.edit_separator()
+            self.text.configure(autoseparators=automatic)
+
+    def copy(self, event=None):
+        if self.text.tag_ranges("sel"):
+            value = self.text.get("sel.first", "sel.last")
+            self.window.clipboard_clear()
+            self.window.clipboard_append(value)
+        return "break"
+
+    def cut(self, event=None):
+        if self.text.tag_ranges("sel"):
+            self.copy()
+            self.replace_selection("")
+        return "break"
+
+    def paste(self, event=None):
+        try:
+            value = self.window.clipboard_get()
+        except self.tk.TclError:
+            return "break"  # Empty clipboard or clipboard has no text.
+        self.replace_selection(value)
+        return "break"
+
+    def undo(self, event=None):
+        try:
+            self.text.edit_undo()
+        except self.tk.TclError:
+            pass
+        return "break"
+
+    def redo(self, event=None):
+        try:
+            self.text.edit_redo()
+        except self.tk.TclError:
+            pass
+        return "break"
+
+    def show_menu(self, event):
+        try:
+            self.menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.menu.grab_release()
+        return "break"
+
+    def submit(self, event=None):
+        try:
+            self.on_submit(self.text.get("1.0", "end-1c"))
+        except ValueError as error:
+            self.error.set(str(error))
+            self.text.focus_set()
+        else:
+            self.window.destroy()
+        return "break"
+
+
+class TimeIntervalDialog:
+    def __init__(self, parent, start, stop, step_minutes, on_submit):
+        import tkinter as tk
+        from tkinter import ttk
+
+        self.window = tk.Toplevel(parent)
+        self.window.title("Sun / Earth time interval (UTC)")
+        self.window.resizable(False, False)
+        frame = ttk.Frame(self.window, padding=14)
+        frame.grid()
+        self.fields = []
+        values = (start.strftime("%Y-%m-%d %H:%M:%S"),
+                  stop.strftime("%Y-%m-%d %H:%M:%S"), str(step_minutes))
+        for row, (label, value) in enumerate(zip(
+                ("Start UTC", "End UTC", "Step"), values)):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=4)
+            entry = ttk.Entry(frame, width=28)
+            entry.insert(0, value)
+            entry.grid(row=row, column=1, sticky="ew", pady=4)
+            entry.bind("<Control-a>", lambda event: (
+                event.widget.selection_range(0, "end"), "break")[-1])
+            self.fields.append(entry)
+        self.unit = ttk.Combobox(frame, values=("seconds", "minutes", "hours", "days"), state="readonly", width=10)
+        self.unit.set("minutes")
+        self.unit.grid(row=2, column=2, padx=(8, 0))
+        ttk.Label(frame, text=f"UTC dates: YYYY-MM-DD HH:MM:SS. Up to {MAX_TIME_SAMPLES} samples.").grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=6)
+        self.error = tk.StringVar(master=self.window)
+        ttk.Label(frame, textvariable=self.error, foreground="#c02020", wraplength=430).grid(
+            row=4, column=0, columnspan=2, sticky="w")
+
+        def apply(event=None):
+            try:
+                on_submit(self.fields[0].get(), self.fields[1].get(),
+                          float(self.fields[2].get()) * {"seconds": 1/60, "minutes": 1, "hours": 60, "days": 1440}[self.unit.get()])
+            except ValueError as error:
+                self.error.set(str(error))
+            else:
+                self.window.destroy()
+            return "break"
+
+        ttk.Button(frame, text="Cancel", command=self.window.destroy).grid(row=5, column=0, pady=(10, 0))
+        ttk.Button(frame, text="Apply interval", command=apply).grid(row=5, column=1, sticky="e", pady=(10, 0))
+        self.window.bind("<Return>", apply)
+        self.window.bind("<Escape>", lambda event: self.window.destroy())
+        self.window.update_idletasks()
+        self.window.lift()
+        self.window.grab_set()
+        self.fields[0].focus_force()
+        self.fields[0].selection_range(0, "end")
+
+
 class MoonWindow:
     """VTK owns the desktop window and mouse interaction; no HTML is involved."""
 
-    def __init__(self, offscreen=False):
+    def __init__(self, offscreen=False, enable_ephemeris=True, ephemeris_fetcher=None):
         import vtk
         from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
 
         self.vtk = vtk
         self.lat, self.lon = -43.31, -11.36
         self.orbit_pivot = np.zeros(3)
+        self._enable_ephemeris = enable_ephemeris
+        self._ephemeris_fetcher = ephemeris_fetcher or query_sky_positions
+        self._sky_jobs = queue.Queue(maxsize=1)
+        self._sky_results = queue.Queue()
+        self._sky_stop = threading.Event()
+        self._sky_thread = None
+        self._sky_timer = self._sky_pump_observer = None
+        self._sky_generation = 0
+        self._sky_data = None
+        self._sky_status = "Waiting for Sun / Earth positions"
+        self._now_mode = True
+        self._epochs = [utc_now()]
+        self._time_index = 0
+        self._interval_step_minutes = 60
+        self._last_now_query = time.monotonic()
         self.renderer = vtk.vtkRenderer()
         self.renderer.SetBackground(0.025, 0.035, 0.055)
         self.renderer.UseFXAAOn()
@@ -315,14 +642,14 @@ class MoonWindow:
 
         self.stats = self.make_text(0.025, 0.97, 19, top=True)
         self.coordinate_editing = False
-        self.coordinate_buffer = ""
-        self.coordinate_prompt = self.make_text(0.025, 0.75, 16, top=True)
-        self.coordinate_prompt.GetTextProperty().SetColor(0.25, 0.9, 1.0)
-        self.update_coordinate_prompt()
+        self._coordinate_root = None
+        self._coordinate_timer = None
+        self._coordinate_pump_observer = None
         self.help = self.make_text(0.025, 0.035, 15)
         self.help.SetInput("Left-drag: orbit   |   Middle/Shift-drag: pan\n"
                            "Ctrl-drag: look around   |   Wheel: zoom   |   Click: select\n"
-                           "G: coordinates   |   R: reset   |   F: fullscreen   |   Esc: close\n"
+                           "G: coordinates   |   T: time interval   |   R: reset\n"
+                           "F: fullscreen   |   Esc: close\n"
                            "Cyan: local horizon   |   Orange: observer   |   Relief: 3x")
         self.profile_background = self.make_profile_background()
         self.profile_title = self.make_text(0.61, 0.32, 14, top=True)
@@ -337,6 +664,23 @@ class MoonWindow:
             label.GetTextProperty().SetJustificationToCentered()
             label.SetInput(text)
             self.profile_labels.append(label)
+        self.sky_trails = {name: self.make_overlay_lines([], color, 2) for name, color in SKY_COLORS.items()}
+        self.sky_samples = {name: self.make_overlay_points([], color, 4) for name, color in SKY_COLORS.items()}
+        self.sky_markers = {name: self.make_overlay_points([], color, 10) for name, color in SKY_COLORS.items()}
+        self.sky_labels = {name: self.make_text(0.61, 0.26, 12) for name in SKY_COLORS}
+        for name, actor in self.sky_labels.items():
+            actor.GetTextProperty().SetColor(*SKY_COLORS[name])
+            actor.SetVisibility(False)
+        self.time_button = self.make_text(0.61, 0.46, 16)
+        self.time_button.SetInput("[ Edit time interval / T ]")
+        self.time_button.GetTextProperty().SetColor(0.25, 0.9, 1.0)
+        self.now_button = self.make_text(0.90, 0.46, 16)
+        self.now_button.SetInput("[ Now ]")
+        self.time_caption = self.make_text(0.61, 0.43, 12, top=True)
+        self.previous_button = self.make_text(0.61, 0.37, 14)
+        self.previous_button.SetInput("[ Previous ]")
+        self.next_button = self.make_text(0.77, 0.37, 14)
+        self.next_button.SetInput("[ Next ]")
         self.picker = vtk.vtkCellPicker()
         self.picker.SetTolerance(0.001)
         self.picker.PickFromListOn()
@@ -377,6 +721,8 @@ class MoonWindow:
                     return
                 self._moon_drag_mode, self._moon_drag_button = mode, button
                 self._moon_drag_press = self.GetInteractor().GetEventPosition()
+                if owner.over_sky_controls(*self._moon_drag_press):
+                    self._moon_drag_mode = "ui"
                 self._moon_drag_last = self._moon_drag_press
                 self._moon_drag_dragged = False
                 self._moon_drag_pan_depth = float(np.linalg.norm(
@@ -386,6 +732,10 @@ class MoonWindow:
                 if self._moon_drag_press is None or owner.coordinate_editing:
                     return
                 current = self.GetInteractor().GetEventPosition()
+                if self._moon_drag_mode == "ui":
+                    if np.hypot(current[0] - self._moon_drag_press[0], current[1] - self._moon_drag_press[1]) > 5:
+                        self._moon_drag_dragged = True
+                    return
                 if ((self._moon_drag_mode in ("pan", "look") and current != self._moon_drag_press)
                         or np.hypot(current[0] - self._moon_drag_press[0], current[1] - self._moon_drag_press[1]) > 5):
                     self._moon_drag_dragged = True
@@ -408,7 +758,7 @@ class MoonWindow:
             def end_drag(self, button):
                 if self._moon_drag_button != button:
                     return
-                if self._moon_drag_press is not None and not self._moon_drag_dragged and self._moon_drag_mode == "orbit" and button == "left":
+                if self._moon_drag_press is not None and not self._moon_drag_dragged and self._moon_drag_mode in ("orbit", "ui") and button == "left":
                     owner.pick(*self.GetInteractor().GetEventPosition())
                 self._moon_drag_press = self._moon_drag_last = None
                 self._moon_drag_mode = self._moon_drag_button = self._moon_drag_pan_depth = None
@@ -417,25 +767,30 @@ class MoonWindow:
                 interactor = self.GetInteractor()
                 key = (interactor.GetKeySym() or "").lower()
                 if owner.coordinate_editing:
-                    if key in ("escape", "return", "kp_enter", "backspace", "delete") or interactor.GetControlKey():
-                        owner.edit_coordinates(key, control=bool(interactor.GetControlKey()))
+                    return  # The native editor handles its own keyboard events.
                 elif key == "escape":
                     owner.interactor.TerminateApp()
 
             def key(self, obj, event):
                 interactor = self.GetInteractor()
                 key = (interactor.GetKeySym() or "").lower()
+                if owner.coordinate_editing:
+                    return
                 if key in ("escape", "return", "kp_enter", "backspace", "delete") or interactor.GetControlKey():
                     return  # Special keys were handled once in KeyPressEvent.
-                if owner.coordinate_editing:
-                    owner.edit_coordinates(key, interactor.GetKeyCode())
-                elif key == "g":
+                if key == "g":
                     owner.begin_coordinate_entry()
+                elif key == "t":
+                    owner.begin_time_entry()
+                elif key == "bracketleft":
+                    owner.step_time(-1)
+                elif key == "bracketright":
+                    owner.step_time(1)
                 elif key == "r":
                     owner.reset_camera()
                     owner.window.Render()
                 elif key == "f":
-                    owner.window.SetFullScreen(not owner.window.GetFullScreen())
+                    owner.toggle_fullscreen()
                     owner.window.Render()
                 # Ignore VTK's default wireframe/representation shortcuts.
 
@@ -504,56 +859,282 @@ class MoonWindow:
         self.renderer.AddViewProp(actor)
         return actor
 
+    def overlay_point_data(self, coordinates):
+        points = self.vtk.vtkPoints()
+        cells = self.vtk.vtkCellArray()
+        for x, y in coordinates:
+            index = points.InsertNextPoint(float(x), float(y), 0)
+            cells.InsertNextCell(1)
+            cells.InsertCellPoint(index)
+        data = self.vtk.vtkPolyData()
+        data.SetPoints(points)
+        data.SetVerts(cells)
+        return data
+
+    def make_overlay_points(self, coordinates, color, size):
+        actor = self.vtk.vtkActor2D()
+        actor.SetMapper(self.overlay_mapper(self.overlay_point_data(coordinates)))
+        actor.GetProperty().SetColor(*color)
+        actor.GetProperty().SetPointSize(size)
+        self.renderer.AddViewProp(actor)
+        return actor
+
     def update_profile(self, angles):
         low, high = float(np.min(angles)), float(np.max(angles))
-        padding = max((high - low) * 0.1, 0.01)
+        if self._sky_data is not None:
+            for body in self._sky_data.values():
+                low = min(low, float(np.min(body["el"] - body["radius"])))
+                high = max(high, float(np.max(body["el"] + body["radius"])))
+        padding = max((high - low) * 0.08, 0.01)
+        self._profile_low, self._profile_high = low - padding, high + padding
         values = np.append(angles, angles[0])
         x = np.linspace(0.61, 0.97, len(values))
-        y = 0.12 + 0.13 * (values - low + padding) / (high - low + 2 * padding)
+        y = self.profile_y(values)
         self.profile.GetMapper().SetInputData(self.overlay_lines_data([np.column_stack((x, y))]))
         self.profile_title.SetInput(
             f"360-degree horizon: selected observer\n"
-            f"Elevation angle {low:+.2f} to {high:+.2f} deg")
+            f"Elevation scale {self._profile_low:+.2f} to {self._profile_high:+.2f} deg\n"
+            "JPL Sun yellow / Earth blue\nSkyfield Sun orange / Earth green")
+        for name in SKY_COLORS:
+            body = self._sky_data.get(name) if self._sky_data is not None else None
+            segments, segment, coordinates = [], [], []
+            previous_az = None
+            if body is not None:
+                for az, el, visible in zip(body["az"], body["el"], body["visible"]):
+                    if previous_az is not None and abs(az - previous_az) > 180:
+                        if len(segment) > 1:
+                            segments.append(segment)
+                        segment = []
+                    point = (0.61 + 0.36 * az / 360.0, float(self.profile_y(el)))
+                    coordinates.append(point)
+                    segment.append(point)
+                    previous_az = az
+                if len(segment) > 1:
+                    segments.append(segment)
+            self.sky_trails[name].GetMapper().SetInputData(self.overlay_lines_data(segments))
+            self.sky_samples[name].GetMapper().SetInputData(self.overlay_point_data(coordinates))
+            marker = []
+            if body is not None:
+                az, el = body["az"][self._time_index], body["el"][self._time_index]
+                point = (0.61 + 0.36 * az / 360.0, float(self.profile_y(el)))
+                marker = [point]
+                label = name + (" (partial)" if body["state"][self._time_index] == "Partly visible" else "")
+                self.sky_labels[name].SetInput(label)
+                self.sky_labels[name].SetPosition(min(point[0] + 0.008, 0.88),
+                                                   float(np.clip(point[1] + (0.01 if name == "Sun" else -0.018), 0.13, 0.255)))
+            self.sky_markers[name].GetMapper().SetInputData(self.overlay_point_data(marker))
+            self.sky_labels[name].SetVisibility(bool(marker))
+        self.update_time_caption()
 
-    def update_coordinate_prompt(self, error=""):
-        self.coordinate_prompt.SetVisibility(self.coordinate_editing)
-        if self.coordinate_editing:
-            self.coordinate_prompt.SetInput(
-                "Latitude, longitude (signed or 0 to 360)\n"
-                f"> {self.coordinate_buffer}_\n"
-                + (error or "Enter: go   |   Esc: cancel   |   Ctrl+A: clear"))
+    def profile_y(self, elevation):
+        return 0.12 + 0.13 * (np.asarray(elevation) - self._profile_low) / (self._profile_high - self._profile_low)
+
+    def update_time_caption(self):
+        epoch = self._epochs[self._time_index]
+        mode = ("Now (refreshes every minute)" if self._now_mode else
+                f"Sample {self._time_index + 1}/{len(self._epochs)} | trails = all samples")
+        self.time_caption.SetInput(f"UTC {epoch:%Y-%m-%d %H:%M:%S}\n{mode}")
+        for actor, enabled in ((self.previous_button, self._time_index > 0),
+                               (self.next_button, self._time_index < len(self._epochs) - 1)):
+            actor.GetTextProperty().SetColor(*((0.9, 0.95, 1.0) if enabled else (0.4, 0.45, 0.5)))
+
+    def update_stats(self):
+        lines = [self._stats_base, f"UTC {self._epochs[self._time_index]:%Y-%m-%d %H:%M:%S}"]
+        if self._sky_data is None:
+            lines.append(self._sky_status)
         else:
-            self.coordinate_prompt.SetInput("")
+            for name in SKY_COLORS:
+                if name not in self._sky_data:
+                    continue
+                body, index = self._sky_data[name], self._time_index
+                lines.append(f"{name}: {body['state'][index]}  |  AZ {body['az'][index]:.2f}, EL {body['el'][index]:+.2f} deg")
+            if len(self._epochs) > 1:
+                counts = [f"{name} {np.count_nonzero(body['visible'])}/{len(self._epochs)}" for name, body in self._sky_data.items()]
+                lines.append("Visible samples: " + "  |  ".join(counts))
+            if self._sky_status:
+                lines.append(self._sky_status)
+            lines.append("Partial visibility is approximate; terrain horizon sampled at 1 deg.")
+        self.stats.SetInput("\n".join(lines))
+
+    def request_sky_update(self):
+        if self._now_mode:
+            self._epochs = [utc_now()]
+            self._time_index = 0
+            self._last_now_query = time.monotonic()
+        self._sky_generation += 1
+        self._sky_data = None  # Never show a previous location's bodies at a new point.
+        self._sky_status = "Loading Sun / Earth positions..." if self._enable_ephemeris else "Sun / Earth lookup disabled"
+        self.update_profile(self.horizon_angles)
+        self.update_stats()
+        if not self._enable_ephemeris:
+            return
+        request = (self._sky_generation, self.lon, self.lat,
+                   (float(sample_dem_bilinear(self.lat, self.lon)) + 2.0) / 1000.0,
+                   list(self._epochs), self.horizon_angles.copy())
+        # Coalesce fast clicks: keep only the newest waiting location/interval.
+        try:
+            self._sky_jobs.get_nowait()
+        except queue.Empty:
+            pass
+        self._sky_jobs.put_nowait(request)
+        if self._sky_thread is None:
+            self._sky_thread = threading.Thread(target=self.sky_worker, daemon=True)
+            self._sky_thread.start()
+
+    @staticmethod
+    def fetch_skyfield(lon, lat, altitude, epochs):
+        try:
+            from skyfield_positions import get_positions
+        except ImportError as error:
+            raise RuntimeError(f"Install skyfield and keep skyfield_positions.py beside moon.py: {error}") from error
+        return get_positions(lon, lat, altitude, epochs)
+
+    def toggle_fullscreen(self):
+        # Avoid SetFullScreen, which recreates the native VTK window on some drivers.
+        if getattr(self, "_windowed_geometry", None) is None:
+            self._windowed_geometry = (tuple(self.window.GetPosition()), tuple(self.window.GetSize()))
+            width, height = self.window.GetScreenSize()
+            self.window.SetPosition(0, 0)
+            self.window.SetSize(width, height)
+        else:
+            position, size = self._windowed_geometry
+            self._windowed_geometry = None
+            self.window.SetPosition(*position)
+            self.window.SetSize(*size)
+        self.constrain_camera()
+        self.window.Render()
+
+    def sky_worker(self):
+        while not self._sky_stop.is_set():
+            try:
+                request = self._sky_jobs.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            generation, lon, lat, altitude, epochs, horizon = request
+            data, errors = {}, []
+            for source, fetch in (("JPL", self._ephemeris_fetcher), ("Skyfield", self.fetch_skyfield)):
+                try:
+                    classified = classify_sky(fetch(lon, lat, altitude, epochs), horizon)
+                    data.update({f"{body} {source}": values for body, values in classified.items()})
+                except Exception as error:
+                    message = str(error).strip().splitlines()
+                    errors.append(f"{source}: " + (message[0] if message else type(error).__name__)[:100])
+            self._sky_results.put((generation, data or None, "; ".join(errors) or None))
+
+    def poll_sky(self, obj=None, event=None):
+        changed = False
+        while True:
+            try:
+                generation, data, error = self._sky_results.get_nowait()
+            except queue.Empty:
+                break
+            if generation != self._sky_generation:
+                continue  # A newer click or time edit made this response obsolete.
+            self._sky_data = data
+            self._sky_status = f"Unavailable: {error}" if error else ""
+            changed = True
+        if self._now_mode and time.monotonic() - self._last_now_query >= 60:
+            self.request_sky_update()
+            changed = True
+        if changed:
+            self.update_profile(self.horizon_angles)
+            self.update_stats()
+            self.window.Render()
+
+    def set_time_interval(self, start, stop, step_minutes):
+        epochs = time_samples(start, stop, step_minutes)
+        self._now_mode = False
+        self._epochs = epochs
+        self._time_index = 0
+        self._interval_step_minutes = float(step_minutes)
+        self.request_sky_update()
+
+    def set_now(self):
+        self._now_mode = True
+        self._time_index = 0
+        self.request_sky_update()
+        self.window.Render()
+
+    def step_time(self, delta):
+        self._time_index = int(np.clip(self._time_index + delta, 0, len(self._epochs) - 1))
+        self.update_profile(self.horizon_angles)
+        self.update_stats()
+        self.window.Render()
+
+    def over_sky_controls(self, x, y):
+        width, height = self.window.GetSize()
+        return x >= width * 0.59 and y <= height * 0.49
 
     def begin_coordinate_entry(self, render=True):
-        self.coordinate_editing = True
-        self.coordinate_buffer = ""
-        self.update_coordinate_prompt()
-        if render:
+        if self.coordinate_editing:
+            return
+        try:
+            import tkinter as tk
+        except ImportError:
+            print("Coordinate text input needs Tkinter. Install your Python Tk package "
+                  "(Debian/Ubuntu: sudo apt install python3-tk).", file=sys.stderr)
+            return
+        dialog = None
+        try:
+            self.get_native_root()
+            self.coordinate_editing = True
+            dialog = CoordinateDialog(
+                self._coordinate_root, f"{self.lat:.6f}, {self.lon:.6f}",
+                lambda text: self.lookup_coordinates(text, render=False))
+            self._coordinate_root.wait_window(dialog.window)
+        except tk.TclError as error:
+            print(f"Could not open coordinate editor: {error}", file=sys.stderr)
+        finally:
+            if dialog is not None:
+                try:
+                    dialog.window.destroy()
+                except tk.TclError:
+                    pass
+            self.coordinate_editing = False
+            if render:
+                self.window.Render()
+
+    def get_native_root(self):
+        if self._coordinate_root is None:
+            import tkinter as tk
+            self._coordinate_root = tk.Tk(className="MoonHorizon")
+            self._coordinate_root.withdraw()
+            # Keep the native clipboard owner alive after a dialog is closed.
+            self._coordinate_pump_observer = self.interactor.AddObserver(
+                "TimerEvent", self.pump_coordinate_clipboard)
+            self._coordinate_timer = self.interactor.CreateRepeatingTimer(50)
+        return self._coordinate_root
+
+    def begin_time_entry(self):
+        if self.coordinate_editing:
+            return
+        try:
+            import tkinter as tk
+        except ImportError:
+            print("Time interval editing needs Tkinter (Debian/Ubuntu: python3-tk).", file=sys.stderr)
+            return
+        dialog = None
+        try:
+            root = self.get_native_root()
+            self.coordinate_editing = True
+            start = self._epochs[0]
+            stop = start + timedelta(days=1) if self._now_mode else self._epochs[-1]
+            dialog = TimeIntervalDialog(root, start, stop, self._interval_step_minutes, self.set_time_interval)
+            root.wait_window(dialog.window)
+        except tk.TclError as error:
+            print(f"Could not open time interval editor: {error}", file=sys.stderr)
+        finally:
+            if dialog is not None:
+                try:
+                    dialog.window.destroy()
+                except tk.TclError:
+                    pass
+            self.coordinate_editing = False
             self.window.Render()
 
-    def edit_coordinates(self, key, character="", control=False, render=True):
-        if not self.coordinate_editing:
-            return
-        error = ""
-        if key == "escape":
-            self.coordinate_editing = False
-        elif key in ("return", "kp_enter"):
-            try:
-                self.lookup_coordinates(self.coordinate_buffer, render=False)
-                self.coordinate_editing = False
-            except ValueError as exc:
-                error = str(exc)
-        elif control and key == "a":
-            self.coordinate_buffer = ""
-        elif key in ("backspace", "delete"):
-            self.coordinate_buffer = self.coordinate_buffer[:-1]
-        elif not control and character and character in "0123456789+-. ,;":
-            if len(self.coordinate_buffer) < 64:
-                self.coordinate_buffer += character
-        self.update_coordinate_prompt(error)
-        if render:
-            self.window.Render()
+    def pump_coordinate_clipboard(self, obj=None, event=None):
+        if self._coordinate_root is not None and not self.coordinate_editing:
+            self._coordinate_root.update()
 
     def lookup_coordinates(self, text, render=True):
         lat, lon = parse_coordinates(text)
@@ -622,7 +1203,7 @@ class MoonWindow:
         self.observer_points.SetPoint(0, *surface_point)
         self.observer_points.Modified()
         elevation = float(sample_dem_bilinear(lat, lon))
-        self.stats.SetInput(
+        self._stats_base = (
             f"MOON HORIZON\n"
             f"Latitude {lat:+.3f} deg    Longitude {lon:+.3f} deg\n"
             f"Elevation {elevation:+,.0f} m    Slope {compute_slope_deg(lat, lon):.1f} deg\n"
@@ -630,6 +1211,7 @@ class MoonWindow:
             f"Horizon angle {np.min(angles):+.2f} to {np.max(angles):+.2f} deg\n"
             "360 bearings; 2 m eye height; terrain search to 250 km\n"
             f"Texture: {self.texture_dimensions[0]} x {self.texture_dimensions[1]}")
+        self.request_sky_update()
         if render:
             self.window.Render()
 
@@ -637,8 +1219,19 @@ class MoonWindow:
         width, height = self.window.GetSize()
         if self.coordinate_editing:
             return
-        if x >= width * 0.59 and y <= height * 0.35:
-            return  # The profile overlay is not a selectable location on the Moon.
+        if self.over_sky_controls(x, y):
+            nx, ny = x / width, y / height
+            if 0.45 <= ny <= 0.49:
+                if 0.61 <= nx <= 0.86:
+                    self.begin_time_entry()
+                elif 0.90 <= nx <= 0.99:
+                    self.set_now()
+            elif 0.36 <= ny <= 0.395:
+                if 0.61 <= nx <= 0.74:
+                    self.step_time(-1)
+                elif 0.77 <= nx <= 0.89:
+                    self.step_time(1)
+            return
         if self.picker.Pick(x, y, 0, self.renderer):
             px, py, pz = self.picker.GetPickPosition()
             radius = np.sqrt(px * px + py * py + pz * pz)
@@ -821,10 +1414,24 @@ class MoonWindow:
 
     def run(self):
         self.interactor.Initialize()
+        self._sky_pump_observer = self.interactor.AddObserver("TimerEvent", self.poll_sky)
+        self._sky_timer = self.interactor.CreateRepeatingTimer(100)
+        self.poll_sky()
         self.window.Render()
         try:
             self.interactor.Start()
         finally:
+            self._sky_stop.set()
+            if self._sky_timer is not None:
+                self.interactor.DestroyTimer(self._sky_timer)
+            if self._sky_pump_observer is not None:
+                self.interactor.RemoveObserver(self._sky_pump_observer)
+            if self._coordinate_timer is not None:
+                self.interactor.DestroyTimer(self._coordinate_timer)
+            if self._coordinate_pump_observer is not None:
+                self.interactor.RemoveObserver(self._coordinate_pump_observer)
+            if self._coordinate_root is not None:
+                self._coordinate_root.destroy()
             self.window.Finalize()
 
 
