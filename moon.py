@@ -471,6 +471,9 @@ class MoonWindow(GlobeMixin, HudMixin):
         # Point comparison (compare.py): the set, and the state of the comparison window.
         self._search_actor = None
         self._search_outline_actor = None
+        self._search_fill_actor = None
+        self._search_fill_picker = None
+        self._search_fill_rows = []
         self._search_point_picker = None
         self._search_rows = []
         self._search_selected = None
@@ -1180,7 +1183,8 @@ class MoonWindow(GlobeMixin, HudMixin):
                     return
                 self.set_points(points)
             rows = dialog.marker_results if dialog.marker_results is not None else dialog.results
-            self.show_visibility_markers(rows[:MAX_DISPLAY_RESULTS], mode=dialog.marker_mode)
+            is_sector = bool(rows and rows[0].get('kind') == 'sector')
+            self.show_visibility_markers(rows if is_sector else rows[:MAX_DISPLAY_RESULTS], mode=dialog.marker_mode)
             if dialog.selected is not None:
                 point = dialog.selected
                 self.lookup_coordinates(f"{point['lat']}, {point['lon']}", render=False)
@@ -1221,13 +1225,19 @@ class MoonWindow(GlobeMixin, HudMixin):
     def show_visibility_markers(self, results, mode='Points'):
         """Draw selectable points and, in cluster mode, colored cell outlines."""
         from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
-        for actor in (self._search_actor, self._search_outline_actor):
+        for actor in (self._search_actor, self._search_outline_actor, self._search_fill_actor):
             if actor is not None:
                 self.renderer.RemoveActor(actor)
         self._search_actor = self._search_outline_actor = self._search_point_picker = None
+        self._search_fill_actor = self._search_fill_picker = None
+        self._search_fill_rows = []
         self._search_rows = list(results)
         if not results:
             return
+        if mode == 'Clusters':
+            self.show_search_cluster_fills(results)
+        if results[0].get('kind') == 'sector':
+            return  # Candidate clusters are areas, not verified point markers.
         lat = np.radians([item['lat'] for item in results])
         lon = np.radians([item['lon'] for item in results])
         directions = np.column_stack((np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)))
@@ -1263,6 +1273,64 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._search_point_picker = picker
         if mode == 'Clusters':
             self.show_search_cell_outlines(results)
+
+    def show_search_cluster_fills(self, results):
+        """Color globe mesh cells under candidate sectors with translucent cluster hues."""
+        from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
+        # The globe uses 0.5-degree quads. Select intersecting quads so even a
+        # sector smaller than one mesh cell has a visible approximation.
+        rows, cols = 360, 720
+        lat_centers = 90.0 - (np.arange(rows) + 0.5) * 180.0 / rows
+        lon_centers = -180.0 + (np.arange(cols) + 0.5) * 360.0 / cols
+        owners = np.full((rows, cols), -1, dtype=np.int32)
+        for index, row in enumerate(results):
+            if not all(k in row for k in ('cell_lat_min', 'cell_lat_max', 'cell_lon_min', 'cell_lon_max')):
+                continue
+            lat0, lat1 = row['cell_lat_min'], row['cell_lat_max']
+            lon0, lon1 = row['cell_lon_min'], row['cell_lon_max']
+            half_lat = (lat1 - lat0) / 2.0
+            half_lon = (lon1 - lon0) / 2.0
+            rs = np.flatnonzero(np.abs(lat_centers - (lat0 + lat1) / 2) < half_lat + 0.25 - 1e-10)
+            delta = (lon_centers - (lon0 + lon1) / 2 + 180) % 360 - 180
+            cs = np.flatnonzero(np.abs(delta) < half_lon + 0.25 - 1e-10)
+            owners[np.ix_(rs, cs)] = index
+        rr, cc = np.nonzero(owners >= 0)
+        if not len(rr):
+            return
+        a = rr * (cols + 1) + cc
+        quads = np.column_stack((a, a + cols + 1, a + cols + 2, a + 1)).astype(np.int64)
+        cells = self.vtk.vtkCellArray()
+        cells.SetData(numpy_to_vtkIdTypeArray(np.arange(0, quads.size + 1, 4, dtype=np.int64), deep=True),
+                      numpy_to_vtkIdTypeArray(quads.ravel(), deep=True))
+        data = self.vtk.vtkPolyData()
+        data.SetPoints(self.mesh.GetPoints())
+        data.SetPolys(cells)
+        indices = owners[rr, cc]
+        palette = np.asarray([np.rint(np.asarray(cluster_color(row.get('cluster_index', 0))) * 255)
+                              for row in results], dtype=np.uint8)
+        data.GetCellData().SetScalars(numpy_to_vtk(np.ascontiguousarray(palette[indices]), deep=True,
+                                                   array_type=self.vtk.VTK_UNSIGNED_CHAR))
+        mapper = self.vtk.vtkPolyDataMapper()
+        mapper.SetInputData(data)
+        mapper.SetScalarModeToUseCellData()
+        mapper.SetColorModeToDirectScalars()
+        self.configure_surface_overlay(mapper)
+        mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(0.0, -3.0)
+        actor = self.vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().LightingOff()
+        actor.GetProperty().SetOpacity(0.35)
+        is_sector = results[0].get('kind') == 'sector'
+        actor.SetPickable(is_sector)
+        self.renderer.AddActor(actor)
+        self._search_fill_actor = actor
+        if is_sector:
+            self._search_fill_rows = [results[int(i)] for i in indices]
+            picker = self.vtk.vtkCellPicker()
+            picker.SetTolerance(0.0001)
+            picker.PickFromListOn()
+            picker.AddPickList(actor)
+            self._search_fill_picker = picker
 
     def show_search_cell_outlines(self, results):
         """Outline matched cells in their cluster colors on the terrain mesh."""
@@ -1309,7 +1377,20 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._search_outline_actor = actor
 
     def pick_search_marker(self, x, y):
-        if self._search_point_picker is None or self._terrain_view:
+        if self._terrain_view:
+            return False
+        if self._search_fill_picker is not None and self._search_fill_picker.Pick(x, y, 0, self.renderer):
+            index = self._search_fill_picker.GetCellId()
+            if 0 <= index < len(self._search_fill_rows):
+                point = np.asarray(self._search_fill_picker.GetPickPosition())
+                camera = np.asarray(self.renderer.GetActiveCamera().GetPosition())
+                hit = self.surface_hit(camera, point - camera)
+                if hit is not None and np.linalg.norm(hit - point) <= 0.002:
+                    self.begin_visibility_search()
+                    if self._visibility_dialog is not None:
+                        self._visibility_dialog.select_sector_on_globe(self._search_fill_rows[index])
+                    return True
+        if self._search_point_picker is None:
             return False
         if not self._search_point_picker.Pick(x, y, 0, self.renderer):
             return False
@@ -1322,6 +1403,11 @@ class MoonWindow(GlobeMixin, HudMixin):
         if hit is None or np.linalg.norm(hit - point) > 0.002:
             return False  # the globe hides the marker
         row = self._search_rows[index]
+        if row.get('kind') == 'sector':
+            self.begin_visibility_search()
+            if self._visibility_dialog is not None:
+                self._visibility_dialog.select_sector_on_globe(row)
+            return True
         self.select_location(row['lat'], row['lon'], render=False)
         self._search_selected = row
         self._stats_base += "\nSearch point selected; press I to analyze its interval"
@@ -1331,7 +1417,7 @@ class MoonWindow(GlobeMixin, HudMixin):
 
     def toggle_terrain_view(self, render=True):
         GlobeMixin.toggle_terrain_view(self, render=False)
-        for actor in (self._search_actor, self._search_outline_actor):
+        for actor in (self._search_actor, self._search_outline_actor, self._search_fill_actor):
             if actor is not None:
                 actor.SetVisibility(not self._terrain_view)
         if render:
