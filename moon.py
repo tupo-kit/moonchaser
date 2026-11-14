@@ -3,14 +3,14 @@
 Install: python -m pip install numpy Pillow vtk skyfield astroquery
 Coordinate editor: requires Tkinter (Linux package: python3-tk).
 Run:     python moon.py
-Texture: python moon.py --texture /path/to/moon_color_8k.jpg
+Texture: python moon.py --texture /path/to/color.jpg
 
-Use your local 8K texture; the NASA elevation map downloads on first run.
+NASA color and elevation maps download on first run and are resized to 13K.
 Left-drag to orbit; middle-drag or Shift-left-drag to pan; wheel to zoom.
-Ctrl-left-drag (or Ctrl-middle-drag) looks around from the current camera position.
+Ctrl-left-drag (or Ctrl-middle-drag) orbits the terrain point under the cursor.
 Click the Moon to select an observer.
 Zoom stops above the terrain. The inset shows all 360 horizon bearings.
-Put moon_color_8k.jpg beside this script to use it automatically.
+Prepared maps are saved beside this script for later runs.
 Press G to enter latitude, longitude; R to reset; F for fullscreen; Escape to close.
 Sun/Earth positions use Skyfield (offline, limited date range) or JPL Horizons via get_angle.py (internet, wide range);
 you pick the model in the time interval window, and only that model is queried. Time defaults to UTC now.
@@ -21,6 +21,7 @@ Use Previous/Next to step samples and Close to return to the horizon-only view.
 """
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import sys
@@ -34,10 +35,13 @@ import numpy as np
 from PIL import Image
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-COLOR_PATH = os.path.join(BASE_DIR, "moon_color_8k.jpg")
-DEM_16_PATH = os.path.join(BASE_DIR, "moon_dem_16.tif")
-DEM_4_PATH = os.path.join(BASE_DIR, "moon_dem.tif")
-DEM_4_URL = "https://svs.gsfc.nasa.gov/vis/a000000/a004700/a004720/ldem_4.tif"
+COLOR_PATH = os.path.join(BASE_DIR, "moon_color_13k.jpg")
+DEM_PATH = os.path.join(BASE_DIR, "moon_dem_13k.tif")
+MAP_SIZE = (12960, 6480)
+COLOR_SOURCE = os.path.join(BASE_DIR, "lroc_color_poles_16k.tif")
+DEM_SOURCE = os.path.join(BASE_DIR, "ldem_64_uint.tif")
+COLOR_SOURCE_URL = "https://svs.gsfc.nasa.gov/vis/a000000/a004700/a004720/lroc_color_poles_16k.tif"
+DEM_SOURCE_URL = "https://svs.gsfc.nasa.gov/vis/a000000/a004700/a004720/ldem_64_uint.tif"
 MOON_RADIUS_M = 1_737_400.0
 RELIEF_EXAGGERATION = 3.0
 
@@ -194,68 +198,88 @@ def download(url, path):
             os.remove(tmp)
 
 
-def load_dem(path):
-    """Return DEM as float32 array (H, 2H) in km, or None if the file is unusable.
-    Reads a real TIFF through PIL; falls back to headerless raw float32."""
+@contextmanager
+def allow_large_nasa_image():
+    # These two known NASA source images exceed Pillow's default pixel limit.
+    # Limit the exception to startup while reading those sources.
+    old_limit = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = None
     try:
-        with Image.open(path) as im:
-            arr = np.array(im, dtype=np.float32)
-        if arr.ndim == 2 and arr.shape[1] == 2 * arr.shape[0]:
-            return arr
-    except Exception:
-        pass
-    size = os.path.getsize(path)
-    for h, w in ((2880, 5760), (720, 1440)):
-        n = h * w * 4
-        if n <= size < n + 100_000:  # tolerate a small header
-            return np.fromfile(path, dtype="<f4", count=h * w, offset=size - n).reshape((h, w))
-    return None
+        yield
+    finally:
+        Image.MAX_IMAGE_PIXELS = old_limit
+
+
+def prepare_nasa_map(source, url, output, expected_size, kind):
+    """Download an identified NASA source and atomically prepare a 13K map."""
+    if os.path.isfile(output):
+        return
+    if not os.path.isfile(source):
+        print(f"Downloading NASA {kind} map; this may take a while...", flush=True)
+        download(url, source)
+    temporary = output + ".part"
+    try:
+        print(f"Preparing 13K {kind} map...", flush=True)
+        with allow_large_nasa_image():
+            with Image.open(source) as image:
+                if image.size != expected_size:
+                    raise ValueError(f"Unexpected {kind} map size {image.size}; expected {expected_size}: {source}")
+                if kind == "elevation":
+                    if image.mode not in ("I;16", "I;16L", "I;16B", "I"):
+                        raise ValueError(f"Expected NASA's 16-bit elevation map, got mode {image.mode}.")
+                    resized = image.resize(MAP_SIZE, Image.Resampling.BILINEAR)
+                    # NASA uint16 is in half-metres, offset +20,000 from the
+                    # signed lunar elevations. Convert to kilometres.
+                    elevations = np.asarray(resized, dtype=np.float32)
+                    elevations -= 20000.0
+                    elevations /= 2000.0
+                    Image.fromarray(elevations).save(temporary, format="TIFF")
+                else:
+                    image = image.convert("RGB")
+                    image = image.resize(MAP_SIZE, Image.Resampling.LANCZOS)
+                    image.save(temporary, format="JPEG", quality=95, subsampling=0)
+        os.replace(temporary, output)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+
+def load_dem(path):
+    """Load the prepared 13K float elevation map in kilometres."""
+    try:
+        with Image.open(path) as image:
+            if image.size != MAP_SIZE or image.mode != "F":
+                raise ValueError(f"Expected a {MAP_SIZE[0]}x{MAP_SIZE[1]} floating-point elevation TIFF: {path}")
+            return np.asarray(image, dtype=np.float32).copy()
+    except (OSError, Image.DecompressionBombError) as error:
+        raise RuntimeError(f"Cannot read elevation map {path}: {error}") from error
 
 
 def get_dem():
-    for p in (DEM_16_PATH, DEM_4_PATH):
-        if os.path.exists(p):
-            d = load_dem(p)
-            if d is not None:
-                return d
-            os.remove(p)  # corrupt/partial file -> re-download
-    download(DEM_4_URL, DEM_4_PATH)
-    d = load_dem(DEM_4_PATH)
-    if d is None:
-        raise RuntimeError("Could not read the downloaded DEM file.")
-    return d
+    prepare_nasa_map(DEM_SOURCE, DEM_SOURCE_URL, DEM_PATH, (23040, 11520), "elevation")
+    return load_dem(DEM_PATH)
 
 
 def choose_texture(texture_path=None):
-    """Prefer the user's real 8K image; never upscale a 2K image."""
     if texture_path:
         path = os.path.abspath(os.path.expanduser(texture_path))
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Texture file does not exist: {path}")
         return path
-    for stem in ("moon_color_8k", "lroc_color_8k"):
-        for extension in (".jpg", ".jpeg", ".png", ".tif", ".tiff"):
-            path = os.path.join(BASE_DIR, stem + extension)
-            if os.path.isfile(path):
-                return path
-    return os.path.join(BASE_DIR, "moon_color_8k.jpg")
+    prepare_nasa_map(COLOR_SOURCE, COLOR_SOURCE_URL, COLOR_PATH, (16384, 8192), "color")
+    return COLOR_PATH
 
 
 def load_data(texture_path=None):
     global dem_km, H, W, R_MAX_M, COLOR_PATH
     COLOR_PATH = choose_texture(texture_path)
-    if not os.path.exists(COLOR_PATH):
-        raise FileNotFoundError(
-            "Place moon_color_8k.jpg beside moon.py, or pass --texture /path/to/your/image.jpg")
     with Image.open(COLOR_PATH) as image:
         print(f"Texture: {os.path.basename(COLOR_PATH)} ({image.width} x {image.height})", flush=True)
         image.verify()
-    print("Loading Moon elevation map...", flush=True)
+    print("Loading 13K Moon elevation map...", flush=True)
     dem_km = get_dem()
     if not np.all(np.isfinite(dem_km)):
         raise RuntimeError("The elevation map contains invalid values.")
-    if float(np.max(np.abs(dem_km))) > 100.0:
-        dem_km = dem_km / 1000.0
     H, W = dem_km.shape
     R_MAX_M = MOON_RADIUS_M + float(np.max(dem_km)) * 1000.0
 
@@ -325,6 +349,48 @@ def compute_horizon_360(lat_deg, lon_deg, eye_height_m=2.0, max_dist_km=250.0, s
     return np.degrees(max_angles), h_dists, h_lats, h_lons
 
 
+def terrain_panorama_samples(lat_deg, lon_deg, texture_rgb, max_dist_km=250.0, step_km=0.5):
+    """Project terrain samples into azimuth/elevation and sample map colors.
+
+    Distances match compute_horizon_360. The DEM and map are coarse; this is
+    an approximate, daytime surface view, not a photograph or lighting model.
+    """
+    az = np.radians(np.arange(360))
+    lat0, lon0 = np.radians([lat_deg, lon_deg])
+    up = np.array([np.cos(lat0) * np.cos(lon0), np.cos(lat0) * np.sin(lon0), np.sin(lat0)])
+    north = np.array([-np.sin(lat0) * np.cos(lon0), -np.sin(lat0) * np.sin(lon0), np.cos(lat0)])
+    east = np.array([-np.sin(lon0), np.cos(lon0), 0.0])
+    direction = np.cos(az)[:, None] * north + np.sin(az)[:, None] * east
+    distances = np.unique(np.concatenate((np.arange(0.05, min(step_km, max_dist_km), 0.05),
+                                         np.arange(step_km, max_dist_km, step_km), [max_dist_km])))
+    theta = distances * 1000.0 / MOON_RADIUS_M
+    points = np.cos(theta)[None, :, None] * up + np.sin(theta)[None, :, None] * direction[:, None, :]
+    lat = np.degrees(np.arctan2(points[..., 2], np.hypot(points[..., 0], points[..., 1])))
+    lon = np.degrees(np.arctan2(points[..., 1], points[..., 0]))
+    ground_r = MOON_RADIUS_M + sample_dem_bilinear(lat, lon)
+    observer_r = MOON_RADIUS_M + float(sample_dem_bilinear(lat_deg, lon_deg)) + 2.0
+    angles = np.degrees(np.arctan2(ground_r * np.cos(theta)[None, :] - observer_r,
+                                   ground_r * np.sin(theta)[None, :]))
+    h, w = texture_rgb.shape[:2]
+    row = np.clip(((90.0 - lat) / 180.0 * h).astype(int), 0, h - 1)
+    col = np.mod(((lon + 180.0) / 360.0 * w).astype(int), w)
+    return np.maximum.accumulate(angles, axis=1), texture_rgb[row, col]
+
+
+def terrain_panorama_rgba(samples, low, high, rows=256):
+    """Fill each pixel with its nearest terrain sample; sky remains transparent."""
+    angles, colors = samples
+    levels = np.linspace(low, high, rows)
+    pixels = np.zeros((rows, 361, 4), dtype=np.uint8)
+    for bearing in range(360):
+        indices = np.searchsorted(angles[bearing], levels, side="left")
+        visible = indices < angles.shape[1]
+        pixels[visible, bearing, :3] = colors[bearing, indices[visible]]
+        pixels[visible, bearing, 3] = 255
+    pixels[:, 360] = pixels[:, 0]
+    return pixels
+
+
 def compute_slope_deg(lat, lon):
     step = 180.0 / H  # one DEM pixel in degrees
     lat_hi, lat_lo = min(lat + step, 90.0), max(lat - step, -90.0)
@@ -374,9 +440,8 @@ class CoordinateDialog:
         self.text.grid(row=1, column=0, columnspan=2, sticky="ew")
         self.text.insert("1.0", initial_text)
         self.text.edit_reset()
-        self.error = tk.StringVar(master=self.window)
-        ttk.Label(frame, textvariable=self.error, foreground="#c02020", wraplength=430).grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        self.error = ttk.Label(frame, foreground="#c02020", wraplength=430)
+        self.error.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 4))
         ttk.Button(frame, text="Cancel", command=self.window.destroy).grid(
             row=3, column=0, sticky="e", padx=(0, 8))
         ttk.Button(frame, text="Go", command=self.submit).grid(row=3, column=1, sticky="e")
@@ -476,7 +541,7 @@ class CoordinateDialog:
         try:
             self.on_submit(self.text.get("1.0", "end-1c"))
         except ValueError as error:
-            self.error.set(str(error))
+            self.error.configure(text=str(error))
             self.text.focus_set()
         else:
             self.window.destroy()
@@ -514,22 +579,24 @@ class TimeIntervalDialog:
         self.method.grid(row=3, column=1, sticky="ew", pady=4)
         ttk.Label(frame, text=f"UTC dates: YYYY-MM-DD HH:MM:SS. Up to {MAX_TIME_SAMPLES} samples.").grid(
             row=4, column=0, columnspan=2, sticky="w", pady=6)
-        self.error = tk.StringVar(master=self.window)
-        ttk.Label(frame, textvariable=self.error, foreground="#c02020", wraplength=430).grid(
-            row=5, column=0, columnspan=2, sticky="w")
+        self.error = ttk.Label(frame, foreground="#c02020", wraplength=430)
+        self.error.grid(row=5, column=0, columnspan=2, sticky="w")
+
+        self.apply_button = ttk.Button(frame, text="Apply interval")
 
         def apply(event=None):
             try:
                 on_submit(self.fields[0].get(), self.fields[1].get(),
                           float(self.fields[2].get()), self.unit.get(), self.method.get())
             except ValueError as error:
-                self.error.set(str(error))
+                self.error.configure(text=str(error))
             else:
                 self.window.destroy()
             return "break"
 
         ttk.Button(frame, text="Cancel", command=self.window.destroy).grid(row=6, column=0, pady=(10, 0))
-        ttk.Button(frame, text="Apply interval", command=apply).grid(row=6, column=1, sticky="e", pady=(10, 0))
+        self.apply_button.configure(command=apply)
+        self.apply_button.grid(row=6, column=1, sticky="e", pady=(10, 0))
         self.window.bind("<Return>", apply)
         self.window.bind("<Escape>", lambda event: self.window.destroy())
         self.window.update_idletasks()
@@ -556,6 +623,12 @@ class MoonWindow:
         self._sky_progress = queue.Queue()
         self._sky_stop = threading.Event()
         self._sky_thread = None
+        self._preload_lock = threading.Lock()
+        self._preload_state = ("loading", "") if enable_ephemeris and ephemeris_fetcher is None else ("ready", "")
+        self._preload_running = False
+        self._preload_done = threading.Event()
+        if self._preload_state[0] == "ready":
+            self._preload_done.set()
         self._sky_timer = self._sky_pump_observer = None
         self._sky_generation = 0
         self._sky_data = None
@@ -676,11 +749,15 @@ class MoonWindow:
         self._coordinate_pump_observer = None
         self.help = self.make_text(0.025, 0.035, 15)
         self.help.SetInput("Left-drag: orbit   |   Middle/Shift-drag: pan\n"
-                           "Ctrl-drag: look around   |   Wheel: zoom   |   Click: select\n"
+                           "Ctrl-drag: orbit cursor point   |   Wheel: zoom   |   Click: select\n"
                            "G: coordinates   |   T: time interval   |   R: reset\n"
                            "F: fullscreen   |   Esc: close\n"
                            "Cyan: local horizon   |   Orange: observer   |   Relief: 3x")
         self.profile_background = self.make_profile_background()
+        self._panorama_samples = None
+        self._panorama_range = None
+        self._panorama_texture_rgb = None
+        self.panorama = self.make_panorama_actor()
         self.profile_title = self.make_text(0.61, 0.32, 14, top=True)
         self.profile = self.make_overlay_lines([], (0.0, 0.9, 1.0), 2)
         self.profile_axes = self.make_overlay_lines([
@@ -751,6 +828,7 @@ class MoonWindow:
                 self._moon_drag_dragged = False
                 self._moon_drag_mode = self._moon_drag_button = None
                 self._moon_drag_pan_depth = None
+                self._moon_drag_cursor_pivot = None
                 self.AddObserver("LeftButtonPressEvent", self.left_down)
                 self.AddObserver("LeftButtonReleaseEvent", self.left_up)
                 self.AddObserver("MiddleButtonPressEvent", self.middle_down)
@@ -780,6 +858,8 @@ class MoonWindow:
                     self._moon_drag_mode = "ui"
                 self._moon_drag_last = self._moon_drag_press
                 self._moon_drag_dragged = False
+                self._moon_drag_cursor_pivot = (owner.cursor_surface_target(*self._moon_drag_press)
+                                                if self._moon_drag_mode == "look" else None)
                 self._moon_drag_pan_depth = float(np.linalg.norm(
                     np.array(owner.renderer.GetActiveCamera().GetPosition()) - owner.view_surface_target()))
 
@@ -799,7 +879,7 @@ class MoonWindow:
                     if self._moon_drag_mode == "pan":
                         owner.pan(dx, dy, depth=self._moon_drag_pan_depth)
                     elif self._moon_drag_mode == "look":
-                        owner.look_around(dx, dy)
+                        owner.orbit_cursor(dx, dy, self._moon_drag_cursor_pivot)
                     else:
                         owner.orbit(dx, dy)
                 self._moon_drag_last = current
@@ -817,6 +897,7 @@ class MoonWindow:
                     owner.pick(*self.GetInteractor().GetEventPosition())
                 self._moon_drag_press = self._moon_drag_last = None
                 self._moon_drag_mode = self._moon_drag_button = self._moon_drag_pan_depth = None
+                self._moon_drag_cursor_pivot = None
 
             def key_press(self, obj, event):
                 interactor = self.GetInteractor()
@@ -855,6 +936,34 @@ class MoonWindow:
         self.interactor.SetInteractorStyle(self.style)
         self.select_location(self.lat, self.lon, render=False)
         self.reset_camera()
+        if self._enable_ephemeris and self._ephemeris_fetcher is None:
+            self.start_skyfield_preload()
+
+    def start_skyfield_preload(self):
+        with self._preload_lock:
+            if self._preload_running or self._preload_state[0] == "ready":
+                return
+            self._preload_running = True
+            self._preload_done.clear()
+            self._preload_state = ("loading", "")
+        def load_data():
+            try:
+                from skyfield_positions import preload
+                preload()
+            except Exception as error:
+                message = str(error).strip().splitlines()
+                result = ("error", (message[0] if message else type(error).__name__)[:200])
+            else:
+                result = ("ready", "")
+            with self._preload_lock:
+                self._preload_state = result
+                self._preload_running = False
+                self._preload_done.set()
+        threading.Thread(target=load_data, daemon=True).start()
+
+    def skyfield_preload_status(self):
+        with self._preload_lock:
+            return self._preload_state
 
     def make_text(self, x, y, size, top=False):
         actor = self.vtk.vtkTextActor()
@@ -896,6 +1005,57 @@ class MoonWindow:
         actor.GetProperty().SetColor(0.025, 0.035, 0.055)
         self.renderer.AddViewProp(actor)
         return actor
+
+    def make_panorama_actor(self):
+        """A textured quad between the graph background and its overlays."""
+        points = self.vtk.vtkPoints()
+        for _ in range(4):
+            points.InsertNextPoint(0, 0, 0)
+        self._panorama_quad_points = points
+        cells = self.vtk.vtkCellArray()
+        cells.InsertNextCell(4)
+        for index in range(4):
+            cells.InsertCellPoint(index)
+        data = self.vtk.vtkPolyData()
+        data.SetPoints(points)
+        data.SetPolys(cells)
+        coords = self.vtk.vtkFloatArray()
+        coords.SetNumberOfComponents(2)
+        for uv in ((0, 0), (1, 0), (1, 1), (0, 1)):
+            coords.InsertNextTuple2(*uv)
+        data.GetPointData().SetTCoords(coords)
+        self._panorama_image = self.vtk.vtkImageData()
+        texture = self.vtk.vtkTexture()
+        texture.SetInputData(self._panorama_image)
+        texture.InterpolateOn()
+        actor = self.vtk.vtkTexturedActor2D()
+        actor.SetMapper(self.overlay_mapper(data))
+        actor.SetTexture(texture)
+        actor.PickableOff()
+        self._panorama_texture = texture
+        self.renderer.AddViewProp(actor)
+        return actor
+
+    def update_panorama(self):
+        if self._panorama_samples is None:
+            self.panorama.SetVisibility(False)
+            return
+        self.panorama.SetVisibility(True)
+        x0, x1, y0, y1 = self._plot_box
+        for i, (x, y) in enumerate(((x0, y0), (x1, y0), (x1, y1), (x0, y1))):
+            self._panorama_quad_points.SetPoint(i, x, y, 0)
+        self._panorama_quad_points.Modified()
+        self.panorama.GetMapper().GetInput().Modified()
+        limits = (self._profile_low, self._profile_high)
+        if limits != self._panorama_range:
+            from vtk.util.numpy_support import numpy_to_vtk
+            rgba = terrain_panorama_rgba(self._panorama_samples, *limits)
+            self._panorama_image.SetDimensions(rgba.shape[1], rgba.shape[0], 1)
+            colors = numpy_to_vtk(rgba.reshape(-1, 4), deep=True, array_type=self.vtk.VTK_UNSIGNED_CHAR)
+            colors.SetNumberOfComponents(4)
+            self._panorama_image.GetPointData().SetScalars(colors)
+            self._panorama_image.Modified()
+            self._panorama_range = limits
 
     def overlay_lines_data(self, segments):
         points = self.vtk.vtkPoints()
@@ -1081,34 +1241,18 @@ class MoonWindow:
                 hide_labels(panel)
                 continue
             xs = x0 + (x1 - x0) * seconds / span
-            if key == "Sun":
-                # Measure the Sun's centre against the local terrain horizon.
-                # Below-horizon values are clamped to the zero baseline.
-                low = 0.0
-                high = max(0.01, max(float(np.max(np.maximum(
-                    data[n]["el"] - data[n]["terrain"], 0.0))) for n in names) * 1.08)
-                for name in names:
-                    clearance = np.maximum(data[name]["el"] - data[name]["terrain"], 0.0)
-                    ys = y0 + (y1 - y0) * clearance / high
-                    self.panel_lines[name].GetMapper().SetInputData(
-                        self.overlay_lines_data([np.column_stack((xs, ys))]))
-                panel["title"].SetInput("Sun centre above terrain horizon vs time (UTC)\n"
-                                        "0 deg = terrain horizon; below horizon shown as 0\n"
-                                        f"Scale 0 to {high:.1f} deg")
-            else:
-                low = min(float(min(np.min(data[n]["el"]), np.min(data[n]["terrain"]))) for n in names)
-                high = max(float(max(np.max(data[n]["el"]), np.max(data[n]["terrain"]))) for n in names)
-                padding = max((high - low) * 0.08, 0.01)
-                low, high = low - padding, high + padding
-                for name in names:
-                    ys = y0 + (y1 - y0) * (data[name]["el"] - low) / (high - low)
-                    ts = y0 + (y1 - y0) * (data[name]["terrain"] - low) / (high - low)
-                    self.panel_lines[name].GetMapper().SetInputData(
-                        self.overlay_lines_data([np.column_stack((xs, ys))]))
-                    self.panel_terrain[name].GetMapper().SetInputData(
-                        self.overlay_lines_data([np.column_stack((xs, ts))]))
-                panel["title"].SetInput(f"{title}\nColour: {key} centre   Cyan: terrain horizon at the {key}'s bearing\n"
-                                        f"Scale {low:+.1f} to {high:+.1f} deg")
+            # Plot the body centre relative to the terrain in its direction.
+            low = 0.0
+            high = max(0.01, max(float(np.max(np.maximum(
+                data[n]["el"] - data[n]["terrain"], 0.0))) for n in names) * 1.08)
+            for name in names:
+                clearance = np.maximum(data[name]["el"] - data[name]["terrain"], 0.0)
+                ys = y0 + (y1 - y0) * clearance / high
+                self.panel_lines[name].GetMapper().SetInputData(
+                    self.overlay_lines_data([np.column_stack((xs, ys))]))
+            panel["title"].SetInput(f"{key} centre above terrain horizon vs time (UTC)\n"
+                                    "0 deg = terrain horizon; below horizon shown as 0\n"
+                                    f"Scale 0 to {high:.1f} deg")
             for fraction, label in zip(np.linspace(0, 1, 5), panel["xlabels"]):
                 label.SetInput(f"{epochs[0] + timedelta(seconds=float(fraction) * span):%m-%d %H:%M}")
                 label.SetVisibility(True)
@@ -1142,8 +1286,10 @@ class MoonWindow:
                     continue
                 low = min(low, float(np.min(body["el"] - body["radius"])))
                 high = max(high, float(np.max(body["el"] + body["radius"])))
+        low = min(low, float(np.min(angles)) - 5.0)
         padding = max((high - low) * 0.08, 0.01)
         self._profile_low, self._profile_high = low - padding, high + padding
+        self.update_panorama()
         values = np.append(angles, angles[0])
         x0, x1, y0, y1 = self._plot_box
         x = np.linspace(x0, x1, len(values))
@@ -1290,8 +1436,15 @@ class MoonWindow:
             result[name] = {"az": az % 360.0, "el": el, "radius": np.full(len(az), radius)}
         return result
 
-    @staticmethod
-    def fetch_skyfield(lon, lat, altitude, epochs, progress=None):
+    def fetch_skyfield(self, lon, lat, altitude, epochs, progress=None):
+        if self.skyfield_preload_status()[0] != "ready":
+            self.start_skyfield_preload()
+            if progress is not None:
+                progress("Preparing Skyfield data")
+            self._preload_done.wait()
+            status, detail = self.skyfield_preload_status()
+            if status != "ready":
+                raise RuntimeError(f"Skyfield data unavailable: {detail}")
         try:
             from skyfield_positions import get_positions
         except ImportError as error:
@@ -1536,6 +1689,13 @@ class MoonWindow:
         angles, distances, hlat, hlon = compute_horizon_360(lat, lon)
         self.horizon_angles = angles
         self.horizon_distances = distances
+        if self._panorama_texture_rgb is None:
+            with Image.open(COLOR_PATH) as texture_image:
+                texture_image = texture_image.convert("RGB")
+                texture_image.thumbnail((2048, 1024), Image.Resampling.LANCZOS)
+                self._panorama_texture_rgb = np.asarray(texture_image)
+        self._panorama_samples = terrain_panorama_samples(lat, lon, self._panorama_texture_rgb)
+        self._panorama_range = None
         self.update_profile(angles)
         # Follow the terrain between bearings rather than drawing straight chords
         # that can pass below the surface when adjacent horizon distances differ.
@@ -1737,14 +1897,41 @@ class MoonWindow:
         if render:
             self.window.Render()
 
-    def look_around(self, dx, dy, render=True):
-        """Turn the view in place: the camera position is the rotation centre."""
+    def cursor_surface_target(self, x, y):
+        """Pick a terrain pivot without changing the selected observer."""
+        if self.picker.Pick(x, y, 0, self.renderer):
+            return np.asarray(self.picker.GetPickPosition(), dtype=float)
+        return np.asarray(self.view_surface_target(), dtype=float)
+
+    def orbit_cursor(self, dx, dy, pivot, render=True):
+        """Orbit around the pressed terrain point; drag follows the mouse."""
         camera = self.renderer.GetActiveCamera()
+        pivot = np.asarray(pivot, dtype=float)
         height = max(self.window.GetSize()[1], 1)
         speed = np.degrees(2 * np.tan(np.radians(camera.GetViewAngle()) / 2) / height)
-        camera.Yaw(dx * speed)
-        camera.Pitch(dy * speed)
-        camera.OrthogonalizeViewUp()
+        position = np.asarray(camera.GetPosition(), dtype=float)
+        focus = np.asarray(camera.GetFocalPoint(), dtype=float)
+        up = np.asarray(camera.GetViewUp(), dtype=float)
+        forward = np.asarray(camera.GetDirectionOfProjection(), dtype=float)
+        right = np.cross(forward, up)
+        right /= np.linalg.norm(right)
+
+        def rotate(vector, axis, degrees):
+            axis = axis / np.linalg.norm(axis)
+            angle = np.radians(degrees)
+            return (vector * np.cos(angle) + np.cross(axis, vector) * np.sin(angle)
+                    + axis * np.dot(axis, vector) * (1 - np.cos(angle)))
+
+        # Drag right moves the surrounding surface right; drag up moves it up.
+        yaw = -dx * speed
+        pitch = dy * speed
+        yawed_right = rotate(right, up, yaw)
+        def turn(vector):
+            return rotate(rotate(vector, up, yaw), yawed_right, pitch)
+        camera.SetPosition(*(pivot + turn(position - pivot)))
+        camera.SetFocalPoint(*(pivot + turn(focus - pivot)))
+        camera.SetViewUp(*turn(up))
+        self.constrain_camera()
         if render:
             self.window.Render()
 
@@ -1801,7 +1988,7 @@ class MoonWindow:
 
 def main():
     parser = argparse.ArgumentParser(description="Native Moon terrain and horizon viewer")
-    parser.add_argument("--texture", help="Path to your 8K (or other resolution) Moon texture")
+    parser.add_argument("--texture", help="Optional path to a Moon color texture")
     arguments = parser.parse_args()
     try:
         load_data(arguments.texture)
