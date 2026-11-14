@@ -9,6 +9,7 @@ Texture path is read as terrain.COLOR_PATH (set by terrain.load_data()).
 import numpy as np
 
 import terrain
+from compare import MAX_POINTS, POINT_COLORS
 from terrain import MOON_RADIUS_M, graticule_lines, lat_lon_to_xyz, choose_graticule_step, pole_heights, sample_dem_bilinear
 
 class GlobeMixin:
@@ -108,7 +109,11 @@ class GlobeMixin:
         self._grid_built = None  # (step, unit vector of the cap centre, cap radius in degrees)
         self.grid_minor = self.make_graticule_actor((0.85, 0.9, 1.0), 1.5, 0.6, -2.0)
         self.grid_major = self.make_graticule_actor((1.0, 0.85, 0.2), 3.0, 0.95, -3.0)
-        self.grid_caption = self.make_text(0.025, 0.19, 14)
+        self.grid_caption = self.make_text(0.025, 0.23, 14)
+        # Comparison points: a coloured surface mark and a screen-space number each (refresh_point_marks).
+        self.point_marks = []
+        self._points_note = ""
+        self.points_caption = self.make_text(0.025, 0.26, 14)
         # North and south pole marks: a point on the surface and a screen-space letter.
         self.pole_marks = {1: self.make_pole_mark(1), -1: self.make_pole_mark(-1)}
         self.renderer.AddObserver("StartEvent", self.on_render_start)
@@ -268,9 +273,74 @@ class GlobeMixin:
         self.grid_major.SetVisibility(True)
         self.grid_caption.SetInput(f"Grid: every {step:g} deg   (L: hide)")
 
+    def refresh_point_marks(self):
+        """Rebuild the marks of the comparison set (self._points) on the Moon."""
+        for mark in self.point_marks:
+            self.renderer.RemoveActor(mark["point"])
+            self.renderer.RemoveViewProp(mark["label"])
+        self.point_marks = []
+        for index, (lat, lon) in enumerate(self._points):
+            color = POINT_COLORS[index % len(POINT_COLORS)]
+            position = self.terrain_overlay_points(np.array(lat_lon_to_xyz(lat, lon, offset=0.0)))[0]
+            points = self.vtk.vtkPoints()
+            points.SetDataTypeToDouble()
+            points.InsertNextPoint(*position)
+            vertices = self.vtk.vtkCellArray()
+            vertices.InsertNextCell(1)
+            vertices.InsertCellPoint(0)
+            data = self.vtk.vtkPolyData()
+            data.SetPoints(points)
+            data.SetVerts(vertices)
+            mapper = self.vtk.vtkPolyDataMapper()
+            mapper.SetInputData(data)
+            self.configure_surface_overlay(mapper)
+            actor = self.vtk.vtkActor()
+            actor.SetMapper(mapper)
+            actor.GetProperty().SetColor(*color)
+            actor.GetProperty().LightingOff()
+            actor.GetProperty().SetPointSize(12)
+            actor.GetProperty().RenderPointsAsSpheresOn()
+            actor.PickableOff()
+            self.renderer.AddActor(actor)
+            label = self.make_text(0.5, 0.5, 18)
+            label.SetInput(str(index + 1))
+            prop = label.GetTextProperty()
+            prop.SetColor(*color)
+            prop.SetBold(True)
+            prop.SetJustificationToCentered()
+            label.SetVisibility(False)
+            self.point_marks.append({"point": actor, "label": label, "position": np.asarray(position, dtype=float)})
+
+    def update_point_marks(self):
+        """Show each comparison number next to its mark while the mark is on the camera's side of the Moon."""
+        show = not self._terrain_view and not self._graph_expanded
+        width, height = self.window.GetSize()
+        camera_position = np.array(self.renderer.GetActiveCamera().GetPosition())
+        for mark in self.point_marks:
+            position = mark["position"]
+            mark["point"].SetVisibility(show)
+            placed = False
+            if show and width > 0 and height > 0 and float(np.dot(position, camera_position - position)) > 0.0:
+                self.renderer.SetWorldPoint(position[0], position[1], position[2], 1.0)
+                self.renderer.WorldToDisplay()
+                x, y, _ = self.renderer.GetDisplayPoint()
+                if 0.0 <= x <= width and 0.0 <= y <= height:
+                    mark["label"].SetPosition(x / width, (y + 14.0) / height)
+                    placed = True
+            mark["label"].SetVisibility(placed)
+        count = len(self._points)
+        text = (f"Comparison points: {count}/{MAX_POINTS}   (Shift+click / A: add, P: manage"
+                + (", T: compare)" if count >= 2 else ")")) if count else \
+            "Comparison points: none   (Shift+click / A: add, P: manage / load)"
+        if self._points_note:
+            text += "\n" + self._points_note
+        self.points_caption.SetInput(text)
+        self.points_caption.SetVisibility(show)
+
     def on_render_start(self, obj=None, event=None):
         self.update_graticule()
         self.update_pole_marks()
+        self.update_point_marks()
 
     def terrain_overlay_points(self, directions):
         """Project marks onto the same mesh used to render the Moon."""
@@ -516,12 +586,7 @@ class GlobeMixin:
             camera.SetViewUp(*up)
             camera.SetViewAngle(angle)
             self.constrain_camera()
-            self.help.SetInput("Left-drag: orbit   |   Middle/Shift-drag: pan\n"
-                               "Ctrl-drag: orbit cursor point   |   Wheel: zoom   |   Click: select\n"
-                               "G: coordinates   |   T: time interval   |   V: terrain view\n"
-                               "R: reset   |   F: fullscreen   |   Esc: close\n"
-                               "Cyan: local horizon   |   Orange: observer   |   Relief: 3x\n"
-                               "L: lat/lon grid (auto detail)   |   Red N / blue S: poles")
+            self.help.SetInput(self.GLOBE_HELP)
         if render:
             self.window.Render()
 

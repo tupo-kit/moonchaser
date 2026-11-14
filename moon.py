@@ -17,6 +17,11 @@ you pick the model in the time interval window, and only that model is queried. 
 Press T to choose a time range; this opens a fullscreen horizon + Sun/Earth graph.
 That window scrolls (mouse wheel, Up/Down, PageUp/PageDown, Home/End) to more graphs: Sun elevation vs
 time and Earth elevation vs time.
+Point comparison: Shift+click (or A for the current point) adds numbered, coloured points; P opens the point
+manager (add, remove, save to / load from a file; only the coordinates are stored). With 2 or more points T opens
+the comparison: the usual window, but the horizon graph shows one point (use the < > buttons, or the , and .
+keys, to change it), the Sun/Earth graphs combine all points (a button per point switches its graph on/off)
+and, further down the page, tables compare sunlight, Earth visibility and the azimuth / elevation statistics.
 Use Previous/Next, the Left/Right arrow keys (Shift: 10 samples) or the time slider under the horizon graph to step
 samples; drag the scroll bar at the right edge to scroll; Close returns to the horizon-only view.
 
@@ -25,8 +30,9 @@ Files (keep them in one folder; run moon.py):
   sky.py      time helpers, Sun/Earth visibility classification, Skyfield (offline) and JPL Horizons (online).
   hud.py      HudMixin: 2D overlay HUD, horizon inset, Sun/Earth graphs, slider, scroll bar.
   globe.py    GlobeMixin: 3D globe, camera/navigation, picking, grid, pole marks, terrain view.
+  compare.py  point comparison without VTK/UI: palette, point-set files, statistics, table text.
   moon.py     Tk dialogs, MoonWindow (glue: state, input handling, sky worker thread) and main().
-Dependencies: terrain <- sky <- hud, globe <- moon. Other files must use `terrain.COLOR_PATH`, not a copy.
+Dependencies: terrain <- sky <- compare <- hud, globe <- moon. Other files must use `terrain.COLOR_PATH`, not a copy.
 """
 
 import argparse
@@ -41,6 +47,7 @@ from PIL import Image
 
 import sky
 import terrain
+from compare import (MAX_POINTS, load_points, normalize_point, point_stats, same_point, save_points)
 from globe import GlobeMixin
 from hud import SCROLL_STEP, HudMixin
 from sky import (MAX_TIME_SAMPLES, SKY_METHODS, TIME_UNITS, classify_sky, get_positions, load_interval, parse_utc,
@@ -179,12 +186,12 @@ class CoordinateDialog:
 
 
 class TimeIntervalDialog:
-    def __init__(self, parent, start, stop, step, unit, on_submit, method="Skyfield"):
+    def __init__(self, parent, start, stop, step, unit, on_submit, method="Skyfield", title=None):
         import tkinter as tk
         from tkinter import ttk
 
         self.window = tk.Toplevel(parent)
-        self.window.title("Sun / Earth time interval (UTC)")
+        self.window.title(title or "Sun / Earth time interval (UTC)")
         self.window.resizable(False, False)
         frame = ttk.Frame(self.window, padding=14)
         frame.grid()
@@ -236,6 +243,132 @@ class TimeIntervalDialog:
         self.fields[0].selection_range(0, "end")
 
 
+class PointsDialog:
+    """Edit the comparison set: add the current location or typed coordinates, remove, save and load."""
+
+    def __init__(self, parent, points, current, on_submit):
+        import tkinter as tk
+        from tkinter import ttk
+
+        self.points = list(points)
+        self.current = current
+        self.on_submit = on_submit
+        self.window = tk.Toplevel(parent)
+        self.window.title("Comparison points")
+        self.window.resizable(False, False)
+        frame = ttk.Frame(self.window, padding=14)
+        frame.grid(sticky="nsew")
+        ttk.Label(frame, text=f"Points to compare (2 to {MAX_POINTS}):  latitude, longitude").grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self.listbox = tk.Listbox(frame, width=34, height=12, selectmode="extended",
+                                  exportselection=False, font="TkFixedFont")
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=scrollbar.set)
+        self.listbox.grid(row=1, column=0, rowspan=6, sticky="nsew")
+        scrollbar.grid(row=1, column=1, rowspan=6, sticky="ns")
+        buttons = (("Add current location", self.add_current), ("Remove selected", self.remove_selected),
+                   ("Clear all", self.clear), ("Load (replace)...", lambda: self.load(False)),
+                   ("Load (add)...", lambda: self.load(True)), ("Save...", self.save))
+        for row, (label, command) in enumerate(buttons, start=1):
+            ttk.Button(frame, text=label, command=lambda c=command: self.guard(c)).grid(
+                row=row, column=2, sticky="ew", padx=(10, 0), pady=2)
+        ttk.Label(frame, text="Add by coordinates, e.g. -43.31, -11.36").grid(
+            row=7, column=0, columnspan=3, sticky="w", pady=(10, 2))
+        self.entry = ttk.Entry(frame, width=30)
+        self.entry.grid(row=8, column=0, columnspan=2, sticky="ew")
+        ttk.Button(frame, text="Add", command=lambda: self.guard(self.add_typed)).grid(
+            row=8, column=2, sticky="ew", padx=(10, 0))
+        self.error = ttk.Label(frame, foreground="#c02020", wraplength=430)
+        self.error.grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 4))
+        bottom = ttk.Frame(frame)
+        bottom.grid(row=10, column=0, columnspan=3, sticky="e", pady=(6, 0))
+        ttk.Button(bottom, text="Cancel", command=self.window.destroy).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(bottom, text="Apply", command=self.apply).grid(row=0, column=1)
+        self.entry.bind("<Return>", lambda event: (self.guard(self.add_typed), "break")[-1])
+        self.entry.bind("<Control-a>", lambda event: (event.widget.selection_range(0, "end"), "break")[-1])
+        self.window.bind("<Escape>", lambda event: self.window.destroy())
+        self.refresh()
+        self.window.update_idletasks()
+        self.window.lift()
+        self.window.grab_set()
+        self.entry.focus_force()
+
+    def refresh(self):
+        self.listbox.delete(0, "end")
+        for number, (lat, lon) in enumerate(self.points, start=1):
+            self.listbox.insert("end", f"P{number:<2} {lat:+10.5f}, {lon:+11.5f}")
+
+    def guard(self, action):
+        try:
+            action()
+        except ValueError as error:
+            self.error.configure(text=str(error))
+        else:
+            self.error.configure(text="")
+        self.refresh()
+
+    def add(self, lat, lon):
+        point = normalize_point(lat, lon)
+        if any(same_point(point, other) for other in self.points):
+            raise ValueError("That point is already in the set.")
+        if len(self.points) >= MAX_POINTS:
+            raise ValueError(f"A set holds at most {MAX_POINTS} points.")
+        self.points.append(point)
+
+    def add_current(self):
+        self.add(*self.current)
+
+    def add_typed(self):
+        lat, lon = parse_coordinates(self.entry.get())
+        self.add(lat, lon)
+        self.entry.delete(0, "end")
+
+    def remove_selected(self):
+        chosen = set(self.listbox.curselection())
+        if not chosen:
+            raise ValueError("Select the points to remove first.")
+        self.points = [point for index, point in enumerate(self.points) if index not in chosen]
+
+    def clear(self):
+        self.points = []
+
+    def save(self):
+        from tkinter import filedialog
+        if not self.points:
+            raise ValueError("There are no points to save.")
+        path = filedialog.asksaveasfilename(
+            parent=self.window, title="Save points", defaultextension=".json", initialfile="moon_points.json",
+            filetypes=(("Point set (JSON)", "*.json"), ("All files", "*.*")))
+        if path:
+            try:
+                save_points(path, self.points)
+            except OSError as error:
+                raise ValueError(f"Could not save the file: {error}") from None
+
+    def load(self, append):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            parent=self.window, title="Load points",
+            filetypes=(("Point set (JSON or text)", "*.json *.txt *.csv"), ("All files", "*.*")))
+        if not path:
+            return
+        loaded = load_points(path)
+        if not append:
+            self.points = loaded
+            return
+        merged = list(self.points)
+        for point in loaded:
+            if not any(same_point(point, other) for other in merged):
+                merged.append(point)
+        if len(merged) > MAX_POINTS:
+            raise ValueError(f"A set holds at most {MAX_POINTS} points; loading would give {len(merged)}.")
+        self.points = merged
+
+    def apply(self):
+        self.on_submit(list(self.points))
+        self.window.destroy()
+
+
 class MoonWindow(GlobeMixin, HudMixin):
     """VTK owns the desktop window and mouse interaction; no HTML is involved."""
 
@@ -271,6 +404,14 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._legend_expanded = True
         self._saved_interval = load_interval()
         self._sky_method = self._saved_interval[4] if self._saved_interval else "Skyfield"
+        # Point comparison (compare.py): the set, and the state of the comparison window.
+        self._points = []              # [(lat, lon), ...] chosen with Shift+click / A / P
+        self._compare_active = False   # True: the graph window compares _compare_points
+        self._compare_points = []      # snapshot of _points used by the running comparison
+        self._compare_index = 0        # point shown in the horizon graph
+        self._compare_visible = []     # per point: shown in the combined Sun/Earth graphs
+        self._compare = None           # results: points, horizons, data, errors, epochs, source, stats
+        self._stats_above_only = True  # azimuth / elevation statistics over samples above the horizon only
         self._graph_expanded = False  # False: horizon only. True: fullscreen horizon + Sun/Earth graph.
         self._scroll = 0.0  # window heights the expanded page is scrolled down
         self._panel_boxes = {}
@@ -390,8 +531,13 @@ class MoonWindow(GlobeMixin, HudMixin):
             def end_drag(self, button):
                 if self._moon_drag_button != button:
                     return
-                if self._moon_drag_press is not None and not self._moon_drag_dragged and self._moon_drag_mode in ("orbit", "ui") and button == "left":
-                    owner.pick(*self.GetInteractor().GetEventPosition())
+                if self._moon_drag_press is not None and button == "left":
+                    position = self.GetInteractor().GetEventPosition()
+                    if not self._moon_drag_dragged and self._moon_drag_mode in ("orbit", "ui"):
+                        owner.pick(*position)
+                    elif (self._moon_drag_mode == "pan" and np.hypot(position[0] - self._moon_drag_press[0],
+                                                                      position[1] - self._moon_drag_press[1]) <= 3):
+                        owner.add_point_at(*position)  # Shift+click without moving: add a comparison point
                 self._moon_drag_press = self._moon_drag_last = None
                 self._moon_drag_mode = self._moon_drag_button = self._moon_drag_pan_depth = None
                 self._moon_drag_cursor_pivot = None
@@ -420,6 +566,14 @@ class MoonWindow(GlobeMixin, HudMixin):
                     owner.begin_coordinate_entry()
                 elif key == "t":
                     owner.begin_time_entry()
+                elif key == "a":
+                    owner.add_current_point()
+                elif key == "p":
+                    owner.begin_points_entry()
+                elif key in ("comma", "less"):
+                    owner.step_point(-1)
+                elif key in ("period", "greater"):
+                    owner.step_point(1)
                 elif key == "bracketleft":
                     owner.step_time(-1)
                 elif key == "bracketright":
@@ -483,15 +637,21 @@ class MoonWindow(GlobeMixin, HudMixin):
             self.zoom(1.08 if direction > 0 else 1 / 1.08)
 
     def close_graph(self):
+        was_compare = self._compare_active
         self._graph_expanded = False
         self._scroll = 0.0
         self._now_mode = True
         self._sky_generation += 1  # discard any response still in flight
         self._sky_data = None
         self._sky_status = ""
+        self._compare_active = False
+        self._compare = None
+        self._compare_points = []
         self.progress_text.SetVisibility(False)
         self._epochs = [utc_now()]
         self._time_index = 0
+        if was_compare:  # the globe follows the point that was shown in the horizon graph
+            self.select_location(self.lat, self.lon, render=False)
         self.apply_layout()
         self.update_profile(self.horizon_angles)
         self.update_stats()
@@ -504,18 +664,24 @@ class MoonWindow(GlobeMixin, HudMixin):
             self._last_now_query = time.monotonic()
         self._sky_generation += 1
         self._sky_data = None  # Never show a previous location's bodies at a new point.
+        self._compare = None
         self._sky_status = "Loading Sun / Earth positions..." if self._enable_ephemeris else "Sun / Earth lookup disabled"
         active = self._enable_ephemeris and self._graph_expanded
         self.progress_text.SetInput("Working: starting calculation...")
         self.progress_text.SetVisibility(active)
+        if self._compare_active:
+            self.sync_compare_points()
         self.update_profile(self.horizon_angles)
         self.update_stats()
         if not active:
             return
         self.window.Render()
-        request = (self._sky_generation, self.lon, self.lat,
-                   (float(sample_dem_bilinear(self.lat, self.lon)) + 2.0) / 1000.0,
-                   list(self._epochs), self.horizon_angles.copy(), SKY_METHODS[self._sky_method])
+        # One job per point: (lon, lat, altitude km, terrain horizon or None to compute it in the worker).
+        if self._compare_active:
+            jobs = [(lon, lat, self.site_altitude_km(lat, lon), None) for lat, lon in self._compare_points]
+        else:
+            jobs = [(self.lon, self.lat, self.site_altitude_km(self.lat, self.lon), self.horizon_angles.copy())]
+        request = (self._sky_generation, jobs, list(self._epochs), SKY_METHODS[self._sky_method])
         # Coalesce fast clicks: keep only the newest waiting location/interval.
         try:
             self._sky_jobs.get_nowait()
@@ -540,31 +706,56 @@ class MoonWindow(GlobeMixin, HudMixin):
                 raise RuntimeError(f"Skyfield data unavailable: {detail}")
         return get_positions(lon, lat, altitude, epochs, progress=progress)
 
+    @staticmethod
+    def site_altitude_km(lat, lon):
+        return (float(sample_dem_bilinear(lat, lon)) + 2.0) / 1000.0
+
+    def sky_for_point(self, lon, lat, altitude, epochs, horizon, methods, progress):
+        """Sun / Earth data of one point for every requested model: (data or None, error text or None)."""
+        data, errors = {}, []
+        fetchers = {"JPL": self.fetch_jpl, "Skyfield": self.fetch_skyfield}
+        for source in methods:
+            fetch = self._ephemeris_fetcher or fetchers[source]
+            try:
+                progress(f"Starting {source} lookup")
+                if self._ephemeris_fetcher is not None:
+                    positions = fetch(lon, lat, altitude, epochs)
+                else:
+                    positions = fetch(lon, lat, altitude, epochs, progress=progress)
+                progress("Checking terrain visibility and eclipses")
+                classified = classify_sky(positions, horizon)
+                data.update({f"{body} {source}": values for body, values in classified.items()})
+            except Exception as error:
+                message = str(error).strip().splitlines()
+                errors.append(f"{source}: " + (message[0] if message else type(error).__name__)[:100])
+        return data or None, "; ".join(errors) or None
+
     def sky_worker(self):
         while not self._sky_stop.is_set():
             try:
                 request = self._sky_jobs.get(timeout=0.2)
             except queue.Empty:
                 continue
-            generation, lon, lat, altitude, epochs, horizon, methods = request
-            data, errors = {}, []
-            fetchers = {"JPL": self.fetch_jpl, "Skyfield": self.fetch_skyfield}
-            for source in methods:
-                fetch = self._ephemeris_fetcher or fetchers[source]
+            generation, jobs, epochs, methods = request
+            results, errors = [], []
+            for number, (lon, lat, altitude, horizon) in enumerate(jobs, start=1):
+                prefix = f"Point {number}/{len(jobs)}: " if len(jobs) > 1 else ""
+                progress = lambda message, prefix=prefix: self._sky_progress.put((generation, prefix + message))
+                entry = {"data": None, "horizon": None, "error": None}
                 try:
-                    progress = lambda message: self._sky_progress.put((generation, message))
-                    progress(f"Starting {source} lookup")
-                    if self._ephemeris_fetcher is not None:
-                        positions = fetch(lon, lat, altitude, epochs)
-                    else:
-                        positions = fetch(lon, lat, altitude, epochs, progress=progress)
-                    progress("Checking terrain visibility and eclipses")
-                    classified = classify_sky(positions, horizon)
-                    data.update({f"{body} {source}": values for body, values in classified.items()})
+                    if horizon is None:  # comparison: the terrain horizon of every point is computed here
+                        progress("Computing terrain horizon")
+                        entry["horizon"] = compute_horizon_360(lat, lon)
+                        horizon = entry["horizon"][0]
+                    entry["data"], entry["error"] = self.sky_for_point(
+                        lon, lat, altitude, epochs, horizon, methods, progress)
                 except Exception as error:
                     message = str(error).strip().splitlines()
-                    errors.append(f"{source}: " + (message[0] if message else type(error).__name__)[:100])
-            self._sky_results.put((generation, data or None, "; ".join(errors) or None))
+                    entry["error"] = (message[0] if message else type(error).__name__)[:100]
+                if entry["error"]:
+                    errors.append((f"P{number}: " if len(jobs) > 1 else "") + entry["error"])
+                results.append(entry)
+            self._sky_results.put((generation, results, "; ".join(errors) or None))
 
     def poll_sky(self, obj=None, event=None):
         changed = False
@@ -581,7 +772,7 @@ class MoonWindow(GlobeMixin, HudMixin):
                 progress_changed = True
         while True:
             try:
-                generation, data, error = self._sky_results.get_nowait()
+                generation, results, error = self._sky_results.get_nowait()
             except queue.Empty:
                 break
             if generation != self._sky_generation:
@@ -589,8 +780,11 @@ class MoonWindow(GlobeMixin, HudMixin):
             self.progress_text.SetInput("Working: building graphs...")
             self.progress_text.SetVisibility(True)
             self.window.Render()
-            self._sky_data = data
-            self._sky_status = f"Unavailable: {error}" if error else ""
+            if self._compare_active:
+                self.apply_compare_results(results, error)
+            else:
+                self._sky_data = results[0]["data"] if results else None
+                self._sky_status = f"Unavailable: {error}" if error else ""
             changed = True
             finished = True
         if self._now_mode and self._graph_expanded and time.monotonic() - self._last_now_query >= 60:
@@ -616,6 +810,15 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._saved_interval = (parse_utc(start), parse_utc(stop), float(step), unit, method)
         save_interval(start, stop, step, unit, method)
         self._graph_expanded = True
+        was_compare = self._compare_active
+        self._compare_active = len(self._points) >= 2  # 2 or more chosen points: compare them
+        self._compare = None
+        if self._compare_active and not was_compare:
+            current = (self.lat, self.lon)
+            self._compare_points = []  # forces sync_compare_points to start a fresh comparison
+            self._compare_index = next((i for i, point in enumerate(self._points) if same_point(point, current)), 0)
+        elif not self._compare_active:
+            self._compare_points = []
         self.apply_layout()
         self._now_mode = False
         self._epochs = epochs
@@ -687,7 +890,8 @@ class MoonWindow(GlobeMixin, HudMixin):
                 start = utc_now()
                 stop = start + timedelta(days=1)
                 step, unit = 60, "minutes"
-            dialog = TimeIntervalDialog(root, start, stop, step, unit, self.set_time_interval, self._sky_method)
+            title = (f"Compare {len(self._points)} points: time interval (UTC)" if len(self._points) >= 2 else None)
+            dialog = TimeIntervalDialog(root, start, stop, step, unit, self.set_time_interval, self._sky_method, title)
             root.wait_window(dialog.window)
         except tk.TclError as error:
             print(f"Could not open time interval editor: {error}", file=sys.stderr)
@@ -719,16 +923,11 @@ class MoonWindow(GlobeMixin, HudMixin):
         from vtk.util.numpy_support import numpy_to_vtk
 
         self.lat, self.lon = float(lat), float(lon)
+        self._points_note = ""
         angles, distances, hlat, hlon = compute_horizon_360(lat, lon)
         self.horizon_angles = angles
         self.horizon_distances = distances
-        if self._panorama_texture_rgb is None:
-            with Image.open(terrain.COLOR_PATH) as texture_image:
-                texture_image = texture_image.convert("RGB")
-                self._panorama_texture_rgb = np.asarray(texture_image).copy()
-        self._panorama_samples = terrain_panorama_samples(
-            lat, lon, self._panorama_texture_rgb, bearings=max(360, self.window.GetSize()[0]))
-        self._panorama_range = None
+        self.update_panorama_samples(lat, lon)
         self.update_profile(angles)
         # Follow the terrain between bearings rather than drawing straight chords
         # that can pass below the surface when adjacent horizon distances differ.
@@ -760,18 +959,174 @@ class MoonWindow(GlobeMixin, HudMixin):
         surface_point = self.terrain_overlay_points(direction)[0]
         self.observer_points.SetPoint(0, *surface_point)
         self.observer_points.Modified()
+        self._stats_base = self.build_stats_base(lat, lon, angles, distances)
+        self.request_sky_update()
+        if render:
+            self.window.Render()
+
+    def update_panorama_samples(self, lat, lon):
+        """Terrain colours / angles for the panorama behind the horizon graph."""
+        if self._panorama_texture_rgb is None:
+            with Image.open(terrain.COLOR_PATH) as texture_image:
+                texture_image = texture_image.convert("RGB")
+                self._panorama_texture_rgb = np.asarray(texture_image).copy()
+        self._panorama_samples = terrain_panorama_samples(
+            lat, lon, self._panorama_texture_rgb, bearings=max(360, self.window.GetSize()[0]))
+        self._panorama_range = None
+
+    def build_stats_base(self, lat, lon, angles, distances, heading="MOON HORIZON"):
         elevation = float(sample_dem_bilinear(lat, lon))
-        self._stats_base = (
-            f"MOON HORIZON\n"
+        return (
+            f"{heading}\n"
             f"Latitude {lat:+.3f} deg    Longitude {lon:+.3f} deg\n"
             f"Elevation {elevation:+,.0f} m    Slope {compute_slope_deg(lat, lon):.1f} deg\n"
             f"Horizon distance {np.min(distances):.1f} to {np.max(distances):.1f} km\n"
             f"Horizon angle {np.min(angles):+.2f} to {np.max(angles):+.2f} deg\n"
             "360 bearings; 2 m eye height; terrain search to 250 km\n"
             f"Texture: {self.texture_dimensions[0]} x {self.texture_dimensions[1]}")
-        self.request_sky_update()
+
+    # ------------------------------------------------------------------ point comparison
+
+    def sync_compare_points(self):
+        """Take over the current point set for a comparison (all points shown, index kept in range)."""
+        points = list(self._points)
+        if points != self._compare_points:
+            self._compare_points = points
+            self._compare_visible = [True] * len(points)
+            self._compare_index = min(self._compare_index, len(points) - 1)
+            self.apply_layout()
+
+    def add_point(self, lat, lon, render=True):
+        try:
+            point = normalize_point(lat, lon)
+        except ValueError as error:
+            self._points_note = str(error)
+        else:
+            if any(same_point(point, other) for other in self._points):
+                self._points_note = "That point is already in the set."
+            elif len(self._points) >= MAX_POINTS:
+                self._points_note = f"A set holds at most {MAX_POINTS} points."
+            else:
+                self._points.append(point)
+                self._points_note = ""
+                self.points_changed(render)
+                return True
         if render:
             self.window.Render()
+        return False
+
+    def add_current_point(self):
+        if not self.coordinate_editing:
+            self.add_point(self.lat, self.lon)
+
+    def add_point_at(self, x, y):
+        """Shift+click on the Moon: select that location and add it to the comparison set."""
+        if self.coordinate_editing or self._graph_expanded or self._terrain_view:
+            return
+        if self.picker.Pick(x, y, 0, self.renderer):
+            px, py, pz = self.picker.GetPickPosition()
+            radius = np.sqrt(px * px + py * py + pz * pz)
+            if radius > 0:
+                lat = float(np.degrees(np.arcsin(np.clip(pz / radius, -1, 1))))
+                lon = float(np.degrees(np.arctan2(py, px)))
+                self.select_location(lat, lon, render=False)
+                self.add_point(lat, lon)
+
+    def set_points(self, points):
+        points = list(points)
+        if points == self._points:
+            return
+        self._points = points
+        self._points_note = ""
+        self.points_changed()
+
+    def points_changed(self, render=True):
+        self.refresh_point_marks()
+        if self._compare_active:
+            if len(self._points) >= 2:
+                self.request_sky_update()  # recalculate for the new set
+            else:
+                self.exit_compare()
+        if render:
+            self.window.Render()
+
+    def exit_compare(self):
+        """Fewer than two points left: carry on with the single point that is shown."""
+        self._compare_active = False
+        self._compare = None
+        self._compare_points = []
+        self.apply_layout()
+        self.request_sky_update()
+
+    def begin_points_entry(self):
+        if self.coordinate_editing or self._terrain_view:
+            return
+        try:
+            import tkinter as tk
+        except ImportError:
+            print("The point manager needs Tkinter (Debian/Ubuntu: python3-tk).", file=sys.stderr)
+            return
+        dialog = None
+        try:
+            root = self.get_native_root()
+            self.coordinate_editing = True
+            dialog = PointsDialog(root, self._points, (self.lat, self.lon), self.set_points)
+            root.wait_window(dialog.window)
+        except tk.TclError as error:
+            print(f"Could not open the point manager: {error}", file=sys.stderr)
+        finally:
+            if dialog is not None:
+                try:
+                    dialog.window.destroy()
+                except tk.TclError:
+                    pass
+            self.coordinate_editing = False
+            self.window.Render()
+
+    def compute_compare_stats(self):
+        compare = self._compare
+        if compare is None:
+            return
+        compare["stats"] = [point_stats(compare["epochs"], data, compare["source"], self._stats_above_only)
+                            for data in compare["data"]]
+        epochs = compare["epochs"]
+        compare["stats_span"] = (epochs[-1] - epochs[0]).total_seconds() if len(epochs) > 1 else None
+
+    def apply_compare_results(self, results, error):
+        points = list(self._compare_points)
+        self._compare = {"points": points, "horizons": [r["horizon"] for r in results],
+                         "data": [r["data"] for r in results], "errors": [r["error"] for r in results],
+                         "epochs": list(self._epochs), "source": SKY_METHODS[self._sky_method][0], "stats": None}
+        self.compute_compare_stats()
+        self.compare_activate(min(self._compare_index, len(points) - 1), refresh=False)
+
+    def compare_activate(self, index, refresh=True):
+        """Show point `index` in the horizon graph (its terrain, panorama, details and Sun/Earth trails)."""
+        compare = self._compare
+        if compare is None or not 0 <= index < len(compare["points"]):
+            return
+        self._compare_index = index
+        lat, lon = compare["points"][index]
+        horizon = compare["horizons"][index] or (np.zeros(360), np.zeros(360), None, None)
+        angles, distances = horizon[0], horizon[1]
+        self.lat, self.lon = lat, lon
+        self.horizon_angles, self.horizon_distances = angles, distances
+        self.update_panorama_samples(lat, lon)
+        self._stats_base = self.build_stats_base(
+            lat, lon, angles, distances, f"MOON HORIZON - POINT {index + 1}/{len(compare['points'])}")
+        self._sky_data = compare["data"][index]
+        error = compare["errors"][index]
+        self._sky_status = f"Unavailable: {error}" if error else ""
+        if refresh:
+            self.update_profile(angles)
+            self.update_stats()
+            self.window.Render()
+
+    def step_point(self, delta):
+        """Next / previous point of a running comparison (wraps around)."""
+        count = len(self._compare_points)
+        if self._compare_active and self._graph_expanded and self._compare is not None and count > 1:
+            self.compare_activate((self._compare_index + delta) % count)
 
     def pick(self, x, y):
         width, height = self.window.GetSize()
@@ -783,10 +1138,15 @@ class MoonWindow(GlobeMixin, HudMixin):
                        "previous": lambda: self.step_time(-1), "next": lambda: self.step_time(1),
                        "Skyfield": lambda: self.toggle_source("Skyfield"),
                        "JPL": lambda: self.toggle_source("JPL"),
-                       "legend": self.toggle_legend}
+                       "legend": self.toggle_legend,
+                       "point_prev": lambda: self.step_point(-1), "point_next": lambda: self.step_point(1),
+                       "stats_mode": self.toggle_stats_mode}
             for name, (left, bottom, right, top) in self._controls.items():
                 if left <= nx <= right and bottom <= ny <= top:
-                    actions[name]()
+                    if name.startswith("vis:"):  # "vis:<panel>:<point index>": point on/off in the combined graphs
+                        self.toggle_point_visibility(int(name.rsplit(":", 1)[1]))
+                    else:
+                        actions[name]()
                     break
             return
         if self.picker.Pick(x, y, 0, self.renderer):
