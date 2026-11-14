@@ -5,6 +5,7 @@ trapezoidal integration of sampled visibility (partly visible counts; Earth
 occulting the Sun is included). No slope requirement is applied.
 """
 import csv
+import colorsys
 import queue
 import threading
 import time
@@ -13,10 +14,23 @@ from datetime import timedelta
 import numpy as np
 import sky
 import terrain
+from compare import MAX_POINTS, normalize_point, same_point
 
 LUNAR_DAY_DAYS = 29.530588861
 MAX_GRID_POINTS = 100_000
 MAX_DISPLAY_RESULTS = 500
+
+
+def cluster_color(index):
+    """Stable, well-spaced hues for cluster markers and outlines."""
+    hue = (0.02 + int(index) * 0.6180339887498949) % 1.0
+    return colorsys.hsv_to_rgb(hue, 0.78, 0.96)
+
+
+def cluster_text_color(index):
+    """A darker version of the cluster hue for light list backgrounds."""
+    hue = (0.02 + int(index) * 0.6180339887498949) % 1.0
+    return '#%02x%02x%02x' % tuple(round(x * 255) for x in colorsys.hsv_to_rgb(hue, 0.85, 0.60))
 
 
 def grid_points(lat_min, lat_max, lon_min, lon_max, spacing):
@@ -26,8 +40,10 @@ def grid_points(lat_min, lat_max, lon_min, lon_max, spacing):
     lat_min, lat_max, lon_min, lon_max, spacing = values
     if not (-90 <= lat_min <= lat_max <= 90):
         raise ValueError('Latitude range must be ordered and within -90 to 90 degrees.')
-    if not (-180 <= lon_min <= lon_max <= 180):
-        raise ValueError('Longitude range must be ordered and within -180 to 180 degrees.')
+    if lon_min > lon_max:
+        raise ValueError('The first longitude must not exceed the second.')
+    # Spans over 360 degrees describe the whole Moon; do not duplicate it.
+    lon_max = min(lon_max, lon_min + 360.0)
     if not 0.1 <= spacing <= 180:
         raise ValueError('Grid spacing must be between 0.1 and 180 degrees.')
     count_lat = int(np.floor((lat_max - lat_min) / spacing + 1e-9)) + 1
@@ -41,9 +57,9 @@ def grid_points(lat_min, lat_max, lon_min, lon_max, spacing):
     points = []
     for lat in lats:
         if np.isclose(abs(lat), 90.0, atol=1e-9, rtol=0):
-            points.append((float(lat), float(lons[0])))
+            points.append((float(lat), float((lons[0] + 180.0) % 360.0 - 180.0)))
         else:
-            points.extend((float(lat), float(lon)) for lon in lons)
+            points.extend((float(lat), float((lon + 180.0) % 360.0 - 180.0)) for lon in lons)
     if len(points) > MAX_GRID_POINTS:
         raise ValueError(f'Grid is too large; maximum {MAX_GRID_POINTS:,} points.')
     return points
@@ -157,11 +173,266 @@ def search(points, epochs, min_sun, min_earth, fetch, cancel=None, progress=None
                                            p['sun_percent'] + p['earth_percent']), reverse=True)
 
 
-def _search_worker(messages, cancel, points, epochs, sun, earth, fetch):
+def grid_cells(lat_min, lat_max, lon_min, lon_max, spacing):
+    """Cover the chosen lat/lon rectangle with non-overlapping angular cells."""
+    vals = np.asarray([lat_min, lat_max, lon_min, lon_max, spacing], dtype=float)
+    if not np.isfinite(vals).all():
+        raise ValueError("Cell bounds and spacing must be finite.")
+    lat_min, lat_max, lon_min, lon_max, spacing = vals
+    if not (-90 <= lat_min < lat_max <= 90):
+        raise ValueError("Latitude bounds must be increasing and between -90 and 90.")
+    if lon_min >= lon_max:
+        raise ValueError("The first longitude must be less than the second.")
+    # Keep the user's continuous convention across the seam, at most one turn.
+    lon_max = min(lon_max, lon_min + 360.0)
+    if not 0.1 <= spacing <= 180:
+        raise ValueError("Cell spacing must be between 0.1 and 180 degrees.")
+    nlat = int(np.ceil((lat_max - lat_min) / spacing - 1e-12))
+    nlon = int(np.ceil((lon_max - lon_min) / spacing - 1e-12))
+    if nlat * nlon > MAX_GRID_POINTS:
+        raise ValueError(f"Too many cells; choose at most {MAX_GRID_POINTS:,}.")
+    return [(float(lat_min + i * spacing), float(min(lat_min + (i + 1) * spacing, lat_max)),
+             float(lon_min + j * spacing), float(min(lon_min + (j + 1) * spacing, lon_max)))
+            for i in range(nlat) for j in range(nlon)]
+
+
+def cell_sample_points(cell, side):
+    """Center first, then an evenly spaced grid from near center outward."""
+    lat0, lat1, lon0, lon1 = cell
+    centre = ((lat0 + lat1) / 2, (lon0 + lon1) / 2)
+    candidates = [centre] + [(float(lat), float(lon))
+                             for lat in np.linspace(lat0, lat1, side)
+                             for lon in np.linspace(lon0, lon1, side)]
+    def normalize(point):
+        lat, lon = point
+        if np.isclose(abs(lat), 90.0, atol=1e-9, rtol=0):
+            lon = 0.0
+        else:
+            lon = (lon + 180.0) % 360.0 - 180.0
+        return (round(lat, 10), round(lon, 10))
+    # Keep center first, removing duplicate center, pole and seam points.
+    unique = list(dict.fromkeys(map(normalize, candidates)))
+    center = normalize(centre)
+    rest = sorted(unique[1:], key=lambda p: (p[0] - center[0]) ** 2 +
+                  (((p[1] - center[1] + 180) % 360) - 180) ** 2)
+    return [unique[0], *rest]
+
+
+def interval_union(intervals):
+    """Merge touching coordinate intervals for compact range reporting."""
+    merged = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1] + 1e-8:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def optimistic_cell_ranges(cells, epochs, min_sun, min_earth, fetch, cancel=None, progress=None):
+    """Screen broad 4-by-4 cell blocks using optimistic visibility estimates.
+
+    The center is allowed the full angular width of the block, a generous
+    parallax margin and a pessimistically low terrain bound. This is an
+    approximate range screen, not a guarantee for every point in the block.
+    """
+    min_height = float(np.min(terrain.dem_km)) * 1000.0
+    max_height = float(np.max(terrain.dem_km)) * 1000.0
+    floor = optimistic_horizon_floor(max_height, min_height)
+    lat_starts = sorted({cell[0] for cell in cells})
+    lon_starts = sorted({cell[2] for cell in cells})
+    lat_index = {x: i for i, x in enumerate(lat_starts)}
+    lon_index = {x: i for i, x in enumerate(lon_starts)}
+    blocks = {}
+    for cell in cells:
+        key = (lat_index[cell[0]] // 4, lon_index[cell[2]] // 4)
+        blocks.setdefault(key, []).append(cell)
+    eligible, cached = [], {}
+    cache_limit = max(1, 500_000 // len(epochs))
+    total = len(cells)
+    completed = 0
+    for block in blocks.values():
+        if cancel is not None and cancel.is_set():
+            break
+        bounds = (min(c[0] for c in block), max(c[1] for c in block),
+                  min(c[2] for c in block), max(c[3] for c in block))
+        center = cell_sample_points(bounds, 3)[0]
+        if progress:
+            progress(completed, total, len(eligible), center)
+        height = float(terrain.sample_dem_bilinear(*center))
+        try:
+            positions = fetch(center[1], center[0], (height + 2.0) / 1000.0, epochs)
+        except Exception as error:
+            raise RuntimeError(f"Range estimate failed at latitude {center[0]:.3f}, longitude {center[1]:.3f}: {error}") from error
+        if cancel is not None and cancel.is_set():
+            break
+        margin = min(180.0, (bounds[1] - bounds[0] + bounds[3] - bounds[2]) / 2.0 + 2.0)
+        possible = True
+        for body, threshold in (("Sun", min_sun), ("Earth", min_earth)):
+            el = np.asarray(positions[body]["el"], dtype=float)
+            radius = np.asarray(positions[body]["radius"], dtype=float)
+            if el.shape != (len(epochs),) or radius.shape != (len(epochs),) or not np.isfinite(el).all() or not np.isfinite(radius).all() or np.any(radius < 0):
+                raise ValueError(f"Invalid {body} ephemeris in optimistic range screen.")
+            if visibility_percent(epochs, el + radius + margin >= floor) + 1e-9 < threshold:
+                possible = False
+        completed += len(block)
+        if possible:
+            eligible.extend(block)
+            if len(block) == 1 and len(cached) < cache_limit:
+                cached[center] = positions
+    lat_ranges = interval_union((cell[0], cell[1]) for cell in eligible)
+    lon_ranges = interval_union((cell[2], cell[3]) for cell in eligible)
+    if progress:
+        progress(completed, total, len(eligible), None)
+    return eligible, cached, lat_ranges, lon_ranges
+
+
+def cluster_results(results, wrap_longitude=False, longitude_bounds=None):
+    """Group edge-adjacent passing cells; this does not fill in untested area."""
+    def r(x):
+        return round(float(x), 8)
+    # Older point-only results remain individually selectable.
+    cells, singles = [], []
+    for row in results:
+        (cells if all(k in row for k in ('cell_lat_min', 'cell_lat_max', 'cell_lon_min', 'cell_lon_max'))
+         else singles).append(row)
+    south = {(r(x['cell_lat_min']), r(x['cell_lon_min']), r(x['cell_lon_max'])): i for i, x in enumerate(cells)}
+    west = {(r(x['cell_lat_min']), r(x['cell_lat_max']), r(x['cell_lon_min'])): i for i, x in enumerate(cells)}
+    seam_start, seam_end = longitude_bounds if longitude_bounds is not None else (-180.0, 180.0)
+    parent = list(range(len(cells)))
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    def join(a, b):
+        a, b = find(a), find(b)
+        if a != b:
+            parent[b] = a
+    for i, row in enumerate(cells):
+        la, lb = r(row['cell_lat_min']), r(row['cell_lat_max'])
+        lo, hi = r(row['cell_lon_min']), r(row['cell_lon_max'])
+        neighbour = south.get((lb, lo, hi))
+        if neighbour is not None:
+            join(i, neighbour)
+        neighbour = west.get((la, lb, hi))
+        if neighbour is None and wrap_longitude and np.isclose(hi, seam_end, atol=1e-8, rtol=0):
+            neighbour = west.get((la, lb, r(seam_start)))
+        if neighbour is not None:
+            join(i, neighbour)
+    groups = {}
+    for i, row in enumerate(cells):
+        groups.setdefault(find(i), []).append(row)
+    return list(groups.values()) + [[x] for x in singles]
+
+
+def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
+                 screen_horizon=2.0, screen_mode="Pessimistic center", cancel=None, progress=None,
+                 use_ranges=True, range_progress=None, range_result=None):
+    """Return at most one terrain-checked match per cell.
+
+    A pessimistic center estimate determines the order in which samples are
+    terrain-checked; it never rejects a cell. Refinement tests a finite grid,
+    so it is not an exhaustive or guaranteed search of any cell.
+    """
+    if terrain.dem_km is None:
+        raise RuntimeError("The Moon elevation map has not been loaded.")
+    if not (2 <= samples_per_side <= 9):
+        raise ValueError("Samples per side must be an integer from 2 to 9.")
+    if not np.isfinite(screen_horizon) or not -90 <= screen_horizon <= 90:
+        raise ValueError("Screen horizon must be between -90 and 90 degrees.")
+    if screen_mode not in ("Pessimistic center", "All cells"):
+        raise ValueError("Choose a valid cell screening mode.")
+    if not np.isfinite([min_sun, min_earth]).all() or not (0 <= min_sun <= 100 and 0 <= min_earth <= 100):
+        raise ValueError("Visibility thresholds must be between 0 and 100 percent.")
+    if len(epochs) < 2 or epochs[-1] <= epochs[0]:
+        raise ValueError("End time must be later than start time.")
+    min_terrain = float(np.min(terrain.dem_km)) * 1000.0
+    if not np.isfinite(min_terrain):
+        raise ValueError("The elevation map contains invalid values.")
+    start = time.monotonic()
+    total_cells = len(cells)
+    precomputed = {}
+    if use_ranges:
+        eligible, precomputed, lat_ranges, lon_ranges = optimistic_cell_ranges(
+            cells, epochs, min_sun, min_earth, fetch, cancel, range_progress)
+        if cancel is not None and cancel.is_set():
+            return []
+        if range_result:
+            range_result(lat_ranges, lon_ranges, len(eligible), total_cells)
+        cells = eligible
+    initial_filtered = total_cells - len(cells)
+    results, checked = [], {}
+    completed = filtered = initial_filtered
+    for cell in cells:
+        if cancel is not None and cancel.is_set():
+            break
+        points = cell_sample_points(cell, samples_per_side)
+        center = points[0]
+        if progress:
+            progress(completed, total_cells, len(results), time.monotonic() - start, *center, filtered)
+        try:
+            center_positions = precomputed.pop(center, None)
+            if screen_mode == "Pessimistic center":
+                if center_positions is None:
+                    elevation = float(terrain.sample_dem_bilinear(*center))
+                    center_positions = fetch(center[1], center[0], (elevation + 2.0) / 1000.0, epochs)
+                if cancel is not None and cancel.is_set():
+                    break
+                # Validate even when thresholds are zero.
+                can_meet_thresholds_without_horizon(epochs, center_positions, -90.0, 0.0, 0.0)
+                approx = sky.classify_sky(center_positions, np.full(360, screen_horizon))
+                if (visibility_percent(epochs, approx["Sun"]["visible"]) < min_sun or
+                        visibility_percent(epochs, approx["Earth"]["visible"]) < min_earth):
+                    # A conservative horizon can fail even where the real
+                    # terrain passes. Try the other samples first, then the
+                    # center itself before giving up on this cell.
+                    points = points[1:] + points[:1]
+            for point in points:
+                if cancel is not None and cancel.is_set():
+                    break
+                if point not in checked:
+                    elevation = float(terrain.sample_dem_bilinear(*point))
+                    pos = (center_positions if point == center and center_positions is not None else
+                           fetch(point[1], point[0], (elevation + 2.0) / 1000.0, epochs))
+                    if cancel is not None and cancel.is_set():
+                        break
+                    floor = optimistic_horizon_floor(elevation, min_terrain)
+                    if can_meet_thresholds_without_horizon(epochs, pos, floor, min_sun, min_earth):
+                        horizon = terrain.compute_horizon_360(*point)[0]
+                        classified = sky.classify_sky(pos, horizon)
+                        sun = visibility_percent(epochs, classified["Sun"]["visible"])
+                        earth = visibility_percent(epochs, classified["Earth"]["visible"])
+                        checked[point] = (sun, earth)
+                    else:
+                        checked[point] = None
+                value = checked[point]
+                if value is not None and value[0] >= min_sun and value[1] >= min_earth:
+                    results.append({"lat": point[0], "lon": point[1], "sun_percent": value[0],
+                                    "earth_percent": value[1], "cell_lat_min": cell[0], "cell_lat_max": cell[1],
+                                    "cell_lon_min": cell[2], "cell_lon_max": cell[3]})
+                    break
+            if cancel is not None and cancel.is_set():
+                break
+        except Exception as error:
+            raise RuntimeError(f"Search failed in cell {cell}: {error}") from error
+        completed += 1
+    if progress:
+        progress(completed, total_cells, len(results), time.monotonic() - start, None, None, filtered)
+    return sorted(results, key=lambda p: (min(p['sun_percent'] - min_sun, p['earth_percent'] - min_earth),
+                                           p['sun_percent'] + p['earth_percent']), reverse=True)
+
+
+def _search_worker(messages, cancel, cells, epochs, sun, earth, fetch, side, horizon, mode, use_ranges):
     def progress(done, total, matches, elapsed, lat, lon, filtered):
         messages.put(('progress', (done, total, matches, elapsed, lat, lon, filtered)))
     try:
-        results = search(points, epochs, sun, earth, fetch, cancel, progress)
+        def range_progress(done, total, eligible, center):
+            messages.put(('range_progress', (done, total, eligible)))
+        def range_result(lat_ranges, lon_ranges, eligible, total):
+            messages.put(('ranges', (lat_ranges, lon_ranges, eligible, total)))
+        results = search_cells(cells, epochs, sun, earth, fetch, side, horizon, mode, cancel, progress,
+                               use_ranges, range_progress, range_result)
         messages.put(('done', (results, cancel.is_set())))
     except Exception as error:
         messages.put(('error', str(error)))
@@ -169,24 +440,31 @@ def _search_worker(messages, cancel, points, epochs, sun, earth, fetch):
 
 class SearchDialog:
     """Tk-only UI; all horizon and ephemeris work stays in a worker thread."""
-    def __init__(self, parent, fetch, previous=None, on_close=None):
+    def __init__(self, parent, fetch, previous=None, on_close=None, existing_points=None):
         import tkinter as tk
         from tkinter import ttk
         self.tk, self.ttk, self.fetch = tk, ttk, fetch
         self.on_close = on_close
+        self.existing_points = existing_points or (lambda: [])
         self._closed = False
         self.window = tk.Toplevel(parent)
         self.window.title('Search lunar visibility')
         self.window.protocol('WM_DELETE_WINDOW', self.close)
-        self.window.geometry('780x720')
+        self.window.geometry('1120x820')
         self.messages = queue.Queue()
         self.cancel = threading.Event()
         self.worker = None
         self.timer = None
         self.results = []
         self.selected = None
+        self.selected_points = []
+        self.add_to_compare = False
         self.show_matches = False
         self.clear_markers = False
+        self.analyze = False
+        self.marker_results = None
+        self.marker_mode = 'Points'
+        self._display_items = []
         self.last_parameters = None
         self.finished = False
         self.was_cancelled = False
@@ -200,7 +478,8 @@ class SearchDialog:
             ('End UTC', (now + timedelta(days=LUNAR_DAY_DAYS)).strftime('%Y-%m-%d %H:%M:%S')),
             ('Time step (hours)', '2'), ('Minimum Sun visible (%)', '30'),
             ('Minimum Earth visible (%)', '50'), ('Grid spacing (degrees)', '10'),
-            ('Latitude min / max', '-90, 90'), ('Longitude min / max', '-180, 180'),
+            ('Latitude min / max', '-90, 90'), ('Longitude start / end', '-180, 180'),
+            ('Samples per side (2-9)', '3'), ('Screen horizon (degrees)', '2'),
         ]
         self.fields = []
         for index, (label, value) in enumerate(defaults):
@@ -210,9 +489,21 @@ class SearchDialog:
             entry.insert(0, value)
             entry.grid(row=row, column=col * 2 + 1, sticky='ew', padx=(0, 12), pady=3)
             self.fields.append(entry)
-        ttk.Label(frame, text='Skyfield; percentages include partial visibility and Earth blocking the Sun.\n'
-                              'Fast mathematical filter, then terrain checks. One lunar day is about 29.53 Earth days.',
-                  wraplength=720).pack(anchor='w', pady=(8, 4))
+        ttk.Label(settings, text='Cell screening').grid(row=5, column=0, sticky='w', pady=3)
+        self.screen_mode = ttk.Combobox(settings, values=('Pessimistic center', 'All cells'), state='readonly', width=23)
+        self.screen_mode.set('Pessimistic center')
+        self.screen_mode.grid(row=5, column=1, sticky='ew', pady=3)
+        ttk.Label(settings, text='Optimistic range estimate').grid(row=5, column=2, sticky='w', pady=3)
+        self.range_mode = ttk.Combobox(settings, values=('On', 'Off'), state='readonly', width=23)
+        self.range_mode.set('On')
+        self.range_mode.grid(row=5, column=3, sticky='ew', pady=3)
+        ttk.Label(frame, text='A raised center-horizon estimate only changes the order in which cell samples are checked.\n'
+                              'Optimistic ranges use broad blocks and can miss cells; turn them off for more coverage.\n'
+                              'Longitudes may cross 180 (e.g. 160, 200); ranges of 360 degrees or more cover one full turn.\n'
+                              'Clusters group neighboring tested cells; selecting a cluster selects its tested points.\n'
+                              'Shift-click selects a range, Ctrl-click adds points; comparisons hold at most 12 points.\n'
+                              'Partial visibility and Earth blocking the Sun count; Skyfield uses UTC.',
+                  wraplength=840).pack(anchor='w', pady=(8, 4))
         controls = ttk.Frame(frame)
         controls.pack(fill='x')
         self.start_button = ttk.Button(controls, text='Start search', command=self.start)
@@ -223,25 +514,42 @@ class SearchDialog:
         self.progress.pack(fill='x', pady=(8, 3))
         self.status = ttk.Label(frame, text='Choose criteria and start the search.', wraplength=720)
         self.status.pack(anchor='w')
-        columns = ('lat', 'lon', 'sun', 'earth')
+        self.range_label = ttk.Label(frame, text='', wraplength=840)
+        self.range_label.pack(anchor='w')
+        mode_frame = ttk.Frame(frame)
+        mode_frame.pack(fill='x', pady=(4, 0))
+        ttk.Label(mode_frame, text='Results:').pack(side='left')
+        self.view_mode = ttk.Combobox(mode_frame, values=('Points', 'Clusters'), state='readonly', width=14)
+        self.view_mode.set('Points')
+        self.view_mode.pack(side='left', padx=5)
+        self.view_mode.bind('<<ComboboxSelected>>', lambda event: self.populate_results('Showing'))
+        columns = ('lat', 'lon', 'sun', 'earth', 'cell')
         table_frame = ttk.Frame(frame)
         table_frame.pack(fill='both', expand=True, pady=8)
-        self.table = ttk.Treeview(table_frame, columns=columns, show='headings', height=14, selectmode='browse')
+        self.table = ttk.Treeview(table_frame, columns=columns, show='headings', height=14, selectmode='extended')
         scrollbar = ttk.Scrollbar(table_frame, orient='vertical', command=self.table.yview)
         self.table.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side='right', fill='y')
-        for key, label in zip(columns, ('Latitude', 'Longitude', 'Sun visible %', 'Earth visible %')):
+        for key, label in zip(columns, ('Latitude', 'Longitude', 'Sun visible %', 'Earth visible %', 'Cell bounds (lat / lon)')):
             self.table.heading(key, text=label)
-            self.table.column(key, width=150, anchor='center')
+            self.table.column(key, width=260 if key == 'cell' else 125, anchor='center')
         self.table.pack(side='left', fill='both', expand=True)
         self.table.bind('<Double-1>', self.view_selected)
+        self.table.bind('<Control-a>', self.select_all)
+        self.table.bind('<Control-A>', self.select_all)
         buttons = ttk.Frame(frame)
         buttons.pack(fill='x')
-        self.view_button = ttk.Button(buttons, text='Show selected on globe', command=self.view_selected, state='disabled')
+        self.view_button = ttk.Button(buttons, text='View selected', command=self.view_selected, state='disabled')
         self.view_button.pack(side='left')
-        self.marks_button = ttk.Button(buttons, text='Show matches on globe', command=self.show_all, state='disabled')
+        self.select_all_button = ttk.Button(buttons, text='Select all', command=self.select_all, state='disabled')
+        self.select_all_button.pack(side='left', padx=5)
+        self.add_button = ttk.Button(buttons, text='Add selected', command=self.add_selected, state='disabled')
+        self.add_button.pack(side='left')
+        self.analyze_button = ttk.Button(buttons, text='Analyze selected', command=self.analyze_selected, state='disabled')
+        self.analyze_button.pack(side='left', padx=5)
+        self.marks_button = ttk.Button(buttons, text='Show all on globe', command=self.show_all, state='disabled')
         self.marks_button.pack(side='left', padx=5)
-        self.export_button = ttk.Button(buttons, text='Save all results as CSV', command=self.export, state='disabled')
+        self.export_button = ttk.Button(buttons, text='Save CSV', command=self.export, state='disabled')
         self.export_button.pack(side='left', padx=5)
         ttk.Button(buttons, text='Close', command=self.close).pack(side='right')
         ttk.Button(buttons, text='Clear markers', command=self.clear).pack(side='right', padx=5)
@@ -271,7 +579,20 @@ class SearchDialog:
             step_hours, sun, earth, spacing = (float(self.fields[i].get()) for i in range(2, 6))
             lat_min, lat_max = self._pair(self.fields[6].get())
             lon_min, lon_max = self._pair(self.fields[7].get())
-            points = grid_points(lat_min, lat_max, lon_min, lon_max, spacing)
+            cells = grid_cells(lat_min, lat_max, lon_min, lon_max, spacing)
+            side_value = float(self.fields[8].get())
+            if not np.isfinite(side_value) or not side_value.is_integer() or not 2 <= side_value <= 9:
+                raise ValueError('Samples per side must be an integer from 2 to 9.')
+            side = int(side_value)
+            horizon = float(self.fields[9].get())
+            if not np.isfinite(horizon) or not -90 <= horizon <= 90:
+                raise ValueError('Screen horizon must be between -90 and 90 degrees.')
+            mode = self.screen_mode.get()
+            range_mode = self.range_mode.get()
+            if range_mode not in ('On', 'Off'):
+                raise ValueError('Choose a valid optimistic range option.')
+            if mode not in ('Pessimistic center', 'All cells'):
+                raise ValueError('Choose a valid cell screening mode.')
             epochs = sky.time_samples(start, stop, step_hours * 60)
             if len(epochs) < 2:
                 raise ValueError('End time must be later than start time.')
@@ -284,29 +605,41 @@ class SearchDialog:
         self.results = []
         self.selected = None
         self.show_matches = False
+        self.marker_results = None
         self.finished = False
-        self.last_parameters = (start, stop, step_hours, sun, earth, spacing, lat_min, lat_max, lon_min, lon_max)
+        self.last_parameters = (start, stop, step_hours, sun, earth, spacing, lat_min, lat_max, lon_min, lon_max, side, horizon, mode, range_mode)
         self.table.delete(*self.table.get_children())
-        for button in (self.view_button, self.marks_button, self.export_button):
+        for button in (self.view_button, self.select_all_button, self.add_button, self.analyze_button, self.marks_button, self.export_button):
             button.configure(state='disabled')
         self.start_button.configure(state='disabled')
         self.cancel_button.configure(state='normal')
-        self.progress.configure(maximum=len(points), value=0)
-        self.status.configure(text=f'Preparing {len(points):,} points, {len(epochs):,} time samples per point...')
+        self.progress.configure(maximum=len(cells), value=0)
+        self.range_label.configure(text='')
+        self.status.configure(text=f'Preparing {len(cells):,} cells, up to {side * side + (side % 2 == 0)} sampled points per cell...')
         self.worker = threading.Thread(target=_search_worker,
-            args=(self.messages, self.cancel, points, epochs, sun, earth, self.fetch), daemon=True)
+            args=(self.messages, self.cancel, cells, epochs, sun, earth, self.fetch, side, horizon, mode, range_mode == 'On'), daemon=True)
         self.worker.start()
 
     def poll(self):
         try:
             while True:
                 kind, value = self.messages.get_nowait()
-                if kind == 'progress':
+                if kind == 'range_progress':
+                    done, total, eligible = value
+                    self.progress.configure(value=done)
+                    self.status.configure(text=f'Estimating optimistic ranges: {done:,}/{total:,} cells | {eligible:,} possible')
+                elif kind == 'ranges':
+                    lat_ranges, lon_ranges, eligible, total = value
+                    def fmt(ranges):
+                        text = ', '.join(f'{a:g} to {b:g}' for a, b in ranges[:5])
+                        return text + (' ...' if len(ranges) > 5 else '') if text else 'none'
+                    self.range_label.configure(text=f'Approximate latitude / longitude unions: lat {fmt(lat_ranges)}; lon {fmt(lon_ranges)} ({eligible:,}/{total:,} cells)')
+                elif kind == 'progress':
                     done, total, matches, elapsed, lat, lon, filtered = value
                     self.progress.configure(value=done)
                     eta = f' | estimated {elapsed / done * (total - done) / 60:.1f} min left' if done else ''
                     where = f' | {lat:+.2f}, {lon:+.2f}' if lat is not None else ''
-                    self.status.configure(text=f'{done:,}/{total:,} points | {matches:,} matches | {filtered:,} filtered | {elapsed / 60:.1f} min elapsed{eta}{where}')
+                    self.status.configure(text=f'{done:,}/{total:,} cells | {matches:,} matches | {filtered:,} filtered | {elapsed / 60:.1f} min elapsed{eta}{where}')
                 elif kind == 'done':
                     self.results, cancelled = value
                     self.finished = True
@@ -315,7 +648,7 @@ class SearchDialog:
                     self.start_button.configure(state='normal')
                     self.cancel_button.configure(state='disabled')
                     if self.results:
-                        for button in (self.view_button, self.marks_button, self.export_button):
+                        for button in (self.view_button, self.select_all_button, self.add_button, self.analyze_button, self.marks_button, self.export_button):
                             button.configure(state='normal')
                 else:
                     self.status.configure(text=value)
@@ -325,15 +658,56 @@ class SearchDialog:
             pass
         self.timer = self.window.after(100, self.poll)
 
+    def _clusters(self):
+        if self.last_parameters:
+            start, end = self.last_parameters[8:10]
+            wrap = end - start >= 360.0 - 1e-8
+            bounds = (start, start + 360.0)
+        else:
+            wrap, bounds = False, None
+        return cluster_results(self.results, wrap_longitude=wrap, longitude_bounds=bounds)
+
+    def _marker_rows(self, members=None):
+        clusters = self._clusters()
+        cluster_for_row = {id(row): index for index, cluster in enumerate(clusters) for row in cluster}
+        source = self.results if members is None else members
+        return [dict(row, cluster_index=cluster_for_row[id(row)]) for row in source]
+
     def populate_results(self, label):
         self.table.delete(*self.table.get_children())
-        for index, row in enumerate(self.results[:MAX_DISPLAY_RESULTS]):
-            self.table.insert('', 'end', iid=str(index), values=(f"{row['lat']:+.3f}", f"{row['lon']:+.3f}",
-                                                                f"{row['sun_percent']:.1f}", f"{row['earth_percent']:.1f}"))
-        suffix = f' Showing first {MAX_DISPLAY_RESULTS}; CSV contains all.' if len(self.results) > MAX_DISPLAY_RESULTS else ''
-        self.status.configure(text=f"{label}: {len(self.results):,} matches.{suffix}")
+        clusters = self._clusters()
+        cluster_for_row = {id(row): index for index, cluster in enumerate(clusters) for row in cluster}
+        if self.view_mode.get() == 'Clusters':
+            groups = clusters
+        else:
+            groups = [[row] for row in self.results]
+        self._display_items = groups[:MAX_DISPLAY_RESULTS]
+        for index, members in enumerate(self._display_items):
+            row = members[0]
+            if self.view_mode.get() == 'Clusters':
+                lat_min = min(x.get('cell_lat_min', x['lat']) for x in members)
+                lat_max = max(x.get('cell_lat_max', x['lat']) for x in members)
+                lon_intervals = interval_union((x.get('cell_lon_min', x['lon']), x.get('cell_lon_max', x['lon'])) for x in members)
+                lon_text = ','.join(f'{a:g}..{b:g}' for a, b in lon_intervals[:2])
+                if len(lon_intervals) > 2:
+                    lon_text += ',...'
+                area = f"Cluster {index + 1}: {len(members)} cells; lat {lat_min:g}..{lat_max:g}, lon {lon_text}"
+            else:
+                area = (f"{row.get('cell_lat_min', row['lat']):g}..{row.get('cell_lat_max', row['lat']):g} / "
+                        f"{row.get('cell_lon_min', row['lon']):g}..{row.get('cell_lon_max', row['lon']):g}")
+            cluster_index = cluster_for_row[id(row)]
+            tag = f'cluster_{cluster_index}'
+            self.table.tag_configure(tag, foreground=cluster_text_color(cluster_index))
+            self.table.insert('', 'end', iid=str(index), tags=(tag,), values=(f"{row['lat']:+.3f}", f"{row['lon']:+.3f}",
+                              f"{row['sun_percent']:.1f}", f"{row['earth_percent']:.1f}", area))
+        suffix = (f' Globe shows at most {MAX_DISPLAY_RESULTS} cells; CSV contains all points.'
+                  if len(self.results) > MAX_DISPLAY_RESULTS else '')
+        if len(groups) > MAX_DISPLAY_RESULTS:
+            suffix += f' Table shows first {MAX_DISPLAY_RESULTS}.'
+        noun = 'clusters' if self.view_mode.get() == 'Clusters' else 'points'
+        self.status.configure(text=f"{label}: {len(groups):,} {noun}, {len(self.results):,} matching cells.{suffix}")
         if self.results:
-            for button in (self.view_button, self.marks_button, self.export_button):
+            for button in (self.view_button, self.select_all_button, self.add_button, self.analyze_button, self.marks_button, self.export_button):
                 button.configure(state='normal')
 
     def restore(self, previous):
@@ -341,9 +715,13 @@ class SearchDialog:
         self.last_parameters = previous['parameters']
         self.was_cancelled = previous['cancelled']
         self.finished = True
-        start, stop, step, sun, earth, spacing, lat_min, lat_max, lon_min, lon_max = self.last_parameters
+        start, stop, step, sun, earth, spacing, lat_min, lat_max, lon_min, lon_max = self.last_parameters[:10]
+        side, horizon, mode = self.last_parameters[10:13] if len(self.last_parameters) >= 13 else (3, 2.0, "Pessimistic center")
+        range_mode = self.last_parameters[13] if len(self.last_parameters) > 13 else 'On'
+        self.screen_mode.set(mode)
+        self.range_mode.set(range_mode)
         values = (start.strftime('%Y-%m-%d %H:%M:%S'), stop.strftime('%Y-%m-%d %H:%M:%S'),
-                  step, sun, earth, spacing, f'{lat_min:g}, {lat_max:g}', f'{lon_min:g}, {lon_max:g}')
+                  step, sun, earth, spacing, f'{lat_min:g}, {lat_max:g}', f'{lon_min:g}, {lon_max:g}', side, horizon)
         for field, value in zip(self.fields, values):
             field.delete(0, 'end')
             field.insert(0, str(value))
@@ -352,11 +730,51 @@ class SearchDialog:
     def view_selected(self, event=None):
         selected = self.table.selection()
         if selected:
-            self.selected = self.results[int(selected[0])]
+            members = self._display_items[int(selected[0])]
+            self.selected = members[0]
+            self.marker_mode = self.view_mode.get()
+            self.marker_results = self._marker_rows(members if self.marker_mode == 'Clusters' else None)
             self.show_matches = True
             self.close()
 
+    def select_all(self, event=None):
+        rows = self.table.get_children()
+        self.table.selection_set(rows)
+        self.status.configure(text=f'Selected {len(rows):,} displayed rows. Comparisons hold at most {MAX_POINTS} points.')
+        return 'break'
+
+    def add_selected(self, analyze=False):
+        selected = self.table.selection()
+        if not selected:
+            self.status.configure(text='Select one or more rows first.')
+            return
+        points = list(self.existing_points())
+        rows = []
+        for item in selected:
+            for row in self._display_items[int(item)]:
+                point = normalize_point(row['lat'], row['lon'])
+                if not any(same_point(point, other) for other in points):
+                    points.append(point)
+                    if len(points) > MAX_POINTS:
+                        self.status.configure(text=f'At most {MAX_POINTS} points can be selected, including existing points. Select fewer rows.')
+                        return
+                if not any(same_point(point, normalize_point(r['lat'], r['lon'])) for r in rows):
+                    rows.append(row)
+        self.selected_points = rows
+        self.selected = rows[0]
+        self.add_to_compare = True
+        self.analyze = analyze
+        self.marker_mode = self.view_mode.get()
+        self.marker_results = self._marker_rows()
+        self.show_matches = True
+        self.close()
+
+    def analyze_selected(self):
+        self.add_selected(analyze=True)
+
     def show_all(self):
+        self.marker_mode = self.view_mode.get()
+        self.marker_results = self._marker_rows()
         self.show_matches = True
         self.close()
 
@@ -376,12 +794,16 @@ class SearchDialog:
                 writer.writerow(('latitude_deg', 'longitude_deg', 'sun_visible_percent', 'earth_visible_percent',
                                  'start_utc', 'end_utc', 'step_hours', 'min_sun_percent', 'min_earth_percent',
                                  'grid_spacing_deg', 'latitude_min', 'latitude_max', 'longitude_min', 'longitude_max',
-                                 'partial_search'))
-                start, stop, step, sun, earth, spacing, lat_min, lat_max, lon_min, lon_max = self.last_parameters
+                                 'partial_search', 'cell_latitude_min', 'cell_latitude_max', 'cell_longitude_min', 'cell_longitude_max',
+                                 'samples_per_side', 'screen_horizon_deg', 'screen_mode', 'optimistic_range_filter'))
+                start, stop, step, sun, earth, spacing, lat_min, lat_max, lon_min, lon_max = self.last_parameters[:10]
+                side, horizon, mode = self.last_parameters[10:13] if len(self.last_parameters) >= 13 else (3, 2.0, "Pessimistic center")
                 for row in self.results:
                     writer.writerow((row['lat'], row['lon'], row['sun_percent'], row['earth_percent'],
                                      start.isoformat(), stop.isoformat(), step, sun, earth, spacing,
-                                     lat_min, lat_max, lon_min, lon_max, self.was_cancelled))
+                                     lat_min, lat_max, lon_min, lon_max, self.was_cancelled,
+                                     row.get('cell_lat_min'), row.get('cell_lat_max'), row.get('cell_lon_min'), row.get('cell_lon_max'),
+                                     side, horizon, mode, self.last_parameters[13] if len(self.last_parameters) > 13 else 'Off'))
             self.status.configure(text=f'Saved {len(self.results):,} results to {path}')
         except OSError as error:
             self.status.configure(text=f'Could not save results: {error}')

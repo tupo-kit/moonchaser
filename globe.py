@@ -7,10 +7,31 @@ horizon/observer/grid actors and the picker, and must run after the renderer exi
 Texture path is read as terrain.COLOR_PATH (set by terrain.load_data()).
 """
 import numpy as np
+from PIL import Image
 
 import terrain
 from compare import MAX_POINTS, POINT_COLORS
 from terrain import MOON_RADIUS_M, graticule_lines, lat_lon_to_xyz, choose_graticule_step, pole_heights, sample_dem_bilinear
+
+
+def load_color_texture(path):
+    """Decode with Pillow, then share its north-first RGB pixels with VTK."""
+    import vtk
+    from vtk.util.numpy_support import numpy_to_vtk
+
+    try:
+        with terrain.allow_large_nasa_image():
+            with Image.open(path) as image:
+                rgb = np.asarray(image.convert('RGB'))
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"Cannot decode color map {path}. The TIFF may be incomplete or damaged; "
+                           f"check or download the file again. Details: {error}") from error
+    height, width, _ = rgb.shape
+    pixels = numpy_to_vtk(rgb.reshape(-1, 3), deep=False)
+    texture_data = vtk.vtkImageData()
+    texture_data.SetDimensions(width, height, 1)
+    texture_data.GetPointData().SetScalars(pixels)
+    return rgb, texture_data
 
 class GlobeMixin:
     def _init_globe(self):
@@ -43,22 +64,19 @@ class GlobeMixin:
         self.mesh = vtk.vtkPolyData()
         self.mesh.SetPoints(points)
         self.mesh.SetPolys(polygons)
+        # Pillow's first row is north; VTK's TIFF reader used south-first rows.
         uv = np.column_stack(((lon.ravel() + 180) / 360,
-                              (lat.ravel() + 90) / 180)).astype(np.float32)
+                              (90 - lat.ravel()) / 180)).astype(np.float32)
         self.mesh.GetPointData().SetTCoords(numpy_to_vtk(uv, deep=True))
         self.surface_locator = vtk.vtkStaticCellLocator()
         self.surface_locator.SetDataSet(self.mesh)
         self.surface_locator.BuildLocator()
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputData(self.mesh)
-        reader = vtk.vtkImageReader2Factory.CreateImageReader2(terrain.COLOR_PATH)
-        if reader is None:
-            raise ValueError(f"Unsupported or unreadable texture: {terrain.COLOR_PATH}")
-        reader.SetFileName(terrain.COLOR_PATH)
-        reader.Update()
-        self.texture_dimensions = reader.GetOutput().GetDimensions()[:2]
+        self._color_rgb, self._color_texture_data = load_color_texture(terrain.COLOR_PATH)
+        self.texture_dimensions = self._color_texture_data.GetDimensions()[:2]
         self.texture = vtk.vtkTexture()
-        self.texture.SetInputConnection(reader.GetOutputPort())
+        self.texture.SetInputData(self._color_texture_data)
         self.texture.InterpolateOn()
         self.texture.MipmapOn()
         self.moon = vtk.vtkActor()

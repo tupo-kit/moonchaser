@@ -5,7 +5,7 @@ Coordinate editor: requires Tkinter (Linux package: python3-tk).
 Run:     python moon.py
 Texture: python moon.py --texture /path/to/color.jpg
 
-NASA color and elevation maps download on first run and are resized to 13K.
+NASA color and elevation maps download on first run and retain their original resolution.
 Left-drag to orbit; middle-drag or Shift-left-drag to pan; wheel to zoom.
 Ctrl-left-drag (or Ctrl-middle-drag) orbits the terrain point under the cursor.
 Click the Moon to select an observer.
@@ -18,8 +18,8 @@ Press T to choose a time range; this opens a fullscreen horizon + Sun/Earth grap
 That window scrolls (mouse wheel, Up/Down, PageUp/PageDown, Home/End) to more graphs: Sun elevation vs
 time and Earth elevation vs time.
 Point comparison: Shift+click (or A for the current point) adds numbered, coloured points; P opens the point
-manager (add, remove, save to / load from a file; only the coordinates are stored). With 2 or more points T opens
-the comparison: the usual window, but the horizon graph shows one point (use the < > buttons, or the , and .
+manager (add, remove, save to / load from a file; only the coordinates are stored). T opens the analysis page:
+the horizon graph shows one point (use the < > buttons, or the , and .
 keys, to change it), the Sun/Earth graphs combine all points (a button per point switches its graph on/off)
 and, further down the page, tables compare sunlight, Earth visibility and the azimuth / elevation statistics.
 Use Previous/Next, the Left/Right arrow keys (Shift: 10 samples) or the time slider under the horizon graph to step
@@ -49,7 +49,7 @@ from PIL import Image
 import sky
 import terrain
 from compare import (MAX_POINTS, load_points, normalize_point, point_stats, same_point, save_points)
-from visibility_search import SearchDialog, MAX_DISPLAY_RESULTS
+from visibility_search import SearchDialog, MAX_DISPLAY_RESULTS, cluster_color
 from globe import GlobeMixin
 from hud import SCROLL_STEP, HudMixin
 from sky import (MAX_TIME_SAMPLES, SKY_METHODS, TIME_UNITS, classify_sky, get_positions, load_interval, parse_utc,
@@ -419,10 +419,15 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._sky_method = self._saved_interval[4] if self._saved_interval else "Skyfield"
         # Point comparison (compare.py): the set, and the state of the comparison window.
         self._search_actor = None
+        self._search_outline_actor = None
+        self._search_point_picker = None
+        self._search_rows = []
+        self._search_selected = None
+        self._search_parameters = None
         self._search_session = None
         self._visibility_dialog = None
         self._tk_pump_active = False
-        self.GLOBE_HELP = self.GLOBE_HELP + "\nS: search locations by visibility"
+        self.GLOBE_HELP = self.GLOBE_HELP + "\nS: search visibility   |   I: analyze selected search point"
         self._points = []              # [(lat, lon), ...] chosen with Shift+click / A / P
         self._compare_active = False   # True: the graph window compares _compare_points
         self._compare_points = []      # snapshot of _points used by the running comparison
@@ -457,6 +462,7 @@ class MoonWindow(GlobeMixin, HudMixin):
         # Build the 3D globe first, then the 2D HUD on top (draw order matches the original single-file build).
         self._init_globe()
         self._init_hud()
+        self._panorama_texture_rgb = self._color_rgb  # share the original-resolution color pixels
 
         owner = self
 
@@ -586,6 +592,8 @@ class MoonWindow(GlobeMixin, HudMixin):
                     owner.begin_time_entry()
                 elif key == "s":
                     owner.begin_visibility_search()
+                elif key == "i":
+                    owner.analyze_selected_search_point()
                 elif key == "a":
                     owner.add_current_point()
                 elif key == "p":
@@ -830,15 +838,12 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._saved_interval = (parse_utc(start), parse_utc(stop), float(step), unit, method)
         save_interval(start, stop, step, unit, method)
         self._graph_expanded = True
-        was_compare = self._compare_active
-        self._compare_active = len(self._points) >= 2  # 2 or more chosen points: compare them
+        self._compare_active = True
+        self._analysis_single_point = None
         self._compare = None
-        if self._compare_active and not was_compare:
-            current = (self.lat, self.lon)
-            self._compare_points = []  # forces sync_compare_points to start a fresh comparison
-            self._compare_index = next((i for i, point in enumerate(self._points) if same_point(point, current)), 0)
-        elif not self._compare_active:
-            self._compare_points = []
+        current = (self.lat, self.lon)
+        self._compare_points = []
+        self._compare_index = next((i for i, point in enumerate(self._points) if same_point(point, current)), 0)
         self.apply_layout()
         self._now_mode = False
         self._epochs = epochs
@@ -870,7 +875,8 @@ class MoonWindow(GlobeMixin, HudMixin):
             # Non-modal: the existing VTK timer pumps Tk events, so both the
             # viewer and the search window remain responsive.
             self._visibility_dialog = SearchDialog(root, self.fetch_skyfield,
-                                                    self._search_session, self.finish_visibility_search)
+                                                    self._search_session, self.finish_visibility_search,
+                                                    existing_points=lambda: list(self._points))
         except tk.TclError as error:
             print(f"Could not open visibility search: {error}", file=sys.stderr)
 
@@ -881,23 +887,69 @@ class MoonWindow(GlobeMixin, HudMixin):
                                     "cancelled": dialog.was_cancelled}
         if dialog.clear_markers:
             self.show_visibility_markers([])
+            self._search_selected = None
         elif dialog.show_matches:
             if self._graph_expanded:
                 self.close_graph()
             if self._terrain_view:
                 self.toggle_terrain_view(render=False)
-            self.show_visibility_markers(dialog.results[:MAX_DISPLAY_RESULTS])
+            self._search_parameters = dialog.last_parameters
+            if dialog.add_to_compare:
+                points = list(self._points)
+                for row in dialog.selected_points:
+                    point = normalize_point(row['lat'], row['lon'])
+                    if not any(same_point(point, other) for other in points):
+                        points.append(point)
+                if len(points) > MAX_POINTS:
+                    self._points_note = f'A set holds at most {MAX_POINTS} points.'
+                    self.refresh_point_marks()
+                    self.window.Render()
+                    return
+                self.set_points(points)
+            rows = dialog.marker_results if dialog.marker_results is not None else dialog.results
+            self.show_visibility_markers(rows[:MAX_DISPLAY_RESULTS], mode=dialog.marker_mode)
             if dialog.selected is not None:
                 point = dialog.selected
                 self.lookup_coordinates(f"{point['lat']}, {point['lon']}", render=False)
+                self._search_selected = point
+                if dialog.analyze:
+                    self.analyze_selected_search_point(render=False, use_points=dialog.add_to_compare)
         self.window.Render()
 
-    def show_visibility_markers(self, results):
-        """Draw a bounded selection of matching grid points on the globe."""
+    def analyze_selected_search_point(self, render=True, use_points=False):
+        """Analyze the searched point or selected point set over the search interval."""
+        if self._search_selected is None or self._search_parameters is None:
+            return
+        if self._terrain_view:
+            self.toggle_terrain_view(render=False)
+        start, stop, step_hours = self._search_parameters[:3]
+        epochs = time_samples(start, stop, float(step_hours) * 60)
+        self._sky_method = "Skyfield"
+        self._graph_expanded = True
+        self._scroll = 0.0
+        self._compare_active = True
+        self._analysis_single_point = None if use_points else normalize_point(
+            self._search_selected['lat'], self._search_selected['lon'])
+        self._compare_index = 0
+        self._compare = None
+        self._compare_points = []
+        self._now_mode = False
+        self._epochs = epochs
+        self._time_index = 0
+        self._interval_step_minutes = float(step_hours) * 60.0
+        self.apply_layout()
+        self.request_sky_update()
+        if render:
+            self.window.Render()
+
+    def show_visibility_markers(self, results, mode='Points'):
+        """Draw selectable points and, in cluster mode, colored cell outlines."""
         from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
-        if self._search_actor is not None:
-            self.renderer.RemoveActor(self._search_actor)
-            self._search_actor = None
+        for actor in (self._search_actor, self._search_outline_actor):
+            if actor is not None:
+                self.renderer.RemoveActor(actor)
+        self._search_actor = self._search_outline_actor = self._search_point_picker = None
+        self._search_rows = list(results)
         if not results:
             return
         lat = np.radians([item['lat'] for item in results])
@@ -905,7 +957,6 @@ class MoonWindow(GlobeMixin, HudMixin):
         directions = np.column_stack((np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)))
         locations = self.terrain_overlay_points(directions)
         points = self.vtk.vtkPoints()
-        points.SetDataTypeToDouble()
         points.SetData(numpy_to_vtk(np.ascontiguousarray(locations, dtype=np.float64), deep=True))
         n = len(locations)
         cells = self.vtk.vtkCellArray()
@@ -914,22 +965,99 @@ class MoonWindow(GlobeMixin, HudMixin):
         data = self.vtk.vtkPolyData()
         data.SetPoints(points)
         data.SetVerts(cells)
+        colors = np.asarray([np.rint(np.asarray(cluster_color(row.get('cluster_index', 0))) * 255)
+                             for row in results], dtype=np.uint8)
+        data.GetPointData().SetScalars(numpy_to_vtk(colors, deep=True, array_type=self.vtk.VTK_UNSIGNED_CHAR))
         mapper = self.vtk.vtkPolyDataMapper()
         mapper.SetInputData(data)
+        mapper.SetScalarModeToUsePointData()
+        mapper.SetColorModeToDirectScalars()
         self.configure_surface_overlay(mapper)
         actor = self.vtk.vtkActor()
         actor.SetMapper(mapper)
-        actor.GetProperty().SetColor(0.25, 1.0, 0.35)
-        actor.GetProperty().SetPointSize(7)
+        actor.GetProperty().SetPointSize(9)
+        actor.GetProperty().LightingOff()
+        actor.PickableOn()
+        self.renderer.AddActor(actor)
+        self._search_actor = actor
+        picker = self.vtk.vtkPointPicker()
+        picker.SetTolerance(0.008)
+        picker.PickFromListOn()
+        picker.AddPickList(actor)
+        self._search_point_picker = picker
+        if mode == 'Clusters':
+            self.show_search_cell_outlines(results)
+
+    def show_search_cell_outlines(self, results):
+        """Outline matched cells in their cluster colors on the terrain mesh."""
+        from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
+        units, offsets, colors = [], [0], []
+        for row in results:
+            keys = ('cell_lat_min', 'cell_lat_max', 'cell_lon_min', 'cell_lon_max')
+            if not all(key in row for key in keys):
+                continue
+            lo_lat, hi_lat, lo_lon, hi_lon = (row[key] for key in keys)
+            count = max(2, min(12, int(np.ceil(max(hi_lat-lo_lat, hi_lon-lo_lon) / 2.5))))
+            lats = np.concatenate((np.full(count, lo_lat), np.linspace(lo_lat, hi_lat, count, endpoint=False),
+                                   np.full(count, hi_lat), np.linspace(hi_lat, lo_lat, count, endpoint=False), [lo_lat]))
+            lons = np.concatenate((np.linspace(lo_lon, hi_lon, count, endpoint=False), np.full(count, hi_lon),
+                                   np.linspace(hi_lon, lo_lon, count, endpoint=False), np.full(count, lo_lon), [lo_lon]))
+            lat, lon = np.radians(lats), np.radians(lons)
+            units.append(np.column_stack((np.cos(lat)*np.cos(lon), np.cos(lat)*np.sin(lon), np.sin(lat))))
+            offsets.append(offsets[-1] + len(lats))
+            colors.append(np.rint(np.asarray(cluster_color(row.get('cluster_index', 0))) * 255))
+        if not units:
+            return
+        coords = self.terrain_overlay_points(np.concatenate(units))
+        points = self.vtk.vtkPoints()
+        points.SetData(numpy_to_vtk(np.ascontiguousarray(coords, dtype=np.float64), deep=True))
+        cells = self.vtk.vtkCellArray()
+        cells.SetData(numpy_to_vtkIdTypeArray(np.asarray(offsets, dtype=np.int64), deep=True),
+                      numpy_to_vtkIdTypeArray(np.arange(len(coords), dtype=np.int64), deep=True))
+        data = self.vtk.vtkPolyData()
+        data.SetPoints(points)
+        data.SetLines(cells)
+        data.GetCellData().SetScalars(numpy_to_vtk(np.asarray(colors, dtype=np.uint8), deep=True,
+                                                    array_type=self.vtk.VTK_UNSIGNED_CHAR))
+        mapper = self.vtk.vtkPolyDataMapper()
+        mapper.SetInputData(data)
+        mapper.SetScalarModeToUseCellData()
+        mapper.SetColorModeToDirectScalars()
+        self.configure_surface_overlay(mapper)
+        actor = self.vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetLineWidth(2)
         actor.GetProperty().LightingOff()
         actor.PickableOff()
         self.renderer.AddActor(actor)
-        self._search_actor = actor
+        self._search_outline_actor = actor
+
+    def pick_search_marker(self, x, y):
+        if self._search_point_picker is None or self._terrain_view:
+            return False
+        if not self._search_point_picker.Pick(x, y, 0, self.renderer):
+            return False
+        index = self._search_point_picker.GetPointId()
+        if index < 0 or index >= len(self._search_rows):
+            return False
+        point = np.asarray(self._search_actor.GetMapper().GetInput().GetPoint(index))
+        camera_position = np.asarray(self.renderer.GetActiveCamera().GetPosition())
+        hit = self.surface_hit(camera_position, point - camera_position)
+        if hit is None or np.linalg.norm(hit - point) > 0.002:
+            return False  # the globe hides the marker
+        row = self._search_rows[index]
+        self.select_location(row['lat'], row['lon'], render=False)
+        self._search_selected = row
+        self._stats_base += "\nSearch point selected; press I to analyze its interval"
+        self.update_stats()
+        self.window.Render()
+        return True
 
     def toggle_terrain_view(self, render=True):
         GlobeMixin.toggle_terrain_view(self, render=False)
-        if self._search_actor is not None:
-            self._search_actor.SetVisibility(not self._terrain_view)
+        for actor in (self._search_actor, self._search_outline_actor):
+            if actor is not None:
+                actor.SetVisibility(not self._terrain_view)
         if render:
             self.window.Render()
 
@@ -1027,6 +1155,7 @@ class MoonWindow(GlobeMixin, HudMixin):
     def select_location(self, lat, lon, render=True):
         from vtk.util.numpy_support import numpy_to_vtk
 
+        self._search_selected = None
         self.lat, self.lon = float(lat), float(lon)
         self._points_note = ""
         angles, distances, hlat, hlon = compute_horizon_360(lat, lon)
@@ -1072,9 +1201,10 @@ class MoonWindow(GlobeMixin, HudMixin):
     def update_panorama_samples(self, lat, lon):
         """Terrain colours / angles for the panorama behind the horizon graph."""
         if self._panorama_texture_rgb is None:
-            with Image.open(terrain.COLOR_PATH) as texture_image:
-                texture_image = texture_image.convert("RGB")
-                self._panorama_texture_rgb = np.asarray(texture_image).copy()
+            with terrain.allow_large_nasa_image():
+                with Image.open(terrain.COLOR_PATH) as texture_image:
+                    texture_image = texture_image.convert("RGB")
+                    self._panorama_texture_rgb = np.asarray(texture_image)
         self._panorama_samples = terrain_panorama_samples(
             lat, lon, self._panorama_texture_rgb, bearings=max(360, self.window.GetSize()[0]))
         self._panorama_range = None
@@ -1094,7 +1224,8 @@ class MoonWindow(GlobeMixin, HudMixin):
 
     def sync_compare_points(self):
         """Take over the current point set for a comparison (all points shown, index kept in range)."""
-        points = list(self._points)
+        single = getattr(self, '_analysis_single_point', None)
+        points = [single] if single is not None else list(self._points) or [(self.lat, self.lon)]
         if points != self._compare_points:
             self._compare_points = points
             self._compare_visible = [True] * len(points)
@@ -1134,8 +1265,17 @@ class MoonWindow(GlobeMixin, HudMixin):
             if radius > 0:
                 lat = float(np.degrees(np.arcsin(np.clip(pz / radius, -1, 1))))
                 lon = float(np.degrees(np.arctan2(py, px)))
+                points = list(self._points)
+                for point in (normalize_point(self.lat, self.lon), normalize_point(lat, lon)):
+                    if not any(same_point(point, other) for other in points):
+                        points.append(point)
+                if len(points) > MAX_POINTS:
+                    self._points_note = f'A set holds at most {MAX_POINTS} points.'
+                    self.window.Render()
+                    return
                 self.select_location(lat, lon, render=False)
-                self.add_point(lat, lon)
+                self.set_points(points)
+                self.window.Render()
 
     def set_points(self, points):
         points = list(points)
@@ -1148,10 +1288,8 @@ class MoonWindow(GlobeMixin, HudMixin):
     def points_changed(self, render=True):
         self.refresh_point_marks()
         if self._compare_active:
-            if len(self._points) >= 2:
-                self.request_sky_update()  # recalculate for the new set
-            else:
-                self.exit_compare()
+            self._analysis_single_point = None
+            self.request_sky_update()  # recalculate for the new set, including a single point
         if render:
             self.window.Render()
 
@@ -1254,7 +1392,10 @@ class MoonWindow(GlobeMixin, HudMixin):
                         actions[name]()
                     break
             return
+        if self.pick_search_marker(x, y):
+            return
         if self.picker.Pick(x, y, 0, self.renderer):
+            self._search_selected = None
             px, py, pz = self.picker.GetPickPosition()
             radius = np.sqrt(px * px + py * py + pz * pz)
             if radius > 0:

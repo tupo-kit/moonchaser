@@ -1,6 +1,6 @@
 """Moon terrain data and geometry: no VTK, no UI, no sky positions.
 
-Prepares and loads the NASA colour/elevation maps, samples the DEM, and computes the
+Loads the NASA colour/elevation maps, samples the DEM, and computes the
 terrain horizon, the panorama and the latitude/longitude graticule.
 
 IMPORTANT: load_data() reassigns the module globals dem_km, H, W, R_MAX_M and COLOR_PATH.
@@ -16,13 +16,12 @@ import numpy as np
 from PIL import Image
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-COLOR_PATH = os.path.join(BASE_DIR, "moon_color_13k.jpg")
-DEM_PATH = os.path.join(BASE_DIR, "moon_dem_13k.tif")
-MAP_SIZE = (12960, 6480)
-COLOR_SOURCE = os.path.join(BASE_DIR, "lroc_color_poles_16k.tif")
-DEM_SOURCE = os.path.join(BASE_DIR, "ldem_64_uint.tif")
-COLOR_SOURCE_URL = "https://svs.gsfc.nasa.gov/vis/a000000/a004700/a004720/lroc_color_poles_16k.tif"
-DEM_SOURCE_URL = "https://svs.gsfc.nasa.gov/vis/a000000/a004700/a004720/ldem_64_uint.tif"
+COLOR_PATH = os.path.join(BASE_DIR, "lroc_color_poles.tif")
+DEM_PATH = os.path.join(BASE_DIR, "ldem_64.tif")
+COLOR_SOURCE_URL = "https://svs.gsfc.nasa.gov/vis/a000000/a004700/a004720/lroc_color_poles.tif"
+DEM_SOURCE_URL = "https://svs.gsfc.nasa.gov/vis/a000000/a004700/a004720/ldem_64.tif"
+COLOR_SIZE = (27360, 13680)
+DEM_SIZE = (23040, 11520)
 MOON_RADIUS_M = 1_737_400.0
 RELIEF_EXAGGERATION = 3.0
 
@@ -58,53 +57,37 @@ def allow_large_nasa_image():
         Image.MAX_IMAGE_PIXELS = old_limit
 
 
-def prepare_nasa_map(source, url, output, expected_size, kind):
-    """Download an identified NASA source and atomically prepare a 13K map."""
-    if os.path.isfile(output):
-        return
-    if not os.path.isfile(source):
+def ensure_nasa_map(path, url, expected_size, kind, expected_mode):
+    """Download the original map when absent and check its TIFF header."""
+    if not os.path.isfile(path):
         print(f"Downloading NASA {kind} map; this may take a while...", flush=True)
-        download(url, source)
-    temporary = output + ".part"
+        download(url, path)
     try:
-        print(f"Preparing 13K {kind} map...", flush=True)
         with allow_large_nasa_image():
-            with Image.open(source) as image:
-                if image.size != expected_size:
-                    raise ValueError(f"Unexpected {kind} map size {image.size}; expected {expected_size}: {source}")
-                if kind == "elevation":
-                    if image.mode not in ("I;16", "I;16L", "I;16B", "I"):
-                        raise ValueError(f"Expected NASA's 16-bit elevation map, got mode {image.mode}.")
-                    resized = image.resize(MAP_SIZE, Image.Resampling.BILINEAR)
-                    # NASA uint16 is in half-metres, offset +20,000 from the
-                    # signed lunar elevations. Convert to kilometres.
-                    elevations = np.asarray(resized, dtype=np.float32)
-                    elevations -= 20000.0
-                    elevations /= 2000.0
-                    Image.fromarray(elevations).save(temporary, format="TIFF")
-                else:
-                    image = image.convert("RGB")
-                    image = image.resize(MAP_SIZE, Image.Resampling.LANCZOS)
-                    image.save(temporary, format="JPEG", quality=95, subsampling=0)
-        os.replace(temporary, output)
-    finally:
-        if os.path.exists(temporary):
-            os.remove(temporary)
+            with Image.open(path) as image:
+                modes = (expected_mode,) if isinstance(expected_mode, str) else tuple(expected_mode)
+                if image.format != "TIFF" or image.size != expected_size or image.mode not in modes:
+                    raise ValueError(f"Unexpected {kind} map in {path}: expected a {expected_size} {expected_mode} TIFF, "
+                                     f"got {image.format} {image.size} {image.mode}.")
+                image.verify()
+    except OSError as error:
+        raise RuntimeError(f"Cannot read {kind} map {path}: {error}") from error
 
 
 def load_dem(path):
-    """Load the prepared 13K float elevation map in kilometres."""
+    """Load NASA's float32 elevations, already in kilometres."""
     try:
-        with Image.open(path) as image:
-            if image.size != MAP_SIZE or image.mode != "F":
-                raise ValueError(f"Expected a {MAP_SIZE[0]}x{MAP_SIZE[1]} floating-point elevation TIFF: {path}")
-            return np.asarray(image, dtype=np.float32).copy()
+        with allow_large_nasa_image():
+            with Image.open(path) as image:
+                if image.size != DEM_SIZE or image.mode != "F":
+                    raise ValueError(f"Expected a {DEM_SIZE[0]}x{DEM_SIZE[1]} floating-point elevation TIFF: {path}")
+                return np.asarray(image, dtype=np.float32).copy()
     except (OSError, Image.DecompressionBombError) as error:
         raise RuntimeError(f"Cannot read elevation map {path}: {error}") from error
 
 
 def get_dem():
-    prepare_nasa_map(DEM_SOURCE, DEM_SOURCE_URL, DEM_PATH, (23040, 11520), "elevation")
+    ensure_nasa_map(DEM_PATH, DEM_SOURCE_URL, DEM_SIZE, "elevation", "F")
     return load_dem(DEM_PATH)
 
 
@@ -114,17 +97,18 @@ def choose_texture(texture_path=None):
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Texture file does not exist: {path}")
         return path
-    prepare_nasa_map(COLOR_SOURCE, COLOR_SOURCE_URL, COLOR_PATH, (16384, 8192), "color")
+    ensure_nasa_map(COLOR_PATH, COLOR_SOURCE_URL, COLOR_SIZE, "color", ("RGB", "RGBA"))
     return COLOR_PATH
 
 
 def load_data(texture_path=None):
     global dem_km, H, W, R_MAX_M, COLOR_PATH
     COLOR_PATH = choose_texture(texture_path)
-    with Image.open(COLOR_PATH) as image:
-        print(f"Texture: {os.path.basename(COLOR_PATH)} ({image.width} x {image.height})", flush=True)
-        image.verify()
-    print("Loading 13K Moon elevation map...", flush=True)
+    with allow_large_nasa_image():
+        with Image.open(COLOR_PATH) as image:
+            print(f"Texture: {os.path.basename(COLOR_PATH)} ({image.width} x {image.height})", flush=True)
+            image.verify()
+    print("Loading full-resolution Moon elevation map...", flush=True)
     dem_km = get_dem()
     if not np.all(np.isfinite(dem_km)):
         raise RuntimeError("The elevation map contains invalid values.")
