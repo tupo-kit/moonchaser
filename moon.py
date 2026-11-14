@@ -11,13 +11,14 @@ Ctrl-left-drag (or Ctrl-middle-drag) orbits the terrain point under the cursor.
 Click the Moon to select an observer.
 Zoom stops above the terrain. The inset shows all 360 horizon bearings.
 Prepared maps are saved beside this script for later runs.
-Press G to enter latitude, longitude; V for terrain view; R to reset; F for fullscreen; Escape to close.
+Press G to enter latitude, longitude; L to hide/show the lat/lon grid (its spacing follows the zoom); V for terrain view; R to reset; F for fullscreen; Escape to close.
 Sun/Earth positions use Skyfield (offline, limited date range) or JPL Horizons via get_angle.py (internet, wide range);
 you pick the model in the time interval window, and only that model is queried. Time defaults to UTC now.
 Press T to choose a time range; this opens a fullscreen horizon + Sun/Earth graph.
 That window scrolls (mouse wheel, Up/Down, PageUp/PageDown, Home/End) to more graphs: Sun elevation vs
 time and Earth elevation vs time.
-Use Previous/Next to step samples and Close to return to the horizon-only view.
+Use Previous/Next, the Left/Right arrow keys (Shift: 10 samples) or the time slider under the horizon graph to step
+samples; drag the scroll bar at the right edge to scroll; Close returns to the horizon-only view.
 """
 
 import argparse
@@ -304,6 +305,134 @@ def lat_lon_to_xyz(lat_deg, lon_deg, offset=0.0):
     r = 1.0 + (sample_dem_bilinear(lat_deg, lon_deg) / MOON_RADIUS_M) * RELIEF_EXAGGERATION + offset
     lat_r, lon_r = np.radians(lat_deg), np.radians(lon_deg)
     return r * np.cos(lat_r) * np.cos(lon_r), r * np.cos(lat_r) * np.sin(lon_r), r * np.sin(lat_r)
+
+
+GRATICULE_LADDER = (30.0, 10.0, 5.0, 2.0, 1.0, 0.5)  # grid spacings in degrees, coarse to fine
+GRATICULE_SAMPLE_DEG = 0.5      # render-mesh spacing: line points sit exactly on mesh vertices
+GRID_MIN_SPACING_PX = 130.0     # grid lines are never drawn closer together than this on screen
+BELOW_DASH_PX, BELOW_GAP_PX = 7.0, 5.0
+BACKGROUND_RGB = (0.025, 0.035, 0.055)
+
+
+def dim_color(color, factor=0.6):
+    """Blend a colour towards the dark background (used for 'below the horizon')."""
+    return tuple(factor * c + (1.0 - factor) * b for c, b in zip(color, BACKGROUND_RGB))
+
+
+def choose_graticule_step(pixels_per_degree, current=None, min_px=GRID_MIN_SPACING_PX):
+    """Finest ladder spacing whose lines are still >= min_px apart on screen.
+
+    Zooming in switches to a finer grid at once; zooming out only coarsens once the
+    current lines are clearly too dense (70 % of min_px), so the grid does not flicker.
+    """
+    wanted = GRATICULE_LADDER[0]
+    for step in GRATICULE_LADDER:
+        if step * pixels_per_degree >= min_px:
+            wanted = step
+        else:
+            break
+    if current in GRATICULE_LADDER and wanted > current and current * pixels_per_degree >= 0.7 * min_px:
+        return current
+    return wanted
+
+
+def pole_heights():
+    """Height of each pole point of the render mesh (it collapses a pole to one point)."""
+    lons = np.linspace(-180.0, 180.0, 721)
+    return {sign: float(np.mean(lat_lon_to_xyz(np.full_like(lons, 90.0 * sign), lons)[2])) for sign in (-1, 1)}
+
+
+def graticule_lines(step_deg, center_lat=0.0, center_lon=0.0, radius_deg=180.0):
+    """Latitude/longitude lines that follow the terrain, limited to a spherical cap.
+
+    Returns (minor, major): lists of (N, 3) polylines; major = equator and 0 deg meridian.
+    Points come from lat_lon_to_xyz, the function that builds the rendered mesh, and are
+    spaced like its vertices, so the lines lie on the surface.
+    """
+    step = float(step_deg)
+    ratio = step / GRATICULE_SAMPLE_DEG
+    if not 0 < step <= 90 or abs(ratio - round(ratio)) > 1e-9:
+        raise ValueError("Grid spacing must be a positive multiple of 0.5 degrees, at most 90.")
+    sample = GRATICULE_SAMPLE_DEG
+    radius = min(float(radius_deg), 180.0)
+    lat_lo, lat_hi = max(-90.0, center_lat - radius), min(90.0, center_lat + radius)
+    full_lon = radius >= 90.0 or abs(center_lat) + radius >= 90.0 - 1e-9
+    if full_lon:
+        lon_lo, lon_hi = -180.0, 180.0
+    else:  # longitude half-width of the cap (it does not contain a pole here)
+        half = np.degrees(np.arcsin(min(1.0, np.sin(np.radians(radius)) / np.cos(np.radians(center_lat)))))
+        lon_lo, lon_hi = center_lon - half, center_lon + half
+    lat_samples = np.clip(np.arange(np.floor(lat_lo / sample), np.ceil(lat_hi / sample) + 1) * sample, -90.0, 90.0)
+    lon_samples = np.arange(np.floor(lon_lo / sample), np.ceil(lon_hi / sample) + 1) * sample
+
+    meridians = np.arange(int(np.ceil(lon_lo / step - 1e-9)), int(np.floor(lon_hi / step + 1e-9)) + 1) * step
+    if full_lon:
+        meridians = meridians[meridians < 180.0 - 1e-9]  # +180 duplicates -180
+    parallels = np.arange(int(np.ceil(lat_lo / step - 1e-9)), int(np.floor(lat_hi / step + 1e-9)) + 1) * step
+    parallels = parallels[np.abs(parallels) < 90.0 - 1e-9]  # the poles are points
+
+    mx, my, mz = lat_lon_to_xyz(lat_samples[None, :], meridians[:, None])
+    meridian_points = np.stack((mx, my, mz), axis=-1)
+    for sign, height in pole_heights().items():
+        meridian_points[:, lat_samples * sign >= 90.0 - 1e-9, :] = (0.0, 0.0, height)
+    px, py, pz = lat_lon_to_xyz(parallels[:, None], lon_samples[None, :])
+    parallel_points = np.stack((px, py, pz), axis=-1)
+
+    minor, major = [], []
+    for lon, line in zip(meridians, meridian_points):
+        turn = lon % 360.0
+        (major if min(turn, 360.0 - turn) < 1e-9 else minor).append(line)
+    for lat, line in zip(parallels, parallel_points):
+        (major if abs(lat) < 1e-9 else minor).append(line)
+    return minor, major
+
+
+def split_at_zero(points, values):
+    """Split a polyline where `values` changes sign, adding the exact crossing point.
+
+    Returns [(points, below)] where below is True for the parts with values < 0.
+    """
+    points, values = np.asarray(points, dtype=float), np.asarray(values, dtype=float)
+    if len(points) < 2:
+        return []
+    below = values < 0
+    pieces, start, start_point = [], 0, None
+    for i in np.flatnonzero(below[1:] != below[:-1]):
+        v0, v1 = values[i], values[i + 1]
+        crossing = points[i] + (v0 / (v0 - v1)) * (points[i + 1] - points[i])
+        piece = points[start:i + 1]
+        if start_point is not None:
+            piece = np.vstack((start_point, piece))
+        pieces.append((np.vstack((piece, crossing)), bool(below[i])))
+        start, start_point = i + 1, crossing
+    piece = points[start:]
+    if start_point is not None:
+        piece = np.vstack((start_point, piece))
+    pieces.append((piece, bool(below[-1])))
+    return [(piece, flag) for piece, flag in pieces if len(piece) > 1]
+
+
+def dash_polyline(points, dash, gap, scale=(1.0, 1.0)):
+    """Cut a polyline into dashes. dash/gap are in pixels when scale = (width, height)."""
+    scale = np.asarray(scale, dtype=float)
+    pts = np.asarray(points, dtype=float) * scale
+    if len(pts) < 2:
+        return []
+    arc = np.concatenate(([0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))))
+    total = float(arc[-1])
+    if total <= 0.0:
+        return []
+    starts = np.arange(0.0, total, float(dash + gap))
+    ends = np.minimum(starts + dash, total)
+
+    def at(distance):
+        return np.array([[np.interp(distance, arc, pts[:, 0]), np.interp(distance, arc, pts[:, 1])]])
+
+    pieces = []
+    for a, b in zip(starts, ends):
+        first, last = np.searchsorted(arc, [a, b], side="right")[0], np.searchsorted(arc, b, side="left")
+        pieces.append(np.vstack((at(a), pts[first:last], at(b))) / scale)
+    return [piece for piece in pieces if len(piece) > 1]
 
 
 def compute_horizon_360(lat_deg, lon_deg, eye_height_m=2.0, max_dist_km=250.0, step_km=0.5):
@@ -747,6 +876,18 @@ class MoonWindow:
         self.observer.PickableOff()
         self.renderer.AddActor(self.observer)
 
+        # Latitude / longitude grid. Its spacing follows the zoom (update_graticule), and only
+        # the part of the Moon the camera can see is built. L hides/shows it.
+        self._grid_enabled = True
+        self._grid_step = None
+        self._grid_built = None  # (step, unit vector of the cap centre, cap radius in degrees)
+        self.grid_minor = self.make_graticule_actor((0.85, 0.9, 1.0), 1.5, 0.6, -2.0)
+        self.grid_major = self.make_graticule_actor((1.0, 0.85, 0.2), 3.0, 0.95, -3.0)
+        self.grid_caption = self.make_text(0.025, 0.19, 14)
+        # North and south pole marks: a point on the surface and a screen-space letter.
+        self.pole_marks = {1: self.make_pole_mark(1), -1: self.make_pole_mark(-1)}
+        self.renderer.AddObserver("StartEvent", self.on_render_start)
+
         self.stats = self.make_text(0.025, 0.97, 19, top=True)
         self.coordinate_editing = False
         self._coordinate_root = None
@@ -757,7 +898,8 @@ class MoonWindow:
                            "Ctrl-drag: orbit cursor point   |   Wheel: zoom   |   Click: select\n"
                            "G: coordinates   |   T: time interval   |   V: terrain view\n"
                            "R: reset   |   F: fullscreen   |   Esc: close\n"
-                           "Cyan: local horizon   |   Orange: observer   |   Relief: 3x")
+                           "Cyan: local horizon   |   Orange: observer   |   Relief: 3x\n"
+                           "L: lat/lon grid (auto detail)   |   Red N / blue S: poles")
         self.profile_background = self.make_profile_background()
         self._panorama_samples = None
         self._panorama_range = None
@@ -775,12 +917,18 @@ class MoonWindow:
             label.GetTextProperty().SetJustificationToCentered()
             label.SetInput(text)
             self.profile_labels.append(label)
+        # Drawn bottom to top: level line, below-horizon parts (dim, dashed), above-horizon parts, selected sample.
+        self.sky_hlines = {name: self.make_overlay_lines([], dim_color(color, 0.8), 1) for name, color in SKY_COLORS.items()}
+        self.sky_trails_below = {name: self.make_overlay_lines([], dim_color(color), 1) for name, color in SKY_COLORS.items()}
         self.sky_trails = {name: self.make_overlay_lines([], color, 2) for name, color in SKY_COLORS.items()}
+        self.sky_samples_below = {name: self.make_overlay_points([], dim_color(color), 3) for name, color in SKY_COLORS.items()}
         self.sky_samples = {name: self.make_overlay_points([], color, 4) for name, color in SKY_COLORS.items()}
-        self.sky_markers = {name: self.make_overlay_points([], color, 10) for name, color in SKY_COLORS.items()}
-        self.sky_labels = {name: self.make_text(0.61, 0.26, 12) for name in SKY_COLORS}
+        self.sky_markers = {name: self.make_bullseye(color) for name, color in SKY_COLORS.items()}
+        self.sky_values = {name: self.make_value_label(color) for name, color in SKY_COLORS.items()}
+        self.sky_labels = {name: self.make_text(0.61, 0.26, 14) for name in SKY_COLORS}
         for name, actor in self.sky_labels.items():
             actor.GetTextProperty().SetColor(*SKY_COLORS[name])
+            actor.GetTextProperty().SetBold(True)
             actor.SetVisibility(False)
         self.source_buttons = {source: self.make_text(0.64, 0.7, 15) for source in ("Skyfield", "JPL")}
         self.legend_button = self.make_text(0.025, 0.98, 16, top=True)
@@ -812,8 +960,23 @@ class MoonWindow:
             self.panels[key] = {"title": title, "axes": axes, "xlabels": xlabels, "ylabels": ylabels}
         self.panel_terrain = {name: self.make_overlay_lines([], (0.0, 0.9, 1.0), 1) for name in SKY_COLORS}
         self.panel_lines = {name: self.make_overlay_lines([], color, 2) for name, color in SKY_COLORS.items()}
-        self.time_cursor = self.make_overlay_lines([], (0.9, 0.95, 1.0), 1)
-        self.scrollbar = self.make_overlay_lines([], (0.45, 0.55, 0.7), 6)
+        self.panel_hlines = {name: self.make_overlay_lines([], dim_color(color, 0.8), 1) for name, color in SKY_COLORS.items()}
+        self.panel_markers = {name: self.make_bullseye(color) for name, color in SKY_COLORS.items()}
+        self.panel_values = {name: self.make_value_label(color) for name, color in SKY_COLORS.items()}
+        self._panel_state = {}
+        # Time slider under the horizon graph (mouse: click or drag it).
+        self._slider_box = None
+        self.slider_track = self.make_overlay_lines([], (0.4, 0.48, 0.58), 4)
+        self.slider_fill = self.make_overlay_lines([], (0.0, 0.9, 1.0), 4)
+        self.slider_handle = self.make_bullseye((0.0, 0.9, 1.0))
+        self.slider_texts = {key: self.make_text(0.0, 0.0, 12) for key in ("start", "current", "end")}
+        self.slider_texts["current"].GetTextProperty().SetJustificationToCentered()
+        self.slider_texts["end"].GetTextProperty().SetJustificationToRight()
+        for actor in self.slider_texts.values():
+            actor.SetVisibility(False)
+        self._scrollbar_grab = 0.0
+        self.scrollbar_track = self.make_overlay_lines([], (0.16, 0.2, 0.28), 8)
+        self.scrollbar = self.make_overlay_lines([], (0.55, 0.65, 0.8), 8)
         self.apply_layout()
         self.picker = vtk.vtkCellPicker()
         self.picker.SetTolerance(0.001)
@@ -858,6 +1021,12 @@ class MoonWindow:
                 self._moon_drag_press = self.GetInteractor().GetEventPosition()
                 if owner.over_sky_controls(*self._moon_drag_press):
                     self._moon_drag_mode = "ui"
+                if owner.scrollbar_hit(*self._moon_drag_press):
+                    self._moon_drag_mode = "scrollbar"
+                    owner.scrollbar_press(self._moon_drag_press[1])
+                elif owner.slider_hit(*self._moon_drag_press):
+                    self._moon_drag_mode = "slider"
+                    owner.slider_drag(self._moon_drag_press[0])
                 self._moon_drag_last = self._moon_drag_press
                 self._moon_drag_dragged = False
                 self._moon_drag_cursor_pivot = (owner.cursor_surface_target(*self._moon_drag_press)
@@ -870,6 +1039,13 @@ class MoonWindow:
                 if self._moon_drag_press is None or owner.coordinate_editing:
                     return
                 current = self.GetInteractor().GetEventPosition()
+                if self._moon_drag_mode in ("scrollbar", "slider"):
+                    if self._moon_drag_mode == "scrollbar":
+                        owner.scrollbar_drag(current[1])
+                    else:
+                        owner.slider_drag(current[0])
+                    self._moon_drag_last = current
+                    return
                 if self._moon_drag_mode == "ui":
                     if np.hypot(current[0] - self._moon_drag_press[0], current[1] - self._moon_drag_press[1]) > 5:
                         self._moon_drag_dragged = True
@@ -913,6 +1089,9 @@ class MoonWindow:
                     owner.interactor.TerminateApp()
                 elif owner._graph_expanded and key in ("up", "down", "prior", "next", "home", "end"):
                     owner.scroll_key(key)
+                elif owner._graph_expanded and key in ("left", "right"):
+                    count = 10 if interactor.GetShiftKey() else 1
+                    owner.step_time(count if key == "right" else -count)
 
             def key(self, obj, event):
                 interactor = self.GetInteractor()
@@ -929,6 +1108,9 @@ class MoonWindow:
                     owner.step_time(-1)
                 elif key == "bracketright":
                     owner.step_time(1)
+                elif key == "l":
+                    owner._grid_enabled = not owner._grid_enabled
+                    owner.window.Render()
                 elif key == "v":
                     owner.toggle_terrain_view()
                 elif key == "r":
@@ -1073,6 +1255,21 @@ class MoonWindow:
             self._panorama_image.Modified()
             self._panorama_range = limits
 
+    def make_bullseye(self, color):
+        """Selected-sample marker: white ring, dark ring, then the body colour in the middle."""
+        return tuple(self.make_overlay_points([], ring_color, size)
+                     for ring_color, size in (((1.0, 1.0, 1.0), 20), ((0.02, 0.03, 0.05), 16), (color, 11)))
+
+    def set_bullseye(self, bullseye, coordinates):
+        data = self.overlay_point_data(coordinates)
+        for actor in bullseye:
+            actor.GetMapper().SetInputData(data)
+
+    def dashed_pieces(self, pieces):
+        width, height = self.window.GetSize()
+        scale = (max(width, 1), max(height, 1))
+        return [dash for piece in pieces for dash in dash_polyline(piece, BELOW_DASH_PX, BELOW_GAP_PX, scale)]
+
     def overlay_lines_data(self, segments):
         points = self.vtk.vtkPoints()
         cells = self.vtk.vtkCellArray()
@@ -1166,12 +1363,16 @@ class MoonWindow:
             actor.SetVisibility(expanded)
         self.help.SetVisibility(not expanded)
         self.layout_panels(s)
-        # Scroll bar: thumb length = visible fraction of the page.
-        thumb = []
+        self._slider_box = (x0, x1, 0.04 + s) if expanded else None
+        # Scroll bar (drag the thumb, or click the track): thumb length = visible fraction of the page.
+        thumb, track = [], []
         if expanded:
             top = 0.98 - 0.96 * s / PAGE_HEIGHT
             thumb = [[(0.993, top), (0.993, top - 0.96 / PAGE_HEIGHT)]]
+            track = [[(0.993, 0.98), (0.993, 0.02)]]
         self.scrollbar.GetMapper().SetInputData(self.overlay_lines_data(thumb))
+        self.scrollbar_track.GetMapper().SetInputData(self.overlay_lines_data(track))
+        self.update_slider()
         # Re-add the stats text last so it is drawn above the fullscreen background.
         self.renderer.RemoveViewProp(self.stats)
         self.renderer.AddViewProp(self.stats)
@@ -1231,9 +1432,11 @@ class MoonWindow:
         for panel in self.panels.values():
             for actor in (panel["title"], *panel["xlabels"], *panel["ylabels"]):
                 actor.SetVisibility(expanded)
-        for actor in (*self.panel_terrain.values(), *self.panel_lines.values(), self.time_cursor):
+        for actor in (*self.panel_terrain.values(), *self.panel_lines.values()):
             actor.GetMapper().SetInputData(self.overlay_lines_data([]))
+        self._panel_state = {}
         if not expanded:
+            self.update_panel_markers()
             return
         data, epochs = self._sky_data, self._epochs
         ready = data is not None and len(epochs) > 1
@@ -1251,7 +1454,6 @@ class MoonWindow:
 
         seconds = np.array([(epoch - epochs[0]).total_seconds() for epoch in epochs])
         span = float(seconds[-1])
-        cursor = []
         for key in ("Sun", "Earth"):
             panel, (x0, x1, y0, y1) = self.panels[key], self._panel_boxes[key]
             title = f"{key} elevation above the horizon vs time (UTC)"
@@ -1265,11 +1467,14 @@ class MoonWindow:
             low = 0.0
             high = max(0.01, max(float(np.max(np.maximum(
                 data[n]["el"] - data[n]["terrain"], 0.0))) for n in names) * 1.08)
+            values = {}
             for name in names:
                 clearance = np.maximum(data[name]["el"] - data[name]["terrain"], 0.0)
+                values[name] = clearance
                 ys = y0 + (y1 - y0) * clearance / high
                 self.panel_lines[name].GetMapper().SetInputData(
                     self.overlay_lines_data([np.column_stack((xs, ys))]))
+            self._panel_state[key] = {"xs": xs, "high": high, "names": names, "values": values}
             panel["title"].SetInput(f"{key} centre above terrain horizon vs time (UTC)\n"
                                     "0 deg = terrain horizon; below horizon shown as 0\n"
                                     f"Scale 0 to {high:.1f} deg")
@@ -1279,9 +1484,133 @@ class MoonWindow:
             for label, value in zip(panel["ylabels"], (low, high)):
                 label.SetInput(f"{value:+.1f}")
                 label.SetVisibility(True)
-            x = float(xs[self._time_index])
-            cursor.append([(x, y0), (x, y1)])
-        self.time_cursor.GetMapper().SetInputData(self.overlay_lines_data(cursor))
+        self.update_panel_markers()
+
+    def make_value_label(self, color):
+        """Degree readout drawn at the right edge of a graph, level with the selected sample."""
+        label = self.make_text(0.9, 0.5, 13)
+        prop = label.GetTextProperty()
+        prop.SetColor(*color)
+        prop.SetBold(True)
+        prop.SetJustificationToRight()
+        label.SetVisibility(False)
+        return label
+
+    def shown_body(self, name):
+        if self._sky_data is None or not self._graph_expanded or not self._shown_sources[name.rsplit(" ", 1)[-1]]:
+            return None
+        return self._sky_data.get(name)
+
+    def update_panel_markers(self):
+        """Selected sample on the Sun/Earth graphs: a marker, a level line and its degrees at the edge."""
+        for name in SKY_COLORS:
+            self.set_bullseye(self.panel_markers[name], [])
+            self.panel_hlines[name].GetMapper().SetInputData(self.overlay_lines_data([]))
+            self.panel_values[name].SetVisibility(False)
+        for key, state in self._panel_state.items():
+            x0, x1, y0, y1 = self._panel_boxes[key]
+            index = min(self._time_index, len(state["xs"]) - 1)
+            for name in state["names"]:
+                value = float(state["values"][name][index])
+                y = y0 + (y1 - y0) * value / state["high"]
+                self.set_bullseye(self.panel_markers[name], [(float(state["xs"][index]), y)])
+                self.panel_hlines[name].GetMapper().SetInputData(self.overlay_lines_data([[(x0, y), (x1, y)]]))
+                label = self.panel_values[name]
+                label.SetInput(f"{value:.1f} deg")
+                label.SetPosition(x1 - 0.004, float(np.clip(y + 0.004, y0, y1 - 0.025)))
+                label.SetVisibility(True)
+
+    def update_profile_marker(self, name):
+        """Selected sample on the horizon graph: a marker, a level line and its elevation at the edge."""
+        x0, x1, y0, y1 = self._plot_box
+        body = self.shown_body(name)
+        marker, level = [], []
+        label, value = self.sky_labels[name], self.sky_values[name]
+        if body is not None:
+            index = min(self._time_index, len(body["az"]) - 1)
+            az, el = float(body["az"][index]), float(body["el"][index])
+            px, py = x0 + (x1 - x0) * az / 360.0, float(self.profile_y(el))
+            marker, level = [(px, py)], [[(x0, py), (x1, py)]]
+            text = name + (" (partial)" if body["state"][index] == "Partly visible" else "")
+            if el < float(body["terrain"][index]):
+                text += " (below horizon)"
+            label.SetInput(text)
+            label.SetPosition(min(px + 0.012, x1 - (0.17 if "(" in text else 0.09)),
+                              float(np.clip(py + (0.012 if name == "Sun" else -0.024), y0 + 0.01, y1 + 0.005)))
+            value.SetInput(f"{el:+.1f} deg")
+            value.SetPosition(x1 - 0.004, float(np.clip(py + 0.004, y0, y1 - 0.025)))
+        self.sky_hlines[name].GetMapper().SetInputData(self.overlay_lines_data(level))
+        self.set_bullseye(self.sky_markers[name], marker)
+        label.SetVisibility(bool(marker))
+        value.SetVisibility(bool(marker))
+
+    def update_selection(self):
+        """Cheap refresh after the selected sample changes (trails and scales stay as they are)."""
+        for name in SKY_COLORS:
+            self.update_profile_marker(name)
+        self.update_panel_markers()
+        self.update_time_caption()
+        self.update_slider()
+
+    def set_time_index(self, index):
+        index = int(np.clip(index, 0, len(self._epochs) - 1))
+        if index == self._time_index:
+            return
+        self._time_index = index
+        self.update_selection()
+        self.update_stats()
+        self.window.Render()
+
+    def update_slider(self):
+        epochs = self._epochs
+        if not (self._graph_expanded and self._slider_box is not None and len(epochs) > 1):
+            for actor in (self.slider_track, self.slider_fill):
+                actor.GetMapper().SetInputData(self.overlay_lines_data([]))
+            self.set_bullseye(self.slider_handle, [])
+            for actor in self.slider_texts.values():
+                actor.SetVisibility(False)
+            return
+        x0, x1, y = self._slider_box
+        index = min(self._time_index, len(epochs) - 1)
+        handle = x0 + (x1 - x0) * index / (len(epochs) - 1)
+        self.slider_track.GetMapper().SetInputData(self.overlay_lines_data([[(x0, y), (x1, y)]]))
+        self.slider_fill.GetMapper().SetInputData(self.overlay_lines_data([[(x0, y), (handle, y)]] if index else []))
+        self.set_bullseye(self.slider_handle, [(handle, y)])
+        form = "%m-%d %H:%M:%S" if self._interval_step_minutes < 1 else "%m-%d %H:%M"
+        placements = {"start": (x0, epochs[0]), "end": (x1, epochs[-1]),
+                      "current": (float(np.clip(handle, x0 + 0.12, x1 - 0.12)), epochs[index])}
+        for key, (x, epoch) in placements.items():
+            self.slider_texts[key].SetInput(f"{epoch:{form}}")
+            self.slider_texts[key].SetPosition(x, y - 0.032)
+            self.slider_texts[key].SetVisibility(True)
+
+    def slider_hit(self, x, y):
+        if not self._graph_expanded or self._slider_box is None or len(self._epochs) < 2:
+            return False
+        width, height = max(self.window.GetSize()[0], 1), max(self.window.GetSize()[1], 1)
+        x0, x1, ys = self._slider_box
+        return x0 - 0.02 <= x / width <= x1 + 0.02 and abs(y / height - ys) <= 0.03
+
+    def slider_drag(self, x):
+        width = max(self.window.GetSize()[0], 1)
+        x0, x1, _ = self._slider_box
+        fraction = float(np.clip((x / width - x0) / (x1 - x0), 0.0, 1.0))
+        self.set_time_index(round(fraction * (len(self._epochs) - 1)))
+
+    def scrollbar_hit(self, x, y):
+        return self._graph_expanded and x / max(self.window.GetSize()[0], 1) >= 0.985
+
+    def scrollbar_press(self, y):
+        """Grab the thumb where it was pressed; a click on the bare track centres the thumb there."""
+        length = 0.96 / PAGE_HEIGHT
+        top = 0.98 - 0.96 * self._scroll / PAGE_HEIGHT
+        ny = y / max(self.window.GetSize()[1], 1)
+        self._scrollbar_grab = top - ny if top - length <= ny <= top else length / 2
+        self.scrollbar_drag(y)
+
+    def scrollbar_drag(self, y):
+        top = y / max(self.window.GetSize()[1], 1) + self._scrollbar_grab
+        self.scroll_to((0.98 - top) * PAGE_HEIGHT / 0.96)
 
     def close_graph(self):
         self._graph_expanded = False
@@ -1321,36 +1650,27 @@ class MoonWindow:
             + ("".join("\n" + SKY_LEGEND[source] for source in SKY_METHODS[self._sky_method] if self._shown_sources[source])
                if self._graph_expanded else ""))
         for name in SKY_COLORS:
-            body = self._sky_data.get(name) if self._sky_data is not None and self._graph_expanded and self._shown_sources[name.rsplit(" ", 1)[-1]] else None
-            segments, segment, coordinates = [], [], []
-            previous_az = None
+            body = self.shown_body(name)
+            above, below = [], []
+            dots_above = dots_below = np.empty((0, 2))
             if body is not None:
-                for az, el, visible in zip(body["az"], body["el"], body["visible"]):
-                    if previous_az is not None and abs(az - previous_az) > 180:
-                        if len(segment) > 1:
-                            segments.append(segment)
-                        segment = []
-                    point = (x0 + (x1 - x0) * az / 360.0, float(self.profile_y(el)))
-                    coordinates.append(point)
-                    segment.append(point)
-                    previous_az = az
-                if len(segment) > 1:
-                    segments.append(segment)
-            self.sky_trails[name].GetMapper().SetInputData(self.overlay_lines_data(segments))
-            self.sky_samples[name].GetMapper().SetInputData(self.overlay_point_data(coordinates))
-            marker = []
-            if body is not None:
-                az, el = body["az"][self._time_index], body["el"][self._time_index]
-                point = (x0 + (x1 - x0) * az / 360.0, float(self.profile_y(el)))
-                marker = [point]
-                label = name + (" (partial)" if body["state"][self._time_index] == "Partly visible" else "")
-                self.sky_labels[name].SetInput(label)
-                self.sky_labels[name].SetPosition(min(point[0] + 0.008, x1 - 0.09),
-                                                   float(np.clip(point[1] + (0.01 if name == "Sun" else -0.018), y0 + 0.01, y1 + 0.005)))
-            self.sky_markers[name].GetMapper().SetInputData(self.overlay_point_data(marker))
-            self.sky_labels[name].SetVisibility(bool(marker))
+                az, el = np.asarray(body["az"], dtype=float), np.asarray(body["el"], dtype=float)
+                clearance = el - np.asarray(body["terrain"], dtype=float)  # < 0: under the terrain horizon
+                points = np.column_stack((x0 + (x1 - x0) * az / 360.0, self.profile_y(el)))
+                # Break the trail where the azimuth wraps from 360 to 0, then where it crosses the horizon.
+                breaks = np.flatnonzero(np.abs(np.diff(az)) > 180.0) + 1
+                for chunk, values in zip(np.split(points, breaks), np.split(clearance, breaks)):
+                    for piece, is_below in split_at_zero(chunk, values):
+                        (below if is_below else above).append(piece)
+                dots_above, dots_below = points[clearance >= 0], points[clearance < 0]
+            self.sky_trails[name].GetMapper().SetInputData(self.overlay_lines_data(above))
+            self.sky_trails_below[name].GetMapper().SetInputData(self.overlay_lines_data(self.dashed_pieces(below)))
+            self.sky_samples[name].GetMapper().SetInputData(self.overlay_point_data(dots_above))
+            self.sky_samples_below[name].GetMapper().SetInputData(self.overlay_point_data(dots_below))
+            self.update_profile_marker(name)
         self.update_time_caption()
         self.update_panels()
+        self.update_slider()
 
     def profile_y(self, elevation):
         _, _, y0, y1 = self._plot_box
@@ -1588,10 +1908,7 @@ class MoonWindow:
         self.window.Render()
 
     def step_time(self, delta):
-        self._time_index = int(np.clip(self._time_index + delta, 0, len(self._epochs) - 1))
-        self.update_profile(self.horizon_angles)
-        self.update_stats()
-        self.window.Render()
+        self.set_time_index(self._time_index + delta)
 
     def over_sky_controls(self, x, y):
         if self._graph_expanded:
@@ -1691,6 +2008,138 @@ class MoonWindow:
         mapper.SetResolveCoincidentTopologyToPolygonOffset()
         mapper.SetRelativeCoincidentTopologyLineOffsetParameters(0.0, -4.0)
         mapper.SetRelativeCoincidentTopologyPointOffsetParameter(-4.0)
+
+    def make_graticule_actor(self, color, width, opacity, line_offset):
+        actor = self.vtk.vtkActor()
+        mapper = self.vtk.vtkPolyDataMapper()
+        mapper.SetInputData(self.vtk.vtkPolyData())
+        self.configure_surface_overlay(mapper)
+        mapper.SetRelativeCoincidentTopologyLineOffsetParameters(0.0, line_offset)  # horizon line (-4) stays on top
+        actor.SetMapper(mapper)
+        prop = actor.GetProperty()
+        prop.SetColor(*color)
+        prop.SetLineWidth(width)
+        prop.SetOpacity(opacity)
+        prop.LightingOff()
+        actor.PickableOff()
+        actor.VisibilityOff()
+        self.renderer.AddActor(actor)
+        return actor
+
+    def polylines_to_polydata(self, polylines):
+        from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
+
+        data = self.vtk.vtkPolyData()
+        if not len(polylines):
+            return data
+        points = np.ascontiguousarray(np.vstack(polylines), dtype=np.float64)
+        lengths = np.array([len(line) for line in polylines], dtype=np.int64)
+        offsets = np.concatenate(([0], np.cumsum(lengths))).astype(np.int64)
+        cells = self.vtk.vtkCellArray()
+        cells.SetData(numpy_to_vtkIdTypeArray(offsets, deep=True),
+                      numpy_to_vtkIdTypeArray(np.arange(len(points), dtype=np.int64), deep=True))
+        vtk_points = self.vtk.vtkPoints()
+        vtk_points.SetData(numpy_to_vtk(points, deep=True))
+        data.SetPoints(vtk_points)
+        data.SetLines(cells)
+        return data
+
+    def make_pole_mark(self, sign):
+        height = pole_heights()[sign]
+        color = (1.0, 0.45, 0.4) if sign > 0 else (0.45, 0.75, 1.0)
+        points = self.vtk.vtkPoints()
+        points.SetDataTypeToDouble()
+        points.InsertNextPoint(0.0, 0.0, height)
+        vertices = self.vtk.vtkCellArray()
+        vertices.InsertNextCell(1)
+        vertices.InsertCellPoint(0)
+        data = self.vtk.vtkPolyData()
+        data.SetPoints(points)
+        data.SetVerts(vertices)
+        mapper = self.vtk.vtkPolyDataMapper()
+        mapper.SetInputData(data)
+        self.configure_surface_overlay(mapper)
+        actor = self.vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(*color)
+        actor.GetProperty().LightingOff()
+        actor.GetProperty().SetPointSize(11)
+        actor.GetProperty().RenderPointsAsSpheresOn()
+        actor.PickableOff()
+        self.renderer.AddActor(actor)
+        label = self.make_text(0.5, 0.5, 22)
+        label.SetInput("N" if sign > 0 else "S")
+        prop = label.GetTextProperty()
+        prop.SetColor(*color)
+        prop.SetBold(True)
+        prop.SetJustificationToCentered()
+        label.SetVisibility(False)
+        return {"point": actor, "label": label, "position": np.array([0.0, 0.0, height])}
+
+    def update_pole_marks(self):
+        """Show N / S next to a pole while it is on the camera's side of the Moon."""
+        show = not self._terrain_view and not self._graph_expanded
+        width, height = self.window.GetSize()
+        camera_position = np.array(self.renderer.GetActiveCamera().GetPosition())
+        for mark in self.pole_marks.values():
+            position = mark["position"]
+            mark["point"].SetVisibility(show)
+            placed = False
+            # A pole is visible when the camera is above the surface's tangent plane there.
+            if show and width > 0 and height > 0 and float(np.dot(position, camera_position - position)) > 0.0:
+                self.renderer.SetWorldPoint(position[0], position[1], position[2], 1.0)
+                self.renderer.WorldToDisplay()
+                x, y, _ = self.renderer.GetDisplayPoint()
+                if 0.0 <= x <= width and 0.0 <= y <= height:
+                    mark["label"].SetPosition(x / width, (y + 14.0) / height)
+                    placed = True
+            mark["label"].SetVisibility(placed)
+
+    def grid_pixels_per_degree(self):
+        """Screen pixels per degree of lunar surface at the point the camera looks at."""
+        camera = self.renderer.GetActiveCamera()
+        distance = float(np.linalg.norm(np.array(camera.GetPosition()) - self.view_surface_target()))
+        height = max(self.window.GetSize()[1], 1)
+        pixels_per_radian = height / (2.0 * np.tan(np.radians(camera.GetViewAngle()) / 2.0) * max(distance, 1e-9))
+        return float(pixels_per_radian * np.pi / 180.0)
+
+    def update_graticule(self):
+        """Pick the grid spacing for the current zoom and rebuild the visible part when needed."""
+        show = self._grid_enabled and not self._terrain_view and not self._graph_expanded
+        self.grid_caption.SetVisibility(show)
+        if not show:
+            self.grid_minor.SetVisibility(False)
+            self.grid_major.SetVisibility(False)
+            return
+        position = np.array(self.renderer.GetActiveCamera().GetPosition())
+        distance = float(np.linalg.norm(position))
+        if distance < 1e-9:
+            return
+        step = choose_graticule_step(self.grid_pixels_per_degree(), self._grid_step)
+        unit = position / distance
+        # Everything the camera can see lies inside the cap below it that reaches the horizon.
+        ratio = 0.97 / distance  # 0.97: slightly below the lowest terrain
+        cap = 90.0 if ratio >= 1.0 else float(np.degrees(np.arccos(ratio)))
+        rebuild = self._grid_built is None or self._grid_built[0] != step
+        if not rebuild:
+            moved = float(np.degrees(np.arccos(np.clip(np.dot(unit, self._grid_built[1]), -1.0, 1.0))))
+            rebuild = moved + cap > self._grid_built[2]
+        if rebuild:
+            radius = min(180.0, cap * 1.3 + 2.0)
+            lat = float(np.degrees(np.arcsin(np.clip(unit[2], -1.0, 1.0))))
+            lon = float(np.degrees(np.arctan2(unit[1], unit[0])))
+            minor, major = graticule_lines(step, lat, lon, radius)
+            self.grid_minor.GetMapper().SetInputData(self.polylines_to_polydata(minor))
+            self.grid_major.GetMapper().SetInputData(self.polylines_to_polydata(major))
+            self._grid_built = (step, unit, radius)
+            self._grid_step = step
+        self.grid_minor.SetVisibility(True)
+        self.grid_major.SetVisibility(True)
+        self.grid_caption.SetInput(f"Grid: every {step:g} deg   (L: hide)")
+
+    def on_render_start(self, obj=None, event=None):
+        self.update_graticule()
+        self.update_pole_marks()
 
     def terrain_overlay_points(self, directions):
         """Project marks onto the same mesh used to render the Moon."""
@@ -2022,7 +2471,8 @@ class MoonWindow:
                                "Ctrl-drag: orbit cursor point   |   Wheel: zoom   |   Click: select\n"
                                "G: coordinates   |   T: time interval   |   V: terrain view\n"
                                "R: reset   |   F: fullscreen   |   Esc: close\n"
-                               "Cyan: local horizon   |   Orange: observer   |   Relief: 3x")
+                               "Cyan: local horizon   |   Orange: observer   |   Relief: 3x\n"
+                               "L: lat/lon grid (auto detail)   |   Red N / blue S: poles")
         if render:
             self.window.Render()
 
