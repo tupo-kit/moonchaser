@@ -1859,6 +1859,8 @@ class MoonWindow(GlobeMixin, HudMixin):
             self.toggle_map_legend()
             return
         if self.over_sky_controls(x, y):
+            if self.table_header_click(x, y):  # sort a comparison table by the clicked column
+                return
             nx, ny = x / width, y / height
             actions = {"now": self.set_now, "close": self.close_graph,
                        "previous": lambda: self.step_time(-1), "next": lambda: self.step_time(1),

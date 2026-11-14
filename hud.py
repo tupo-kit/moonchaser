@@ -16,7 +16,7 @@ from datetime import timedelta
 
 import numpy as np
 
-from compare import POINT_COLORS, build_tables, table_notes
+from compare import POINT_COLORS, build_tables, next_sort, table_notes
 from sky import SKY_METHODS
 from terrain import terrain_panorama_rgba, terrain_panorama_samples
 
@@ -185,6 +185,8 @@ class HudMixin:
             actor.SetVisibility(False)
         self._cmp_lines, self._cmp_markers, self._cmp_toggles, self._cmp_state = {}, {}, {}, {}
         self._table_pool = []
+        self._table_sorts = [None, None]    # per table: (column, descending) or None
+        self._table_headers = []            # per table: (text slot, column character spans), set by update_table
         self._scrollbar_grab = 0.0
         self.scrollbar_track = self.make_overlay_lines([], (0.16, 0.2, 0.28), 8)
         self.scrollbar = self.make_overlay_lines([], (0.55, 0.65, 0.8), 8)
@@ -533,9 +535,9 @@ class HudMixin:
             self.table_actor(slot)
         white = (0.92, 0.96, 1.0)
         compare = self._compare
-        tables = build_tables(compare["points"], compare["stats"])
+        tables = build_tables(compare["points"], compare["stats"], self._table_sorts)
         notes = table_notes(compare["stats_span"], self._stats_above_only)
-        chars = max(len(line) for _, header, rows in tables for line in (*header, *rows))
+        chars = max(len(line) for _, header, rows, _, _ in tables for line in (*header, *rows))
         size = self.table_font(chars)
 
         def put(slot, text, color, font_size, mono=True):
@@ -549,15 +551,44 @@ class HudMixin:
 
         put(0, "[ Stats over: " + ("samples above the horizon" if self._stats_above_only else "all samples")
             + " ]   (click to change)", white, 14, mono=False)
-        for t, (title, header, rows) in enumerate(tables):
+        self._table_headers = []
+        for t, (title, header, rows, order, spans) in enumerate(tables):
             base = 1 + t * (2 + n)
             put(base, f"{title}  ({compare['source']})", white, size)
             put(base + 1, "\n".join(header), white, size)
-            for i, row in enumerate(rows):
-                put(base + 2 + i, row, POINT_COLORS[i % len(POINT_COLORS)], size)
+            self._table_headers.append((base + 1, spans))
+            for i, row in enumerate(rows):  # rows may be sorted; each keeps the colour of its point
+                put(base + 2 + i, row, POINT_COLORS[order[i] % len(POINT_COLORS)], size)
         put(len(slots) - 1, notes, (0.62, 0.7, 0.8), max(8, size - 1), mono=False)
         for actor in self._table_pool[len(slots):]:
             actor.SetVisibility(False)
+
+    def table_header_click(self, x, y):
+        """A click on a column heading of a comparison table sorts that table. True if it was handled."""
+        if not (self._compare_active and self._graph_expanded) or not self._table_headers:
+            return False
+        width, height = self.window.GetSize()
+        for t, (slot, spans) in enumerate(self._table_headers):
+            if slot >= len(self._table_pool):
+                continue
+            actor = self._table_pool[slot]
+            if not actor.GetVisibility() or not spans:
+                continue
+            size = [0.0, 0.0]
+            actor.GetSize(self.renderer, size)
+            px, py = actor.GetPosition()  # left edge, top edge (the table text is top-justified)
+            left, top = px * width, py * height
+            if not (left <= x <= left + size[0] and top - size[1] <= y <= top) or size[0] <= 0:
+                continue
+            char = (x - left) / size[0] * spans[-1][1]
+            for column, (first, last) in enumerate(spans):
+                if first - 1 <= char < last + 1:
+                    self._table_sorts[t] = next_sort(self._table_sorts[t], column)
+                    self.update_table()
+                    self.window.Render()
+                    return True
+            return True
+        return False
 
     def toggle_stats_mode(self):
         self._stats_above_only = not self._stats_above_only
