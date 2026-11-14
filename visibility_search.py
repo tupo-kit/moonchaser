@@ -19,6 +19,59 @@ from compare import MAX_POINTS, normalize_point, same_point
 LUNAR_DAY_DAYS = 29.530588861
 MAX_GRID_POINTS = 100_000
 MAX_DISPLAY_RESULTS = 500
+_elevation_stats_lock = threading.Lock()
+_elevation_stats_source = None
+_elevation_stats_result = None
+
+
+def global_elevation_stats(cancel=None):
+    """Return exact DEM minimum and median in metres using chunked passes.
+
+    Histogram bins identify the middle value(s), then only those bins are
+    collected and partitioned. The result is reused while the DEM is loaded.
+    """
+    global _elevation_stats_source, _elevation_stats_result
+    dem = terrain.dem_km
+    if dem is None or not dem.size:
+        raise RuntimeError('The Moon elevation map has not been loaded.')
+    with _elevation_stats_lock:
+        if _elevation_stats_source is dem:
+            return _elevation_stats_result
+        minimum, maximum = float(np.min(dem)), float(np.max(dem))
+        if not np.isfinite([minimum, maximum]).all():
+            raise ValueError('The elevation map contains invalid values.')
+        if minimum == maximum:
+            result = (minimum * 1000, minimum * 1000)
+        else:
+            edges = np.linspace(minimum, maximum, 4097, dtype=np.float64)
+            counts = np.zeros(4096, dtype=np.int64)
+            for first in range(0, dem.shape[0], 64):
+                if cancel is not None and cancel.is_set():
+                    return None
+                block = np.asarray(dem[first:first + 64], dtype=np.float64)
+                counts += np.histogram(block, bins=edges)[0]
+            cumulative = np.cumsum(counts)
+            ranks = ((dem.size - 1) // 2, dem.size // 2)
+            bins = [int(np.searchsorted(cumulative, rank, side='right')) for rank in ranks]
+            buckets = {index: [] for index in set(bins)}
+            for first in range(0, dem.shape[0], 64):
+                if cancel is not None and cancel.is_set():
+                    return None
+                block = np.asarray(dem[first:first + 64], dtype=np.float64)
+                for index, values in buckets.items():
+                    mask = (block >= edges[index]) & ((block <= edges[index + 1]) if index == 4095 else (block < edges[index + 1]))
+                    if np.any(mask):
+                        values.append(block[mask])
+            middle = []
+            for index in set(bins):
+                values = np.concatenate(buckets[index])
+                before = int(cumulative[index - 1]) if index else 0
+                local_ranks = [rank - before for rank, b in zip(ranks, bins) if b == index]
+                values.partition(local_ranks)
+                middle.extend(float(values[k]) for k in local_ranks)
+            result = (minimum * 1000.0, sum(middle) * 500.0)
+        _elevation_stats_source, _elevation_stats_result = dem, result
+        return result
 
 
 def cluster_color(index):
@@ -246,16 +299,20 @@ def interval_union(intervals):
     return merged
 
 
-def optimistic_cell_ranges(cells, epochs, min_sun, min_earth, fetch, cancel=None, progress=None):
+def optimistic_cell_ranges(cells, epochs, min_sun, min_earth, fetch, cancel=None, progress=None, horizon_result=None):
     """Screen broad 4-by-4 cell blocks using optimistic visibility estimates.
 
     The center is allowed the full angular width of the block, a generous
-    parallax margin and a pessimistically low terrain bound. This is an
-    approximate range screen, not a guarantee for every point in the block.
+    parallax margin and a median-height observer looking toward the lowest
+    terrain. This is approximate and can exclude a higher valid observer.
     """
-    min_height = float(np.min(terrain.dem_km)) * 1000.0
-    max_height = float(np.max(terrain.dem_km)) * 1000.0
-    floor = optimistic_horizon_floor(max_height, min_height)
+    heights = global_elevation_stats(cancel)
+    if heights is None:
+        return [], {}, [], []
+    min_height, median_height = heights
+    floor = optimistic_horizon_floor(median_height, min_height)
+    if horizon_result:
+        horizon_result(min_height, median_height, floor)
     lat_starts = sorted({cell[0] for cell in cells})
     lon_starts = sorted({cell[2] for cell in cells})
     lat_index = {x: i for i, x in enumerate(lat_starts)}
@@ -345,12 +402,13 @@ def cluster_results(results, wrap_longitude=False, longitude_bounds=None):
 
 def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
                  screen_horizon=2.0, screen_mode="Pessimistic center", cancel=None, progress=None,
-                 use_ranges=True, range_progress=None, range_result=None, max_slope=None, slope_radius_km=1.0):
+                 use_ranges=True, range_progress=None, range_result=None, max_slope=None, slope_radius_km=1.0,
+                 horizon_result=None):
     """Return at most one terrain-checked match per cell.
 
-    A pessimistic center estimate determines the order in which samples are
-    terrain-checked; it never rejects a cell. Refinement tests a finite grid,
-    so it is not an exhaustive or guaranteed search of any cell.
+    The center is checked against real terrain first. If it fails, the optional
+    pessimistic horizon screen decides whether to try the remaining samples.
+    This heuristic can miss valid locations elsewhere in the cell.
     """
     if terrain.dem_km is None:
         raise RuntimeError("The Moon elevation map has not been loaded.")
@@ -376,7 +434,7 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
     precomputed = {}
     if use_ranges:
         eligible, precomputed, lat_ranges, lon_ranges = optimistic_cell_ranges(
-            cells, epochs, min_sun, min_earth, fetch, cancel, range_progress)
+            cells, epochs, min_sun, min_earth, fetch, cancel, range_progress, horizon_result)
         if cancel is not None and cancel.is_set():
             return []
         if range_result:
@@ -394,21 +452,6 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
             progress(completed, total_cells, len(results), time.monotonic() - start, *center, filtered)
         try:
             center_positions = precomputed.pop(center, None)
-            if screen_mode == "Pessimistic center":
-                if center_positions is None:
-                    elevation = float(terrain.sample_dem_bilinear(*center))
-                    center_positions = fetch(center[1], center[0], (elevation + 2.0) / 1000.0, epochs)
-                if cancel is not None and cancel.is_set():
-                    break
-                # Validate even when thresholds are zero.
-                can_meet_thresholds_without_horizon(epochs, center_positions, -90.0, 0.0, 0.0)
-                approx = sky.classify_sky(center_positions, np.full(360, screen_horizon))
-                if (visibility_percent(epochs, approx["Sun"]["visible"]) < min_sun or
-                        visibility_percent(epochs, approx["Earth"]["visible"]) < min_earth):
-                    # A conservative horizon can fail even where the real
-                    # terrain passes. Try the other samples first, then the
-                    # center itself before giving up on this cell.
-                    points = points[1:] + points[:1]
             for point in points:
                 if cancel is not None and cancel.is_set():
                     break
@@ -416,10 +459,13 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
                     elevation = float(terrain.sample_dem_bilinear(*point))
                     pos = (center_positions if point == center and center_positions is not None else
                            fetch(point[1], point[0], (elevation + 2.0) / 1000.0, epochs))
+                    if point == center:
+                        center_positions = pos
                     if cancel is not None and cancel.is_set():
                         break
                     floor = optimistic_horizon_floor(elevation, min_terrain)
-                    if can_meet_thresholds_without_horizon(epochs, pos, floor, min_sun, min_earth):
+                    if ((point == center and screen_mode == 'Pessimistic center') or
+                            can_meet_thresholds_without_horizon(epochs, pos, floor, min_sun, min_earth)):
                         horizon = terrain.compute_horizon_360(*point)[0]
                         classified = sky.classify_sky(pos, horizon)
                         sun = visibility_percent(epochs, classified["Sun"]["visible"])
@@ -441,6 +487,18 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
                                     "cell_lat_min": cell[0], "cell_lat_max": cell[1],
                                     "cell_lon_min": cell[2], "cell_lon_max": cell[3]})
                     break
+                if point == center and screen_mode == 'Pessimistic center':
+                    if center_positions is None:
+                        elevation = float(terrain.sample_dem_bilinear(*center))
+                        center_positions = fetch(center[1], center[0], (elevation + 2.0) / 1000.0, epochs)
+                    if cancel is not None and cancel.is_set():
+                        break
+                    can_meet_thresholds_without_horizon(epochs, center_positions, -90.0, 0.0, 0.0)
+                    approx = sky.classify_sky(center_positions, np.full(360, screen_horizon))
+                    if (visibility_percent(epochs, approx['Sun']['visible']) < min_sun or
+                            visibility_percent(epochs, approx['Earth']['visible']) < min_earth):
+                        filtered += 1
+                        break
             if cancel is not None and cancel.is_set():
                 break
         except Exception as error:
@@ -452,12 +510,12 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
                                            p['sun_percent'] + p['earth_percent']), reverse=True)
 
 
-def search_optimistic_sectors(cells, epochs, min_sun, min_earth, fetch, cancel=None, progress=None):
-    """Keep cells with optimistic visibility bounds, without terrain horizon rays.
+def search_optimistic_sectors(cells, epochs, min_sun, min_earth, fetch, cancel=None, progress=None, horizon_result=None):
+    """Keep cells with optimistic visibility estimates, without terrain horizon rays.
 
     Each body is allowed the cell's full angular margin and full disk visibility;
-    mutual eclipses are ignored. These are candidate sectors, not verified sites.
-    The angular/parallax allowance is approximate, as in the range filter.
+    mutual eclipses are ignored. The horizon assumes the median observer height,
+    so it is not a guaranteed bound for sites higher than that median.
     """
     if terrain.dem_km is None:
         raise RuntimeError('The Moon elevation map has not been loaded.')
@@ -465,11 +523,13 @@ def search_optimistic_sectors(cells, epochs, min_sun, min_earth, fetch, cancel=N
         raise ValueError('End time must be later than start time.')
     if not np.isfinite([min_sun, min_earth]).all() or not (0 <= min_sun <= 100 and 0 <= min_earth <= 100):
         raise ValueError('Visibility thresholds must be between 0 and 100 percent.')
-    min_height = float(np.min(terrain.dem_km)) * 1000.0
-    max_height = float(np.max(terrain.dem_km)) * 1000.0
-    if not np.isfinite([min_height, max_height]).all():
-        raise ValueError('The elevation map contains invalid values.')
-    floor = optimistic_horizon_floor(max_height, min_height)
+    heights = global_elevation_stats(cancel)
+    if heights is None:
+        return []
+    min_height, median_height = heights
+    floor = optimistic_horizon_floor(median_height, min_height)
+    if horizon_result:
+        horizon_result(min_height, median_height, floor)
     results, filtered, start, completed = [], 0, time.monotonic(), 0
     total = len(cells)
     for index, cell in enumerate(cells):
@@ -516,11 +576,15 @@ def _search_worker(messages, cancel, cells, epochs, sun, earth, fetch, side, hor
             messages.put(('range_progress', (done, total, eligible)))
         def range_result(lat_ranges, lon_ranges, eligible, total):
             messages.put(('ranges', (lat_ranges, lon_ranges, eligible, total)))
+        def horizon_result(low, median, floor):
+            messages.put(('optimistic_horizon', (low, median, floor)))
+        if use_ranges or not use_terrain:
+            messages.put(('phase', 'Calculating the exact median and lowest elevation...'))
         if use_terrain:
             results = search_cells(cells, epochs, sun, earth, fetch, side, horizon, mode, cancel, progress,
-                                   use_ranges, range_progress, range_result, max_slope, slope_radius_km)
+                                   use_ranges, range_progress, range_result, max_slope, slope_radius_km, horizon_result)
         else:
-            results = search_optimistic_sectors(cells, epochs, sun, earth, fetch, cancel, progress)
+            results = search_optimistic_sectors(cells, epochs, sun, earth, fetch, cancel, progress, horizon_result)
         messages.put(('done', (results, cancel.is_set())))
     except Exception as error:
         messages.put(('error', str(error)))
@@ -570,7 +634,7 @@ class SearchDialog:
             ('Time step (hours)', '2'), ('Minimum Sun visible (%)', '30'),
             ('Minimum Earth visible (%)', '50'), ('Grid spacing (degrees)', '10'),
             ('Latitude min / max', '-90, 90'), ('Longitude start / end', '-180, 180'),
-            ('Samples per side (2-9)', '3'), ('Screen horizon (degrees)', '2'),
+            ('Samples per side (2-9)', '3'), ('Pessimistic horizon (degrees)', '2'),
             ('Maximum slope (degrees; blank = off)', ''), ('Slope radius (km; 0-20)', '1'),
         ]
         self.fields = []
@@ -590,7 +654,7 @@ class SearchDialog:
         self.range_mode.set('On')
         self.range_mode.grid(row=6, column=3, sticky='ew', pady=3)
         ttk.Label(frame, text='Shift-click or Ctrl-click to select results (maximum 12 points).\n'
-                              'Slope is sampled at DEM scale; optimistic range screening can miss cells.',
+                              'Both pessimistic and optimistic screens can miss cells; slope uses DEM-scale samples.',
                   wraplength=840).pack(anchor='w', pady=(4, 2))
         controls = ttk.Frame(frame)
         controls.pack(fill='x')
@@ -607,6 +671,8 @@ class SearchDialog:
         self.status.pack(anchor='w')
         self.range_label = ttk.Label(frame, text='', wraplength=840)
         self.range_label.pack(anchor='w')
+        self.horizon_label = ttk.Label(frame, text='', wraplength=840)
+        self.horizon_label.pack(anchor='w')
         mode_frame = ttk.Frame(frame)
         mode_frame.pack(fill='x', pady=(4, 0))
         ttk.Label(mode_frame, text='Results:').pack(side='left')
@@ -720,8 +786,8 @@ class SearchDialog:
         self.last_parameters = (start, stop, step_hours, sun, earth, spacing, lat_min, lat_max, lon_min, lon_max, side, horizon, mode, range_mode, max_slope, radius, use_terrain)
         self.view_mode.configure(values=('Points', 'Clusters') if use_terrain else ('Clusters',))
         self.view_mode.set('Points' if use_terrain else 'Clusters')
-        self.table.heading('sun', text='Sun visible %' if use_terrain else 'Sun max upper %')
-        self.table.heading('earth', text='Earth visible %' if use_terrain else 'Earth max upper %')
+        self.table.heading('sun', text='Sun visible %' if use_terrain else 'Sun optimistic %')
+        self.table.heading('earth', text='Earth visible %' if use_terrain else 'Earth optimistic %')
         self.table.delete(*self.table.get_children())
         for button in (self.view_button, self.select_all_button, self.add_button, self.analyze_button, self.marks_button, self.export_button, self.sector_button):
             button.configure(state='disabled')
@@ -729,6 +795,7 @@ class SearchDialog:
         self.cancel_button.configure(state='normal')
         self.progress.configure(maximum=len(cells), value=0)
         self.range_label.configure(text='')
+        self.horizon_label.configure(text='')
         self.status.configure(text=(f'Preparing {len(cells):,} terrain cells, up to {side * side + (side % 2 == 0)} samples each...'
                                     if use_terrain else f'Preparing {len(cells):,} optimistic sectors; terrain horizon and slope are not checked...'))
         self.worker = threading.Thread(target=_search_worker,
@@ -739,7 +806,12 @@ class SearchDialog:
         try:
             while True:
                 kind, value = self.messages.get_nowait()
-                if kind == 'range_progress':
+                if kind == 'phase':
+                    self.status.configure(text=value)
+                elif kind == 'optimistic_horizon':
+                    low, median, floor = value
+                    self.horizon_label.configure(text=f'Optimistic horizon {floor:+.2f} deg | median elevation {median / 1000:+.3f} km | lowest {low / 1000:+.3f} km')
+                elif kind == 'range_progress':
                     done, total, eligible = value
                     self.progress.configure(value=done)
                     self.status.configure(text=f'Estimating optimistic ranges: {done:,}/{total:,} cells | {eligible:,} possible')
@@ -824,7 +896,7 @@ class SearchDialog:
             suffix += f' Table shows first {MAX_DISPLAY_RESULTS}.'
         sectors = self.is_sector_results()
         noun = 'clusters' if self.view_mode.get() == 'Clusters' else ('candidate sectors' if sectors else 'points')
-        explanation = ' Candidate clusters; upper bounds may differ by sector. Select a cluster to search its terrain.' if sectors else ''
+        explanation = ' Candidate clusters; optimistic estimates may miss high sites and differ by sector. Select a cluster to search.' if sectors else ''
         self.status.configure(text=f"{label}: {len(groups):,} {noun}, {len(self.results):,} matching cells.{suffix}{explanation}")
         if self.results:
             for button in (self.select_all_button, self.marks_button, self.export_button):
@@ -850,8 +922,8 @@ class SearchDialog:
         self.use_terrain.set(not sector)
         self.view_mode.configure(values=('Clusters',) if sector else ('Points', 'Clusters'))
         self.view_mode.set('Clusters' if sector else 'Points')
-        self.table.heading('sun', text='Sun max upper %' if sector else 'Sun visible %')
-        self.table.heading('earth', text='Earth max upper %' if sector else 'Earth visible %')
+        self.table.heading('sun', text='Sun optimistic %' if sector else 'Sun visible %')
+        self.table.heading('earth', text='Earth optimistic %' if sector else 'Earth visible %')
         values = (start.strftime('%Y-%m-%d %H:%M:%S'), stop.strftime('%Y-%m-%d %H:%M:%S'),
                   step, sun, earth, spacing, f'{lat_min:g}, {lat_max:g}', f'{lon_min:g}, {lon_max:g}', side, horizon,
                   self.last_parameters[14] if len(self.last_parameters) > 14 and self.last_parameters[14] is not None else '',
@@ -976,7 +1048,7 @@ class SearchDialog:
                 writer = csv.writer(output)
                 if self.is_sector_results():
                     writer.writerow(('cluster', 'sector_count', 'lat_min', 'lat_max', 'longitude_intervals',
-                                     'max_sun_upper_percent', 'max_earth_upper_percent', 'partial_search'))
+                                     'max_sun_optimistic_percent', 'max_earth_optimistic_percent', 'partial_search'))
                     for i, members in enumerate(self._clusters(), 1):
                         intervals = interval_union((m['cell_lon_min'], m['cell_lon_max']) for m in members)
                         writer.writerow((i, len(members), min(m['cell_lat_min'] for m in members),
