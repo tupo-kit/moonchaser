@@ -13,11 +13,12 @@ Zoom stops above the terrain. The inset shows all 360 horizon bearings.
 Put moon_color_8k.jpg beside this script to use it automatically.
 Press G to enter latitude, longitude; R to reset; F for fullscreen; Escape to close.
 Sun/Earth positions use JPL Horizons over the internet. Time defaults to UTC now.
-Click Edit time interval (or T) to choose a range and a method (JPL Horizons, Skyfield or both); this opens a fullscreen horizon + Sun/Earth graph.
+Click Edit time interval (or T) to choose a range; this opens a fullscreen horizon + Sun/Earth graph.
 Use Previous/Next to step samples and Close to return to the horizon-only view.
 """
 
 import argparse
+import json
 import os
 import sys
 import urllib.request
@@ -42,9 +43,31 @@ dem_km = None
 H = W = 0
 R_MAX_M = MOON_RADIUS_M
 MAX_TIME_SAMPLES = 1000
-SKY_METHODS = {"JPL Horizons": ("JPL",), "Skyfield": ("Skyfield",), "Both": ("JPL", "Skyfield")}
+INTERVAL_PATH = os.path.join(os.path.expanduser("~"), ".moon_horizon_interval.json")
+TIME_UNITS = {"seconds": 1/60, "minutes": 1, "hours": 60, "days": 1440}
 SKY_LEGEND = {"JPL": "JPL Sun yellow / Earth blue", "Skyfield": "Skyfield Sun orange / Earth green"}
 SKY_COLORS = {"Sun JPL": (1.0, 0.8, 0.12), "Earth JPL": (0.35, 0.65, 1.0), "Sun Skyfield": (1.0, 0.35, 0.1), "Earth Skyfield": (0.3, 1.0, 0.5)}
+
+
+def load_interval():
+    try:
+        with open(INTERVAL_PATH, encoding="utf-8") as file:
+            data = json.load(file)
+        start, stop = parse_utc(data["start"]), parse_utc(data["stop"])
+        step, unit = float(data["step"]), data["unit"]
+        time_samples(start, stop, step * TIME_UNITS[unit])
+        return start, stop, step, unit
+    except (OSError, ValueError, TypeError, KeyError, OverflowError):
+        return None
+
+
+def save_interval(start, stop, step, unit):
+    data = {"start": parse_utc(start).isoformat(), "stop": parse_utc(stop).isoformat(), "step": float(step), "unit": unit}
+    try:
+        with open(INTERVAL_PATH, "w", encoding="utf-8") as file:
+            json.dump(data, file)
+    except OSError as error:
+        print(f"Could not save the time interval: {error}", file=sys.stderr)
 
 
 def utc_now():
@@ -470,7 +493,7 @@ class CoordinateDialog:
 
 
 class TimeIntervalDialog:
-    def __init__(self, parent, start, stop, step_minutes, on_submit, method="Both"):
+    def __init__(self, parent, start, stop, step, unit, on_submit):
         import tkinter as tk
         from tkinter import ttk
 
@@ -481,7 +504,7 @@ class TimeIntervalDialog:
         frame.grid()
         self.fields = []
         values = (start.strftime("%Y-%m-%d %H:%M:%S"),
-                  stop.strftime("%Y-%m-%d %H:%M:%S"), str(step_minutes))
+                  stop.strftime("%Y-%m-%d %H:%M:%S"), str(step))
         for row, (label, value) in enumerate(zip(
                 ("Start UTC", "End UTC", "Step"), values)):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=4)
@@ -492,12 +515,8 @@ class TimeIntervalDialog:
                 event.widget.selection_range(0, "end"), "break")[-1])
             self.fields.append(entry)
         self.unit = ttk.Combobox(frame, values=("seconds", "minutes", "hours", "days"), state="readonly", width=10)
-        self.unit.set("minutes")
+        self.unit.set(unit)
         self.unit.grid(row=2, column=2, padx=(8, 0))
-        ttk.Label(frame, text="Method").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=4)
-        self.method = ttk.Combobox(frame, values=tuple(SKY_METHODS), state="readonly", width=26)
-        self.method.set(method if method in SKY_METHODS else "Both")
-        self.method.grid(row=3, column=1, sticky="ew", pady=4)
         ttk.Label(frame, text=f"UTC dates: YYYY-MM-DD HH:MM:SS. Up to {MAX_TIME_SAMPLES} samples.").grid(
             row=4, column=0, columnspan=2, sticky="w", pady=6)
         self.error = tk.StringVar(master=self.window)
@@ -507,8 +526,7 @@ class TimeIntervalDialog:
         def apply(event=None):
             try:
                 on_submit(self.fields[0].get(), self.fields[1].get(),
-                          float(self.fields[2].get()) * {"seconds": 1/60, "minutes": 1, "hours": 60, "days": 1440}[self.unit.get()],
-                          self.method.get())
+                          float(self.fields[2].get()), self.unit.get())
             except ValueError as error:
                 self.error.set(str(error))
             else:
@@ -547,7 +565,9 @@ class MoonWindow:
         self._sky_data = None
         self._sky_status = "Waiting for Sun / Earth positions"
         self._now_mode = True
-        self._sky_method = "Both"
+        self._shown_sources = {"JPL": True, "Skyfield": True}
+        self._legend_expanded = True
+        self._saved_interval = load_interval()
         self._graph_expanded = False  # False: horizon only. True: fullscreen horizon + Sun/Earth graph.
         self._epochs = [utc_now()]
         self._time_index = 0
@@ -681,6 +701,8 @@ class MoonWindow:
         for name, actor in self.sky_labels.items():
             actor.GetTextProperty().SetColor(*SKY_COLORS[name])
             actor.SetVisibility(False)
+        self.source_buttons = {source: self.make_text(0.64, 0.7, 15) for source in ("JPL", "Skyfield")}
+        self.legend_button = self.make_text(0.025, 0.98, 16, top=True)
         self.time_button = self.make_text(0.61, 0.46, 16)
         self.time_button.SetInput("[ Edit time interval / T ]")
         self.time_button.GetTextProperty().SetColor(0.25, 0.9, 1.0)
@@ -902,7 +924,9 @@ class MoonWindow:
             bx = 0.64
             self._controls = {"time": (bx, 0.92, 0.83, 0.96), "now": (0.85, 0.92, 0.905, 0.96),
                               "close": (0.91, 0.92, 0.985, 0.96),
-                              "previous": (bx, 0.79, bx + 0.13, 0.825), "next": (bx + 0.16, 0.79, bx + 0.28, 0.825)}
+                              "previous": (bx, 0.79, bx + 0.13, 0.825), "next": (bx + 0.16, 0.79, bx + 0.28, 0.825),
+                              "JPL": (bx, 0.625, bx + 0.15, 0.66), "Skyfield": (bx + 0.17, 0.625, bx + 0.33, 0.66),
+                              "legend": (0.02, 0.95, 0.30, 0.995)}
             positions = {self.time_button: (bx, 0.93), self.now_button: (0.85, 0.93),
                          self.close_button: (0.91, 0.93), self.time_caption: (bx, 0.89),
                          self.previous_button: (bx, 0.795), self.next_button: (bx + 0.16, 0.795),
@@ -910,7 +934,7 @@ class MoonWindow:
         else:
             self._plot_box = (0.61, 0.97, 0.12, 0.25)
             background = ((0.59, 0.055), (0.99, 0.055), (0.99, 0.35), (0.59, 0.35))
-            self._controls = {"time": (0.61, 0.45, 0.86, 0.49)}
+            self._controls = {"time": (0.61, 0.45, 0.86, 0.49), "legend": (0.02, 0.95, 0.30, 0.995)}
             positions = {self.time_button: (0.61, 0.46), self.now_button: (0.90, 0.46),
                          self.close_button: (0.91, 0.46), self.time_caption: (0.61, 0.43),
                          self.previous_button: (0.61, 0.37), self.next_button: (0.77, 0.37),
@@ -919,6 +943,15 @@ class MoonWindow:
             self._bg_points.SetPoint(index, x, y, 0)
         self._bg_points.Modified()
         self.profile_background.GetMapper().GetInput().Modified()
+        self.source_buttons["JPL"].SetPosition(0.64, 0.635)
+        self.source_buttons["Skyfield"].SetPosition(0.81, 0.635)
+        self.legend_button.SetInput("[v] Point details" if self._legend_expanded else "[>] Point details")
+        self.legend_button.SetVisibility(True)
+        self.stats.SetPosition(0.025, 0.93)
+        self.stats.SetVisibility(self._legend_expanded)
+        for source, actor in self.source_buttons.items():
+            actor.SetInput(("[x] " if self._shown_sources[source] else "[ ] ") + source)
+            actor.SetVisibility(expanded)
         for actor, (x, y) in positions.items():
             actor.SetPosition(x, y)
         x0, x1, y0, y1 = self._plot_box
@@ -951,7 +984,9 @@ class MoonWindow:
     def update_profile(self, angles):
         low, high = float(np.min(angles)), float(np.max(angles))
         if self._sky_data is not None:
-            for body in self._sky_data.values():
+            for name, body in self._sky_data.items():
+                if not self._shown_sources[name.rsplit(" ", 1)[-1]]:
+                    continue
                 low = min(low, float(np.min(body["el"] - body["radius"])))
                 high = max(high, float(np.max(body["el"] + body["radius"])))
         padding = max((high - low) * 0.08, 0.01)
@@ -964,10 +999,10 @@ class MoonWindow:
         self.profile_title.SetInput(
             f"360-degree horizon: selected observer\n"
             f"Elevation scale {self._profile_low:+.2f} to {self._profile_high:+.2f} deg"
-            + ("".join("\n" + SKY_LEGEND[source] for source in SKY_METHODS[self._sky_method])
+            + ("".join("\n" + SKY_LEGEND[source] for source in ("JPL", "Skyfield") if self._shown_sources[source])
                if self._graph_expanded else ""))
         for name in SKY_COLORS:
-            body = self._sky_data.get(name) if self._sky_data is not None else None
+            body = self._sky_data.get(name) if self._sky_data is not None and self._graph_expanded and self._shown_sources[name.rsplit(" ", 1)[-1]] else None
             segments, segment, coordinates = [], [], []
             previous_az = None
             if body is not None:
@@ -1019,12 +1054,12 @@ class MoonWindow:
             lines.append(self._sky_status)
         else:
             for name in SKY_COLORS:
-                if name not in self._sky_data:
+                if name not in self._sky_data or not self._shown_sources[name.rsplit(" ", 1)[-1]]:
                     continue
                 body, index = self._sky_data[name], self._time_index
                 lines.append(f"{name}: {body['state'][index]}  |  AZ {body['az'][index]:.2f}, EL {body['el'][index]:+.2f} deg")
             if len(self._epochs) > 1:
-                counts = [f"{name} {np.count_nonzero(body['visible'])}/{len(self._epochs)}" for name, body in self._sky_data.items()]
+                counts = [f"{name} {np.count_nonzero(body['visible'])}/{len(self._epochs)}" for name, body in self._sky_data.items() if self._shown_sources[name.rsplit(" ", 1)[-1]]]
                 lines.append("Visible samples: " + "  |  ".join(counts))
             if self._sky_status:
                 lines.append(self._sky_status)
@@ -1045,7 +1080,7 @@ class MoonWindow:
             return
         request = (self._sky_generation, self.lon, self.lat,
                    (float(sample_dem_bilinear(self.lat, self.lon)) + 2.0) / 1000.0,
-                   list(self._epochs), self.horizon_angles.copy(), SKY_METHODS[self._sky_method])
+                   list(self._epochs), self.horizon_angles.copy())
         # Coalesce fast clicks: keep only the newest waiting location/interval.
         try:
             self._sky_jobs.get_nowait()
@@ -1085,11 +1120,9 @@ class MoonWindow:
                 request = self._sky_jobs.get(timeout=0.2)
             except queue.Empty:
                 continue
-            generation, lon, lat, altitude, epochs, horizon, methods = request
+            generation, lon, lat, altitude, epochs, horizon = request
             data, errors = {}, []
             for source, fetch in (("JPL", self._ephemeris_fetcher), ("Skyfield", self.fetch_skyfield)):
-                if source not in methods:
-                    continue
                 try:
                     classified = classify_sky(fetch(lon, lat, altitude, epochs), horizon)
                     data.update({f"{body} {source}": values for body, values in classified.items()})
@@ -1118,19 +1151,31 @@ class MoonWindow:
             self.update_stats()
             self.window.Render()
 
-    def set_time_interval(self, start, stop, step_minutes, method=None):
-        epochs = time_samples(start, stop, step_minutes)
-        if method is not None:
-            if method not in SKY_METHODS:
-                raise ValueError("Choose JPL Horizons, Skyfield or Both.")
-            self._sky_method = method
+    def set_time_interval(self, start, stop, step, unit="minutes"):
+        if unit not in TIME_UNITS:
+            raise ValueError("Choose a valid time unit.")
+        epochs = time_samples(start, stop, float(step) * TIME_UNITS[unit])
+        self._saved_interval = (parse_utc(start), parse_utc(stop), float(step), unit)
+        save_interval(start, stop, step, unit)
         self._graph_expanded = True
         self.apply_layout()
         self._now_mode = False
         self._epochs = epochs
         self._time_index = 0
-        self._interval_step_minutes = float(step_minutes)
+        self._interval_step_minutes = float(step) * TIME_UNITS[unit]
         self.request_sky_update()
+
+    def toggle_source(self, source):
+        self._shown_sources[source] = not self._shown_sources[source]
+        self.apply_layout()
+        self.update_profile(self.horizon_angles)
+        self.update_stats()
+        self.window.Render()
+
+    def toggle_legend(self):
+        self._legend_expanded = not self._legend_expanded
+        self.apply_layout()
+        self.window.Render()
 
     def set_now(self):
         self._now_mode = True
@@ -1148,7 +1193,7 @@ class MoonWindow:
         if self._graph_expanded:
             return True  # the graph covers the whole window
         width, height = self.window.GetSize()
-        return x >= width * 0.59 and y <= height * 0.49
+        return (x >= width * 0.59 and y <= height * 0.49) or (0.02 <= x / width <= 0.30 and 0.95 <= y / height <= 0.995)
 
     def begin_coordinate_entry(self, render=True):
         if self.coordinate_editing:
@@ -1202,10 +1247,13 @@ class MoonWindow:
         try:
             root = self.get_native_root()
             self.coordinate_editing = True
-            start = self._epochs[0] if self._graph_expanded else utc_now()
-            stop = start + timedelta(days=1) if (self._now_mode or not self._graph_expanded) else self._epochs[-1]
-            dialog = TimeIntervalDialog(root, start, stop, self._interval_step_minutes, self.set_time_interval,
-                                        self._sky_method)
+            if self._saved_interval is not None:
+                start, stop, step, unit = self._saved_interval
+            else:
+                start = utc_now()
+                stop = start + timedelta(days=1)
+                step, unit = 60, "minutes"
+            dialog = TimeIntervalDialog(root, start, stop, step, unit, self.set_time_interval)
             root.wait_window(dialog.window)
         except tk.TclError as error:
             print(f"Could not open time interval editor: {error}", file=sys.stderr)
@@ -1308,7 +1356,9 @@ class MoonWindow:
         if self.over_sky_controls(x, y):
             nx, ny = x / width, y / height
             actions = {"time": self.begin_time_entry, "now": self.set_now, "close": self.close_graph,
-                       "previous": lambda: self.step_time(-1), "next": lambda: self.step_time(1)}
+                       "previous": lambda: self.step_time(-1), "next": lambda: self.step_time(1),
+                       "JPL": lambda: self.toggle_source("JPL"), "Skyfield": lambda: self.toggle_source("Skyfield"),
+                       "legend": self.toggle_legend}
             for name, (left, bottom, right, top) in self._controls.items():
                 if left <= nx <= right and bottom <= ny <= top:
                     actions[name]()
