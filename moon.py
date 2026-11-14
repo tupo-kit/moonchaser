@@ -11,10 +11,10 @@ Ctrl-left-drag (or Ctrl-middle-drag) orbits the terrain point under the cursor.
 Click the Moon to select an observer.
 Zoom stops above the terrain. The inset shows all 360 horizon bearings.
 Prepared maps are saved beside this script for later runs.
-Press G to enter latitude, longitude; R to reset; F for fullscreen; Escape to close.
+Press G to enter latitude, longitude; V for terrain view; R to reset; F for fullscreen; Escape to close.
 Sun/Earth positions use Skyfield (offline, limited date range) or JPL Horizons via get_angle.py (internet, wide range);
 you pick the model in the time interval window, and only that model is queried. Time defaults to UTC now.
-Click Edit time interval (or T) to choose a range; this opens a fullscreen horizon + Sun/Earth graph.
+Press T to choose a time range; this opens a fullscreen horizon + Sun/Earth graph.
 That window scrolls (mouse wheel, Up/Down, PageUp/PageDown, Home/End) to more graphs: Sun elevation vs
 time and Earth elevation vs time.
 Use Previous/Next to step samples and Close to return to the horizon-only view.
@@ -349,13 +349,13 @@ def compute_horizon_360(lat_deg, lon_deg, eye_height_m=2.0, max_dist_km=250.0, s
     return np.degrees(max_angles), h_dists, h_lats, h_lons
 
 
-def terrain_panorama_samples(lat_deg, lon_deg, texture_rgb, max_dist_km=250.0, step_km=0.5):
+def terrain_panorama_samples(lat_deg, lon_deg, texture_rgb, max_dist_km=250.0, step_km=0.5, bearings=360):
     """Project terrain samples into azimuth/elevation and sample map colors.
 
     Distances match compute_horizon_360. The DEM and map are coarse; this is
     an approximate, daytime surface view, not a photograph or lighting model.
     """
-    az = np.radians(np.arange(360))
+    az = np.linspace(0.0, 2 * np.pi, bearings, endpoint=False)
     lat0, lon0 = np.radians([lat_deg, lon_deg])
     up = np.array([np.cos(lat0) * np.cos(lon0), np.cos(lat0) * np.sin(lon0), np.sin(lat0)])
     north = np.array([-np.sin(lat0) * np.cos(lon0), -np.sin(lat0) * np.sin(lon0), np.cos(lat0)])
@@ -381,13 +381,14 @@ def terrain_panorama_rgba(samples, low, high, rows=256):
     """Fill each pixel with its nearest terrain sample; sky remains transparent."""
     angles, colors = samples
     levels = np.linspace(low, high, rows)
-    pixels = np.zeros((rows, 361, 4), dtype=np.uint8)
-    for bearing in range(360):
+    bearing_count = angles.shape[0]
+    pixels = np.zeros((rows, bearing_count + 1, 4), dtype=np.uint8)
+    for bearing in range(bearing_count):
         indices = np.searchsorted(angles[bearing], levels, side="left")
         visible = indices < angles.shape[1]
         pixels[visible, bearing, :3] = colors[bearing, indices[visible]]
         pixels[visible, bearing, 3] = 255
-    pixels[:, 360] = pixels[:, 0]
+    pixels[:, bearing_count] = pixels[:, 0]
     return pixels
 
 
@@ -616,6 +617,10 @@ class MoonWindow:
         self.vtk = vtk
         self.lat, self.lon = -43.31, -11.36
         self.orbit_pivot = np.zeros(3)
+        self._terrain_view = False
+        self._terrain_actor = None
+        self._terrain_saved_camera = None
+        self._zoom_anchor = None
         self._enable_ephemeris = enable_ephemeris
         self._ephemeris_fetcher = ephemeris_fetcher  # optional override used for any model (testing)
         self._sky_jobs = queue.Queue(maxsize=1)
@@ -750,8 +755,8 @@ class MoonWindow:
         self.help = self.make_text(0.025, 0.035, 15)
         self.help.SetInput("Left-drag: orbit   |   Middle/Shift-drag: pan\n"
                            "Ctrl-drag: orbit cursor point   |   Wheel: zoom   |   Click: select\n"
-                           "G: coordinates   |   T: time interval   |   R: reset\n"
-                           "F: fullscreen   |   Esc: close\n"
+                           "G: coordinates   |   T: time interval   |   V: terrain view\n"
+                           "R: reset   |   F: fullscreen   |   Esc: close\n"
                            "Cyan: local horizon   |   Orange: observer   |   Relief: 3x")
         self.profile_background = self.make_profile_background()
         self._panorama_samples = None
@@ -781,9 +786,6 @@ class MoonWindow:
         self.legend_button = self.make_text(0.025, 0.98, 16, top=True)
         self.progress_text = self.make_text(0.35, 0.025, 16)
         self.progress_text.SetVisibility(False)
-        self.time_button = self.make_text(0.61, 0.46, 16)
-        self.time_button.SetInput("[ Edit time interval / T ]")
-        self.time_button.GetTextProperty().SetColor(0.25, 0.9, 1.0)
         self.now_button = self.make_text(0.90, 0.46, 16)
         self.now_button.SetInput("[ Now ]")
         self.time_caption = self.make_text(0.61, 0.43, 12, top=True)
@@ -842,11 +844,11 @@ class MoonWindow:
 
             def left_down(self, obj, event):
                 interactor = self.GetInteractor()
-                mode = "look" if interactor.GetControlKey() else ("pan" if interactor.GetShiftKey() else "orbit")
+                mode = "surface_look" if owner._terrain_view and not owner._graph_expanded else ("look" if interactor.GetControlKey() else ("pan" if interactor.GetShiftKey() else "orbit"))
                 self.start_drag(mode, "left")
 
             def middle_down(self, obj, event):
-                mode = "look" if self.GetInteractor().GetControlKey() else "pan"
+                mode = "surface_look" if owner._terrain_view and not owner._graph_expanded else ("look" if self.GetInteractor().GetControlKey() else "pan")
                 self.start_drag(mode, "middle")
 
             def start_drag(self, mode, button):
@@ -860,8 +862,9 @@ class MoonWindow:
                 self._moon_drag_dragged = False
                 self._moon_drag_cursor_pivot = (owner.cursor_surface_target(*self._moon_drag_press)
                                                 if self._moon_drag_mode == "look" else None)
-                self._moon_drag_pan_depth = float(np.linalg.norm(
+                self._moon_drag_pan_depth = (float(np.linalg.norm(
                     np.array(owner.renderer.GetActiveCamera().GetPosition()) - owner.view_surface_target()))
+                    if self._moon_drag_mode == "pan" else None)
 
             def mouse_move(self, obj, event):
                 if self._moon_drag_press is None or owner.coordinate_editing:
@@ -871,13 +874,15 @@ class MoonWindow:
                     if np.hypot(current[0] - self._moon_drag_press[0], current[1] - self._moon_drag_press[1]) > 5:
                         self._moon_drag_dragged = True
                     return
-                if ((self._moon_drag_mode in ("pan", "look") and current != self._moon_drag_press)
+                if ((self._moon_drag_mode in ("pan", "look", "surface_look") and current != self._moon_drag_press)
                         or np.hypot(current[0] - self._moon_drag_press[0], current[1] - self._moon_drag_press[1]) > 5):
                     self._moon_drag_dragged = True
                 if self._moon_drag_dragged:
                     dx, dy = current[0] - self._moon_drag_last[0], current[1] - self._moon_drag_last[1]
                     if self._moon_drag_mode == "pan":
                         owner.pan(dx, dy, depth=self._moon_drag_pan_depth)
+                    elif self._moon_drag_mode == "surface_look":
+                        owner.terrain_look(dx, dy)
                     elif self._moon_drag_mode == "look":
                         owner.orbit_cursor(dx, dy, self._moon_drag_cursor_pivot)
                     else:
@@ -924,7 +929,11 @@ class MoonWindow:
                     owner.step_time(-1)
                 elif key == "bracketright":
                     owner.step_time(1)
+                elif key == "v":
+                    owner.toggle_terrain_view()
                 elif key == "r":
+                    if owner._terrain_view:
+                        owner.toggle_terrain_view(render=False)
                     owner.reset_camera()
                     owner.window.Render()
                 elif key == "f":
@@ -1046,7 +1055,14 @@ class MoonWindow:
             self._panorama_quad_points.SetPoint(i, x, y, 0)
         self._panorama_quad_points.Modified()
         self.panorama.GetMapper().GetInput().Modified()
-        limits = (self._profile_low, self._profile_high)
+        width, height = self.window.GetSize()
+        bearings = max(360, int(np.ceil((x1 - x0) * width)))
+        if bearings > self._panorama_samples[0].shape[0]:
+            self._panorama_samples = terrain_panorama_samples(
+                self.lat, self.lon, self._panorama_texture_rgb, bearings=bearings)
+            self._panorama_range = None
+        rows = max(2, int(np.ceil((y1 - y0) * height)))
+        limits = (self._profile_low, self._profile_high, rows)
         if limits != self._panorama_range:
             from vtk.util.numpy_support import numpy_to_vtk
             rgba = terrain_panorama_rgba(self._panorama_samples, *limits)
@@ -1105,21 +1121,21 @@ class MoonWindow:
             self._plot_box = (0.06, 0.97, 0.10 + s, 0.62 + s)
             background = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
             bx = 0.64
-            self._controls = {"time": (bx, 0.92 + s, 0.83, 0.96 + s), "now": (0.85, 0.92 + s, 0.905, 0.96 + s),
+            self._controls = {"now": (0.85, 0.92 + s, 0.905, 0.96 + s),
                               "close": (0.91, 0.92 + s, 0.985, 0.96 + s),
                               "previous": (bx, 0.79 + s, bx + 0.13, 0.825 + s),
                               "next": (bx + 0.16, 0.79 + s, bx + 0.28, 0.825 + s),
                               **{source: (bx, 0.625 + s, bx + 0.16, 0.66 + s) for source in SKY_METHODS[self._sky_method]},
                               "legend": (0.02, 0.95 + s, 0.30, 0.995 + s)}
-            positions = {self.time_button: (bx, 0.93 + s), self.now_button: (0.85, 0.93 + s),
+            positions = {self.now_button: (0.85, 0.93 + s),
                          self.close_button: (0.91, 0.93 + s), self.time_caption: (bx, 0.89 + s),
                          self.previous_button: (bx, 0.795 + s), self.next_button: (bx + 0.16, 0.795 + s),
                          self.profile_title: (bx, 0.765 + s)}
         else:
             self._plot_box = (0.61, 0.97, 0.12, 0.25)
             background = ((0.59, 0.055), (0.99, 0.055), (0.99, 0.35), (0.59, 0.35))
-            self._controls = {"time": (0.61, 0.45, 0.86, 0.49), "legend": (0.02, 0.95, 0.30, 0.995)}
-            positions = {self.time_button: (0.61, 0.46), self.now_button: (0.90, 0.46),
+            self._controls = {"legend": (0.02, 0.95, 0.30, 0.995)}
+            positions = {self.now_button: (0.90, 0.46),
                          self.close_button: (0.91, 0.46), self.time_caption: (0.61, 0.43),
                          self.previous_button: (0.61, 0.37), self.next_button: (0.77, 0.37),
                          self.profile_title: (0.61, 0.32)}
@@ -1202,6 +1218,10 @@ class MoonWindow:
         """Wheel zooms the Moon, or scrolls the page while the graph window is open."""
         if self._graph_expanded:
             self.scroll_to(self._scroll + direction * SCROLL_STEP)
+        elif self._terrain_view:
+            camera = self.renderer.GetActiveCamera()
+            camera.SetViewAngle(float(np.clip(camera.GetViewAngle() * (1.08 if direction > 0 else 1 / 1.08), 15, 110)))
+            self.window.Render()
         else:
             self.zoom(1.08 if direction > 0 else 1 / 1.08)
 
@@ -1220,7 +1240,7 @@ class MoonWindow:
         if data is None:
             note = self._sky_status or "Waiting for Sun / Earth positions"
         else:
-            note = "Needs an interval with 2 or more samples (Edit time interval)"
+            note = "Needs an interval with 2 or more samples (press T)"
 
         def hide_labels(panel):
             for actor in (*panel["xlabels"], *panel["ylabels"]):
@@ -1577,7 +1597,7 @@ class MoonWindow:
         if self._graph_expanded:
             return True  # the graph covers the whole window
         width, height = self.window.GetSize()
-        return (x >= width * 0.59 and y <= height * 0.49) or (0.02 <= x / width <= 0.30 and 0.95 <= y / height <= 0.995)
+        return (0.59 <= x / width <= 0.99 and 0.055 <= y / height <= 0.35) or (0.02 <= x / width <= 0.30 and 0.95 <= y / height <= 0.995)
 
     def begin_coordinate_entry(self, render=True):
         if self.coordinate_editing:
@@ -1656,6 +1676,8 @@ class MoonWindow:
 
     def lookup_coordinates(self, text, render=True):
         lat, lon = parse_coordinates(text)
+        if self._terrain_view:
+            self.toggle_terrain_view(render=False)
         distance = np.linalg.norm(self.renderer.GetActiveCamera().GetPosition())
         self.select_location(lat, lon, render=False)
         self.reset_camera(distance=distance)
@@ -1692,9 +1714,9 @@ class MoonWindow:
         if self._panorama_texture_rgb is None:
             with Image.open(COLOR_PATH) as texture_image:
                 texture_image = texture_image.convert("RGB")
-                texture_image.thumbnail((2048, 1024), Image.Resampling.LANCZOS)
-                self._panorama_texture_rgb = np.asarray(texture_image)
-        self._panorama_samples = terrain_panorama_samples(lat, lon, self._panorama_texture_rgb)
+                self._panorama_texture_rgb = np.asarray(texture_image).copy()
+        self._panorama_samples = terrain_panorama_samples(
+            lat, lon, self._panorama_texture_rgb, bearings=max(360, self.window.GetSize()[0]))
         self._panorama_range = None
         self.update_profile(angles)
         # Follow the terrain between bearings rather than drawing straight chords
@@ -1746,7 +1768,7 @@ class MoonWindow:
             return
         if self.over_sky_controls(x, y):
             nx, ny = x / width, y / height
-            actions = {"time": self.begin_time_entry, "now": self.set_now, "close": self.close_graph,
+            actions = {"now": self.set_now, "close": self.close_graph,
                        "previous": lambda: self.step_time(-1), "next": lambda: self.step_time(1),
                        "Skyfield": lambda: self.toggle_source("Skyfield"),
                        "JPL": lambda: self.toggle_source("JPL"),
@@ -1814,6 +1836,9 @@ class MoonWindow:
 
     def constrain_camera(self):
         camera = self.renderer.GetActiveCamera()
+        if self._terrain_view:
+            camera.SetClippingRange(0.25 / MOON_RADIUS_M, 4.0)
+            return
         position = np.array(camera.GetPosition())
         radius = float(np.linalg.norm(position))
         radial = position / radius if radius > 1e-12 else np.array([1.0, 0.0, 0.0])
@@ -1845,18 +1870,33 @@ class MoonWindow:
         camera = self.renderer.GetActiveCamera()
         self.constrain_camera()
         position = np.array(camera.GetPosition())
-        target = self.surface_hit(position, camera.GetDirectionOfProjection())
+        focus = np.array(camera.GetFocalPoint())
+        forward = np.asarray(camera.GetDirectionOfProjection())
+        target = self.surface_hit(position, forward)
+        if target is None and self._zoom_anchor is not None:
+            direction = np.asarray(self._zoom_anchor) - position
+            if np.dot(direction, forward) > 0:
+                target = self.surface_hit(position, direction)
         if target is None:
-            return  # Looking into the sky must not snap the view back to the Moon.
+            # If there is no prior pivot, try the surface currently under the mouse.
+            x, y = self.interactor.GetEventPosition()
+            if self.picker.Pick(x, y, 0, self.renderer):
+                target = np.asarray(self.picker.GetPickPosition(), dtype=float)
+        if target is None:
+            return
         offset = position - target
         surface_distance = float(np.linalg.norm(offset))
-        # Scale the camera-to-hit distance. The actual surface point is the
-        # fixed zoom anchor, including for off-centre and oblique views.
         new_distance = max(self.minimum_surface_clearance, surface_distance * factor)
         if surface_distance > 1e-12:
-            camera.SetPosition(*(target + offset / surface_distance * new_distance))
-            camera.SetFocalPoint(*target)
-        self.constrain_camera()
+            new_position = target + offset / surface_distance * new_distance
+            delta = new_position - position
+            camera.SetPosition(*new_position)
+            camera.SetFocalPoint(*(focus + delta))
+            self.constrain_camera()
+            # Keep the viewing direction unchanged if terrain clearance pushes
+            # the camera away from the requested position.
+            correction = np.asarray(camera.GetPosition()) - new_position
+            camera.SetFocalPoint(*(np.asarray(camera.GetFocalPoint()) + correction))
         if render:
             self.window.Render()
 
@@ -1897,11 +1937,113 @@ class MoonWindow:
         if render:
             self.window.Render()
 
+    def make_terrain_actor(self, half_width_km=250.0, side=501):
+        """Build a local physical-elevation mesh centered on the observer."""
+        from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
+        axis = np.linspace(-half_width_km, half_width_km, side)
+        east_km, north_km = np.meshgrid(axis, axis)
+        distance = np.hypot(east_km, north_km)
+        lat0, lon0 = np.radians([self.lat, self.lon])
+        up = np.array([np.cos(lat0) * np.cos(lon0), np.cos(lat0) * np.sin(lon0), np.sin(lat0)])
+        north = np.array([-np.sin(lat0) * np.cos(lon0), -np.sin(lat0) * np.sin(lon0), np.cos(lat0)])
+        east = np.array([-np.sin(lon0), np.cos(lon0), 0.0])
+        theta = distance * 1000.0 / MOON_RADIUS_M
+        # sinc(theta / pi) / radius avoids division by zero at the observer.
+        scale = np.sinc(theta / np.pi) * 1000.0 / MOON_RADIUS_M
+        xyz = (np.cos(theta)[..., None] * up + scale[..., None] *
+               (north_km[..., None] * north + east_km[..., None] * east))
+        lat = np.degrees(np.arctan2(xyz[..., 2], np.hypot(xyz[..., 0], xyz[..., 1])))
+        lon = np.degrees(np.arctan2(xyz[..., 1], xyz[..., 0]))
+        radius = 1.0 + sample_dem_bilinear(lat, lon) / MOON_RADIUS_M
+        xyz *= radius[..., None]
+        points = self.vtk.vtkPoints()
+        points.SetData(numpy_to_vtk(xyz.reshape(-1, 3).astype(np.float32), deep=True))
+        indices = np.arange(side * side).reshape(side, side)
+        cells_np = np.column_stack((indices[:-1, :-1].ravel(), indices[:-1, 1:].ravel(),
+                                    indices[1:, 1:].ravel(), indices[1:, :-1].ravel()))
+        offsets = np.arange(0, cells_np.size + 1, 4, dtype=np.int64)
+        cells = self.vtk.vtkCellArray()
+        cells.SetData(numpy_to_vtkIdTypeArray(offsets, deep=True),
+                      numpy_to_vtkIdTypeArray(cells_np.astype(np.int64).ravel(), deep=True))
+        # Unwrap longitude around the observer to avoid a visible texture seam.
+        lon_unwrapped = self.lon + (lon - self.lon + 180.0) % 360.0 - 180.0
+        uv = np.column_stack(((lon_unwrapped.ravel() + 180.0) / 360.0,
+                              (lat.ravel() + 90.0) / 180.0)).astype(np.float32)
+        data = self.vtk.vtkPolyData()
+        data.SetPoints(points)
+        data.SetPolys(cells)
+        data.GetPointData().SetTCoords(numpy_to_vtk(uv, deep=True))
+        mapper = self.vtk.vtkPolyDataMapper()
+        mapper.SetInputData(data)
+        actor = self.vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.SetTexture(self.texture)
+        actor.GetProperty().LightingOff()
+        actor.PickableOff()
+        return actor, up, north
+
+    def toggle_terrain_view(self, render=True):
+        """Switch between the globe and a look-around view at the observer."""
+        if self._graph_expanded and not self._terrain_view:
+            return
+        camera = self.renderer.GetActiveCamera()
+        if not self._terrain_view:
+            actor, up, north = self.make_terrain_actor()
+            self._terrain_saved_camera = (camera.GetPosition(), camera.GetFocalPoint(),
+                                          camera.GetViewUp(), camera.GetViewAngle())
+            self._terrain_actor = actor
+            self.renderer.AddActor(actor)
+            self.moon.SetVisibility(False)
+            self.horizon.SetVisibility(False)
+            self.observer.SetVisibility(False)
+            self._terrain_view = True
+            position = up * (1.0 + (float(sample_dem_bilinear(self.lat, self.lon)) + 2.0) / MOON_RADIUS_M)
+            camera.SetPosition(*position)
+            camera.SetFocalPoint(*(position + north * 0.01))
+            camera.SetViewUp(*up)
+            camera.SetViewAngle(75)
+            self.constrain_camera()
+            self.help.SetInput("Terrain view: left-drag to look   |   Wheel: field of view\n"
+                               "V: return to globe   |   G: coordinates   |   T: time interval")
+        else:
+            self.renderer.RemoveActor(self._terrain_actor)
+            self._terrain_actor = None
+            self._terrain_view = False
+            self.moon.SetVisibility(True)
+            self.horizon.SetVisibility(True)
+            self.observer.SetVisibility(True)
+            position, focus, up, angle = self._terrain_saved_camera
+            camera.SetPosition(*position)
+            camera.SetFocalPoint(*focus)
+            camera.SetViewUp(*up)
+            camera.SetViewAngle(angle)
+            self.constrain_camera()
+            self.help.SetInput("Left-drag: orbit   |   Middle/Shift-drag: pan\n"
+                               "Ctrl-drag: orbit cursor point   |   Wheel: zoom   |   Click: select\n"
+                               "G: coordinates   |   T: time interval   |   V: terrain view\n"
+                               "R: reset   |   F: fullscreen   |   Esc: close\n"
+                               "Cyan: local horizon   |   Orange: observer   |   Relief: 3x")
+        if render:
+            self.window.Render()
+
+    def terrain_look(self, dx, dy, render=True):
+        camera = self.renderer.GetActiveCamera()
+        height = max(self.window.GetSize()[1], 1)
+        speed = np.degrees(2 * np.tan(np.radians(camera.GetViewAngle()) / 2) / height)
+        camera.Yaw(dx * speed)
+        camera.Pitch(-dy * speed)
+        camera.OrthogonalizeViewUp()
+        if render:
+            self.window.Render()
+
     def cursor_surface_target(self, x, y):
         """Pick a terrain pivot without changing the selected observer."""
         if self.picker.Pick(x, y, 0, self.renderer):
-            return np.asarray(self.picker.GetPickPosition(), dtype=float)
-        return np.asarray(self.view_surface_target(), dtype=float)
+            pivot = np.asarray(self.picker.GetPickPosition(), dtype=float)
+        else:
+            pivot = np.asarray(self.view_surface_target(), dtype=float)
+        self._zoom_anchor = pivot.copy()
+        return pivot
 
     def orbit_cursor(self, dx, dy, pivot, render=True):
         """Orbit around the pressed terrain point; drag follows the mouse."""
