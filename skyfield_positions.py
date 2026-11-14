@@ -8,13 +8,15 @@ from pathlib import Path
 import numpy as np
 
 
-def get_positions(lon, lat, altitude_km, epochs, data_dir=None):
+def get_positions(lon, lat, altitude_km, epochs, data_dir=None, progress=None):
     from skyfield.api import Loader, PlanetaryConstants
     folder = Path(data_dir) if data_dir else Path(__file__).resolve().parent / 'skyfield_data'
     folder.mkdir(parents=True, exist_ok=True)
     load = Loader(str(folder))
     ts = load.timescale()
     times = ts.from_datetimes(epochs)
+    if progress is not None:
+        progress("Loading Skyfield data (download may be needed)")
     eph = load('https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/planets/de440.bsp')
     constants = PlanetaryConstants()
     constants.read_text(load('https://naif.jpl.nasa.gov/pub/naif/generic_kernels/fk/satellites/moon_de440_250416.tf'))
@@ -41,6 +43,8 @@ def get_positions(lon, lat, altitude_km, epochs, data_dir=None):
             frame, float(lat), float(lon), elevation_m=float(altitude_km) * 1000)
         selected_times = times[indices]
         for name, radius_km in (('Sun', 695700.0), ('Earth', 6378.1366)):
+            if progress is not None:
+                progress(f"Calculating {name} positions")
             apparent = observer.at(selected_times).observe(eph[name.lower()]).apparent()
             elevation, azimuth, distance = apparent.altaz()
             result[name]['az'][indices] = np.atleast_1d(azimuth.degrees) % 360

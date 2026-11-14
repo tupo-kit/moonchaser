@@ -584,6 +584,7 @@ class MoonWindow:
         self._ephemeris_fetcher = ephemeris_fetcher  # optional override used for any model (testing)
         self._sky_jobs = queue.Queue(maxsize=1)
         self._sky_results = queue.Queue()
+        self._sky_progress = queue.Queue()
         self._sky_stop = threading.Event()
         self._sky_thread = None
         self._sky_timer = self._sky_pump_observer = None
@@ -732,6 +733,8 @@ class MoonWindow:
             actor.SetVisibility(False)
         self.source_buttons = {source: self.make_text(0.64, 0.7, 15) for source in ("Skyfield", "JPL")}
         self.legend_button = self.make_text(0.025, 0.98, 16, top=True)
+        self.progress_text = self.make_text(0.35, 0.025, 16)
+        self.progress_text.SetVisibility(False)
         self.time_button = self.make_text(0.61, 0.46, 16)
         self.time_button.SetInput("[ Edit time interval / T ]")
         self.time_button.GetTextProperty().SetColor(0.25, 0.9, 1.0)
@@ -1029,6 +1032,8 @@ class MoonWindow:
         # Re-add the stats text last so it is drawn above the fullscreen background.
         self.renderer.RemoveViewProp(self.stats)
         self.renderer.AddViewProp(self.stats)
+        self.renderer.RemoveViewProp(self.progress_text)
+        self.renderer.AddViewProp(self.progress_text)
 
     def layout_panels(self, s):
         """Place the extra graphs below the main one; page y = -PANEL_HEIGHT * k, screen y = page y + s."""
@@ -1175,6 +1180,7 @@ class MoonWindow:
         self._sky_generation += 1  # discard any response still in flight
         self._sky_data = None
         self._sky_status = ""
+        self.progress_text.SetVisibility(False)
         self._epochs = [utc_now()]
         self._time_index = 0
         self.apply_layout()
@@ -1276,10 +1282,14 @@ class MoonWindow:
         self._sky_generation += 1
         self._sky_data = None  # Never show a previous location's bodies at a new point.
         self._sky_status = "Loading Sun / Earth positions..." if self._enable_ephemeris else "Sun / Earth lookup disabled"
+        active = self._enable_ephemeris and self._graph_expanded
+        self.progress_text.SetInput("Working: starting calculation...")
+        self.progress_text.SetVisibility(active)
         self.update_profile(self.horizon_angles)
         self.update_stats()
-        if not self._enable_ephemeris or not self._graph_expanded:
+        if not active:
             return
+        self.window.Render()
         request = (self._sky_generation, self.lon, self.lat,
                    (float(sample_dem_bilinear(self.lat, self.lon)) + 2.0) / 1000.0,
                    list(self._epochs), self.horizon_angles.copy(), SKY_METHODS[self._sky_method])
@@ -1294,7 +1304,7 @@ class MoonWindow:
             self._sky_thread.start()
 
     @staticmethod
-    def fetch_jpl(lon, lat, altitude, epochs):
+    def fetch_jpl(lon, lat, altitude, epochs, progress=None):
         """JPL Horizons through get_angle.py (azimuth and elevation only)."""
         try:
             from get_angle import get_angle
@@ -1312,6 +1322,8 @@ class MoonWindow:
         runs.append(run)
         result = {}
         for name, body, radius in (("Sun", 10, SUN_RADIUS_DEG), ("Earth", "Earth", EARTH_RADIUS_DEG)):
+            if progress is not None:
+                progress(f"Requesting {name} from JPL Horizons")
             az, el = [], []
             for run in runs:
                 if len(run) == 1:
@@ -1333,12 +1345,12 @@ class MoonWindow:
         return result
 
     @staticmethod
-    def fetch_skyfield(lon, lat, altitude, epochs):
+    def fetch_skyfield(lon, lat, altitude, epochs, progress=None):
         try:
             from skyfield_positions import get_positions
         except ImportError as error:
             raise RuntimeError(f"Install skyfield and keep skyfield_positions.py beside moon.py: {error}") from error
-        return get_positions(lon, lat, altitude, epochs)
+        return get_positions(lon, lat, altitude, epochs, progress=progress)
 
     def toggle_fullscreen(self):
         # Avoid SetFullScreen, which recreates the native VTK window on some drivers.
@@ -1367,7 +1379,14 @@ class MoonWindow:
             for source in methods:
                 fetch = self._ephemeris_fetcher or fetchers[source]
                 try:
-                    classified = classify_sky(fetch(lon, lat, altitude, epochs), horizon)
+                    progress = lambda message: self._sky_progress.put((generation, message))
+                    progress(f"Starting {source} lookup")
+                    if self._ephemeris_fetcher is not None:
+                        positions = fetch(lon, lat, altitude, epochs)
+                    else:
+                        positions = fetch(lon, lat, altitude, epochs, progress=progress)
+                    progress("Checking terrain visibility and eclipses")
+                    classified = classify_sky(positions, horizon)
                     data.update({f"{body} {source}": values for body, values in classified.items()})
                 except Exception as error:
                     message = str(error).strip().splitlines()
@@ -1376,6 +1395,17 @@ class MoonWindow:
 
     def poll_sky(self, obj=None, event=None):
         changed = False
+        finished = False
+        progress_changed = False
+        while True:
+            try:
+                generation, message = self._sky_progress.get_nowait()
+            except queue.Empty:
+                break
+            if generation == self._sky_generation and self._graph_expanded:
+                self.progress_text.SetInput("Working: " + message + "...")
+                self.progress_text.SetVisibility(True)
+                progress_changed = True
         while True:
             try:
                 generation, data, error = self._sky_results.get_nowait()
@@ -1383,15 +1413,23 @@ class MoonWindow:
                 break
             if generation != self._sky_generation:
                 continue  # A newer click or time edit made this response obsolete.
+            self.progress_text.SetInput("Working: building graphs...")
+            self.progress_text.SetVisibility(True)
+            self.window.Render()
             self._sky_data = data
             self._sky_status = f"Unavailable: {error}" if error else ""
             changed = True
+            finished = True
         if self._now_mode and self._graph_expanded and time.monotonic() - self._last_now_query >= 60:
             self.request_sky_update()
             changed = True
         if changed:
             self.update_profile(self.horizon_angles)
             self.update_stats()
+            if finished:
+                self.progress_text.SetVisibility(False)
+            self.window.Render()
+        elif progress_changed:
             self.window.Render()
 
     def set_time_interval(self, start, stop, step, unit="minutes", method=None):
