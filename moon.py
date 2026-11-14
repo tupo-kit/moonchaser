@@ -31,6 +31,7 @@ Files (keep them in one folder; run moon.py):
   hud.py      HudMixin: 2D overlay HUD, horizon inset, Sun/Earth graphs, slider, scroll bar.
   globe.py    GlobeMixin: 3D globe, camera/navigation, picking, grid, pole marks, terrain view.
   compare.py  point comparison without VTK/UI: palette, point-set files, statistics, table text.
+  visibility_search.py  coarse, terrain-aware search for visibility thresholds.
   moon.py     Tk dialogs, MoonWindow (glue: state, input handling, sky worker thread) and main().
 Dependencies: terrain <- sky <- compare <- hud, globe <- moon. Other files must use `terrain.COLOR_PATH`, not a copy.
 """
@@ -48,11 +49,23 @@ from PIL import Image
 import sky
 import terrain
 from compare import (MAX_POINTS, load_points, normalize_point, point_stats, same_point, save_points)
+from visibility_search import SearchDialog, MAX_DISPLAY_RESULTS
 from globe import GlobeMixin
 from hud import SCROLL_STEP, HudMixin
 from sky import (MAX_TIME_SAMPLES, SKY_METHODS, TIME_UNITS, classify_sky, get_positions, load_interval, parse_utc,
                  preload, save_interval, time_samples, utc_now)
 from terrain import compute_horizon_360, compute_slope_deg, load_data, parse_coordinates, sample_dem_bilinear, lat_lon_to_xyz, terrain_panorama_samples
+
+
+def run_responsive_event_loop(interactor, delay=0.01):
+    """Keep VTK on the main thread while giving Python workers time to run."""
+    interactor.SetDone(False)
+    while not interactor.GetDone():
+        interactor.ProcessEvents()
+        if not interactor.GetDone():
+            # Sleep releases Python's GIL. The interactor's blocking Start()
+            # can otherwise starve the calculation threads while idle.
+            time.sleep(delay)
 
 
 class CoordinateDialog:
@@ -405,6 +418,11 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._saved_interval = load_interval()
         self._sky_method = self._saved_interval[4] if self._saved_interval else "Skyfield"
         # Point comparison (compare.py): the set, and the state of the comparison window.
+        self._search_actor = None
+        self._search_session = None
+        self._visibility_dialog = None
+        self._tk_pump_active = False
+        self.GLOBE_HELP = self.GLOBE_HELP + "\nS: search locations by visibility"
         self._points = []              # [(lat, lon), ...] chosen with Shift+click / A / P
         self._compare_active = False   # True: the graph window compares _compare_points
         self._compare_points = []      # snapshot of _points used by the running comparison
@@ -566,6 +584,8 @@ class MoonWindow(GlobeMixin, HudMixin):
                     owner.begin_coordinate_entry()
                 elif key == "t":
                     owner.begin_time_entry()
+                elif key == "s":
+                    owner.begin_visibility_search()
                 elif key == "a":
                     owner.add_current_point()
                 elif key == "p":
@@ -832,6 +852,87 @@ class MoonWindow(GlobeMixin, HudMixin):
         self.request_sky_update()
         self.window.Render()
 
+    def begin_visibility_search(self):
+        if self.coordinate_editing:
+            return
+        try:
+            import tkinter as tk
+        except ImportError:
+            print("Visibility search needs Tkinter.", file=sys.stderr)
+            return
+        if self._visibility_dialog is not None:
+            self._visibility_dialog.window.deiconify()
+            self._visibility_dialog.window.lift()
+            self._visibility_dialog.window.focus_force()
+            return
+        try:
+            root = self.get_native_root()
+            # Non-modal: the existing VTK timer pumps Tk events, so both the
+            # viewer and the search window remain responsive.
+            self._visibility_dialog = SearchDialog(root, self.fetch_skyfield,
+                                                    self._search_session, self.finish_visibility_search)
+        except tk.TclError as error:
+            print(f"Could not open visibility search: {error}", file=sys.stderr)
+
+    def finish_visibility_search(self, dialog):
+        self._visibility_dialog = None
+        if dialog.finished:
+            self._search_session = {"results": dialog.results, "parameters": dialog.last_parameters,
+                                    "cancelled": dialog.was_cancelled}
+        if dialog.clear_markers:
+            self.show_visibility_markers([])
+        elif dialog.show_matches:
+            if self._graph_expanded:
+                self.close_graph()
+            if self._terrain_view:
+                self.toggle_terrain_view(render=False)
+            self.show_visibility_markers(dialog.results[:MAX_DISPLAY_RESULTS])
+            if dialog.selected is not None:
+                point = dialog.selected
+                self.lookup_coordinates(f"{point['lat']}, {point['lon']}", render=False)
+        self.window.Render()
+
+    def show_visibility_markers(self, results):
+        """Draw a bounded selection of matching grid points on the globe."""
+        from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
+        if self._search_actor is not None:
+            self.renderer.RemoveActor(self._search_actor)
+            self._search_actor = None
+        if not results:
+            return
+        lat = np.radians([item['lat'] for item in results])
+        lon = np.radians([item['lon'] for item in results])
+        directions = np.column_stack((np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)))
+        locations = self.terrain_overlay_points(directions)
+        points = self.vtk.vtkPoints()
+        points.SetDataTypeToDouble()
+        points.SetData(numpy_to_vtk(np.ascontiguousarray(locations, dtype=np.float64), deep=True))
+        n = len(locations)
+        cells = self.vtk.vtkCellArray()
+        cells.SetData(numpy_to_vtkIdTypeArray(np.arange(n + 1, dtype=np.int64), deep=True),
+                      numpy_to_vtkIdTypeArray(np.arange(n, dtype=np.int64), deep=True))
+        data = self.vtk.vtkPolyData()
+        data.SetPoints(points)
+        data.SetVerts(cells)
+        mapper = self.vtk.vtkPolyDataMapper()
+        mapper.SetInputData(data)
+        self.configure_surface_overlay(mapper)
+        actor = self.vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(0.25, 1.0, 0.35)
+        actor.GetProperty().SetPointSize(7)
+        actor.GetProperty().LightingOff()
+        actor.PickableOff()
+        self.renderer.AddActor(actor)
+        self._search_actor = actor
+
+    def toggle_terrain_view(self, render=True):
+        GlobeMixin.toggle_terrain_view(self, render=False)
+        if self._search_actor is not None:
+            self._search_actor.SetVisibility(not self._terrain_view)
+        if render:
+            self.window.Render()
+
     def begin_coordinate_entry(self, render=True):
         if self.coordinate_editing:
             return
@@ -905,8 +1006,12 @@ class MoonWindow(GlobeMixin, HudMixin):
             self.window.Render()
 
     def pump_coordinate_clipboard(self, obj=None, event=None):
-        if self._coordinate_root is not None and not self.coordinate_editing:
-            self._coordinate_root.update()
+        if self._coordinate_root is not None and not self.coordinate_editing and not self._tk_pump_active:
+            self._tk_pump_active = True
+            try:
+                self._coordinate_root.update()
+            finally:
+                self._tk_pump_active = False
 
     def lookup_coordinates(self, text, render=True):
         lat, lon = parse_coordinates(text)
@@ -1163,9 +1268,13 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._sky_timer = self.interactor.CreateRepeatingTimer(100)
         self.poll_sky()
         self.window.Render()
+        # Explicitly handle window-manager close as well as Escape.
+        exit_observer = self.interactor.AddObserver(
+            "ExitEvent", lambda obj, event: obj.SetDone(True))
         try:
-            self.interactor.Start()
+            run_responsive_event_loop(self.interactor)
         finally:
+            self.interactor.RemoveObserver(exit_observer)
             self._sky_stop.set()
             if self._sky_timer is not None:
                 self.interactor.DestroyTimer(self._sky_timer)
@@ -1175,6 +1284,11 @@ class MoonWindow(GlobeMixin, HudMixin):
                 self.interactor.DestroyTimer(self._coordinate_timer)
             if self._coordinate_pump_observer is not None:
                 self.interactor.RemoveObserver(self._coordinate_pump_observer)
+            if self._visibility_dialog is not None:
+                # Stop its worker and timer before destroying the Tk root.
+                self._visibility_dialog.on_close = None
+                self._visibility_dialog.close()
+                self._visibility_dialog = None
             if self._coordinate_root is not None:
                 self._coordinate_root.destroy()
             self.window.Finalize()
