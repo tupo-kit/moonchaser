@@ -1,6 +1,6 @@
 """Moon Horizon: a native desktop viewer, with no browser or web server.
 
-Install: python -m pip install numpy Pillow vtk skyfield
+Install: python -m pip install numpy Pillow vtk skyfield astroquery
 Coordinate editor: requires Tkinter (Linux package: python3-tk).
 Run:     python moon.py
 Texture: python moon.py --texture /path/to/moon_color_8k.jpg
@@ -12,8 +12,11 @@ Click the Moon to select an observer.
 Zoom stops above the terrain. The inset shows all 360 horizon bearings.
 Put moon_color_8k.jpg beside this script to use it automatically.
 Press G to enter latitude, longitude; R to reset; F for fullscreen; Escape to close.
-Sun/Earth positions use Skyfield. Time defaults to UTC now.
+Sun/Earth positions use Skyfield (offline, limited date range) or JPL Horizons via get_angle.py (internet, wide range);
+you pick the model in the time interval window, and only that model is queried. Time defaults to UTC now.
 Click Edit time interval (or T) to choose a range; this opens a fullscreen horizon + Sun/Earth graph.
+That window scrolls (mouse wheel, Up/Down, PageUp/PageDown, Home/End) to more graphs: Sun elevation vs
+time, Earth elevation vs time, and hours of sunlight per day.
 Use Previous/Next to step samples and Close to return to the horizon-only view.
 """
 
@@ -42,11 +45,49 @@ RELIEF_EXAGGERATION = 3.0
 dem_km = None
 H = W = 0
 R_MAX_M = MOON_RADIUS_M
-MAX_TIME_SAMPLES = 1000
+MAX_TIME_SAMPLES = 100_000
 INTERVAL_PATH = os.path.join(os.path.expanduser("~"), ".moon_horizon_interval.json")
 TIME_UNITS = {"seconds": 1/60, "minutes": 1, "hours": 60, "days": 1440}
-SKY_LEGEND = {"Skyfield": "Skyfield Sun orange / Earth green"}
-SKY_COLORS = {"Sun Skyfield": (1.0, 0.35, 0.1), "Earth Skyfield": (0.3, 1.0, 0.5)}
+SKY_METHODS = {"Skyfield": ("Skyfield",), "JPL Horizons": ("JPL",)}
+SUN_RADIUS_DEG = float(np.degrees(np.arcsin(695700.0 / 149597870.7)))  # mean, 1 AU
+EARTH_RADIUS_DEG = float(np.degrees(np.arcsin(6378.1366 / 384400.0)))  # mean Earth-Moon distance
+SKY_LEGEND = {"JPL": "JPL Sun yellow / Earth blue", "Skyfield": "Skyfield Sun orange / Earth green"}
+SKY_COLORS = {"Sun JPL": (1.0, 0.8, 0.12), "Earth JPL": (0.35, 0.65, 1.0), "Sun Skyfield": (1.0, 0.35, 0.1), "Earth Skyfield": (0.3, 1.0, 0.5)}
+LIGHT_COLORS = {name: color for name, color in SKY_COLORS.items() if name.startswith("Sun ")}
+PANEL_HEIGHT = 0.5  # each extra graph is half a window tall; the page scrolls under the window
+EXTRA_PANELS = ("Sun", "Earth", "Light")
+PAGE_HEIGHT = 1.0 + PANEL_HEIGHT * len(EXTRA_PANELS)
+SCROLL_STEP = 0.08
+
+
+def daily_light_hours(epochs, masks):
+    """Hours of light per UTC day, and the average per day, from sampled visibility.
+
+    Each sample is taken to hold until the next one. Days only partly covered by the
+    interval are scaled to 24 h, and the average is total lit time / total time * 24.
+    Returns (days, {name: hours per day}, {name: average hours per day}).
+    """
+    first_day = epochs[0].replace(hour=0, minute=0, second=0, microsecond=0)
+    count = (epochs[-1] - first_day).days + 1
+    covered = np.zeros(count)
+    lit = {name: np.zeros(count) for name in masks}
+    for i in range(len(epochs) - 1):
+        start, stop = epochs[i], epochs[i + 1]
+        while start < stop:
+            index = (start - first_day).days
+            end = min(stop, first_day + timedelta(days=index + 1))
+            seconds = (end - start).total_seconds()
+            covered[index] += seconds
+            for name, mask in masks.items():
+                if mask[i]:
+                    lit[name][index] += seconds
+            start = end
+    keep = covered > 0
+    days = [first_day + timedelta(days=int(index)) for index in np.nonzero(keep)[0]]
+    total = float(covered.sum())
+    hours = {name: lit[name][keep] / covered[keep] * 24.0 for name in masks}
+    average = {name: (float(lit[name].sum()) / total * 24.0 if total > 0 else 0.0) for name in masks}
+    return days, hours, average
 
 
 def load_interval():
@@ -55,14 +96,18 @@ def load_interval():
             data = json.load(file)
         start, stop = parse_utc(data["start"]), parse_utc(data["stop"])
         step, unit = float(data["step"]), data["unit"]
+        method = data.get("method", "Skyfield")
+        if method not in SKY_METHODS:
+            method = "Skyfield"
         time_samples(start, stop, step * TIME_UNITS[unit])
-        return start, stop, step, unit
+        return start, stop, step, unit, method
     except (OSError, ValueError, TypeError, KeyError, OverflowError):
         return None
 
 
-def save_interval(start, stop, step, unit):
-    data = {"start": parse_utc(start).isoformat(), "stop": parse_utc(stop).isoformat(), "step": float(step), "unit": unit}
+def save_interval(start, stop, step, unit, method="Skyfield"):
+    data = {"start": parse_utc(start).isoformat(), "stop": parse_utc(stop).isoformat(), "step": float(step), "unit": unit,
+            "method": method}
     try:
         with open(INTERVAL_PATH, "w", encoding="utf-8") as file:
             json.dump(data, file)
@@ -461,7 +506,7 @@ class CoordinateDialog:
 
 
 class TimeIntervalDialog:
-    def __init__(self, parent, start, stop, step, unit, on_submit):
+    def __init__(self, parent, start, stop, step, unit, on_submit, method="Skyfield"):
         import tkinter as tk
         from tkinter import ttk
 
@@ -485,6 +530,10 @@ class TimeIntervalDialog:
         self.unit = ttk.Combobox(frame, values=("seconds", "minutes", "hours", "days"), state="readonly", width=10)
         self.unit.set(unit)
         self.unit.grid(row=2, column=2, padx=(8, 0))
+        ttk.Label(frame, text="Model").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=4)
+        self.method = ttk.Combobox(frame, values=tuple(SKY_METHODS), state="readonly", width=26)
+        self.method.set(method if method in SKY_METHODS else "Skyfield")
+        self.method.grid(row=3, column=1, sticky="ew", pady=4)
         ttk.Label(frame, text=f"UTC dates: YYYY-MM-DD HH:MM:SS. Up to {MAX_TIME_SAMPLES} samples.").grid(
             row=4, column=0, columnspan=2, sticky="w", pady=6)
         self.error = tk.StringVar(master=self.window)
@@ -494,7 +543,7 @@ class TimeIntervalDialog:
         def apply(event=None):
             try:
                 on_submit(self.fields[0].get(), self.fields[1].get(),
-                          float(self.fields[2].get()), self.unit.get())
+                          float(self.fields[2].get()), self.unit.get(), self.method.get())
             except ValueError as error:
                 self.error.set(str(error))
             else:
@@ -523,7 +572,7 @@ class MoonWindow:
         self.lat, self.lon = -43.31, -11.36
         self.orbit_pivot = np.zeros(3)
         self._enable_ephemeris = enable_ephemeris
-        self._ephemeris_fetcher = ephemeris_fetcher or self.fetch_skyfield
+        self._ephemeris_fetcher = ephemeris_fetcher  # optional override used for any model (testing)
         self._sky_jobs = queue.Queue(maxsize=1)
         self._sky_results = queue.Queue()
         self._sky_stop = threading.Event()
@@ -533,10 +582,13 @@ class MoonWindow:
         self._sky_data = None
         self._sky_status = "Waiting for Sun / Earth positions"
         self._now_mode = True
-        self._shown_sources = {"Skyfield": True}
+        self._shown_sources = {"Skyfield": True, "JPL": True}
         self._legend_expanded = True
         self._saved_interval = load_interval()
+        self._sky_method = self._saved_interval[4] if self._saved_interval else "Skyfield"
         self._graph_expanded = False  # False: horizon only. True: fullscreen horizon + Sun/Earth graph.
+        self._scroll = 0.0  # window heights the expanded page is scrolled down
+        self._panel_boxes = {}
         self._epochs = [utc_now()]
         self._time_index = 0
         self._interval_step_minutes = 60
@@ -669,7 +721,7 @@ class MoonWindow:
         for name, actor in self.sky_labels.items():
             actor.GetTextProperty().SetColor(*SKY_COLORS[name])
             actor.SetVisibility(False)
-        self.source_buttons = {source: self.make_text(0.64, 0.7, 15) for source in ("Skyfield",)}
+        self.source_buttons = {source: self.make_text(0.64, 0.7, 15) for source in ("Skyfield", "JPL")}
         self.legend_button = self.make_text(0.025, 0.98, 16, top=True)
         self.time_button = self.make_text(0.61, 0.46, 16)
         self.time_button.SetInput("[ Edit time interval / T ]")
@@ -683,6 +735,27 @@ class MoonWindow:
         self.next_button.SetInput("[ Next ]")
         self.close_button = self.make_text(0.91, 0.46, 16)
         self.close_button.SetInput("[ Close ]")
+        self.panels = {}
+        for key in EXTRA_PANELS:
+            title = self.make_text(0.08, 0.0, 14, top=True)
+            axes = self.make_overlay_lines([], (0.4, 0.48, 0.58), 1)
+            xlabels, ylabels = [], []
+            for _ in range(5):
+                label = self.make_text(0.0, 0.0, 12)
+                label.GetTextProperty().SetJustificationToCentered()
+                xlabels.append(label)
+            for _ in range(2):
+                label = self.make_text(0.0, 0.0, 12)
+                label.GetTextProperty().SetJustificationToRight()
+                label.GetTextProperty().SetVerticalJustificationToCentered()
+                ylabels.append(label)
+            self.panels[key] = {"title": title, "axes": axes, "xlabels": xlabels, "ylabels": ylabels}
+        self.panel_terrain = {name: self.make_overlay_lines([], (0.0, 0.9, 1.0), 1) for name in SKY_COLORS}
+        self.panel_lines = {name: self.make_overlay_lines([], color, 2) for name, color in SKY_COLORS.items()}
+        self.light_lines = {name: self.make_overlay_lines([], color, 2) for name, color in LIGHT_COLORS.items()}
+        self.light_points = {name: self.make_overlay_points([], color, 6) for name, color in LIGHT_COLORS.items()}
+        self.time_cursor = self.make_overlay_lines([], (0.9, 0.95, 1.0), 1)
+        self.scrollbar = self.make_overlay_lines([], (0.45, 0.55, 0.7), 6)
         self.apply_layout()
         self.picker = vtk.vtkCellPicker()
         self.picker.SetTolerance(0.001)
@@ -704,8 +777,8 @@ class MoonWindow:
                 self.AddObserver("MiddleButtonPressEvent", self.middle_down)
                 self.AddObserver("MiddleButtonReleaseEvent", self.middle_up)
                 self.AddObserver("MouseMoveEvent", self.mouse_move)
-                self.AddObserver("MouseWheelForwardEvent", lambda obj, event: owner.zoom(1 / 1.08) if not owner._graph_expanded else None)
-                self.AddObserver("MouseWheelBackwardEvent", lambda obj, event: owner.zoom(1.08) if not owner._graph_expanded else None)
+                self.AddObserver("MouseWheelForwardEvent", lambda obj, event: owner.wheel(-1))
+                self.AddObserver("MouseWheelBackwardEvent", lambda obj, event: owner.wheel(1))
                 self.AddObserver("KeyPressEvent", self.key_press)
                 self.AddObserver("CharEvent", self.key)
                 self.AddObserver("ConfigureEvent", lambda obj, event: owner.constrain_camera())
@@ -773,6 +846,8 @@ class MoonWindow:
                     return  # The native editor handles its own keyboard events.
                 elif key == "escape":
                     owner.interactor.TerminateApp()
+                elif owner._graph_expanded and key in ("up", "down", "prior", "next", "home", "end"):
+                    owner.scroll_key(key)
 
             def key(self, obj, event):
                 interactor = self.GetInteractor()
@@ -886,19 +961,21 @@ class MoonWindow:
     def apply_layout(self):
         """Small inset with only the horizon, or a fullscreen combined graph."""
         expanded = self._graph_expanded
+        s = self._scroll if expanded else 0.0  # screen y = page y + s
         if expanded:
-            self._plot_box = (0.06, 0.97, 0.10, 0.62)
+            self._plot_box = (0.06, 0.97, 0.10 + s, 0.62 + s)
             background = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
             bx = 0.64
-            self._controls = {"time": (bx, 0.92, 0.83, 0.96), "now": (0.85, 0.92, 0.905, 0.96),
-                              "close": (0.91, 0.92, 0.985, 0.96),
-                              "previous": (bx, 0.79, bx + 0.13, 0.825), "next": (bx + 0.16, 0.79, bx + 0.28, 0.825),
-                              "Skyfield": (bx, 0.625, bx + 0.16, 0.66),
-                              "legend": (0.02, 0.95, 0.30, 0.995)}
-            positions = {self.time_button: (bx, 0.93), self.now_button: (0.85, 0.93),
-                         self.close_button: (0.91, 0.93), self.time_caption: (bx, 0.89),
-                         self.previous_button: (bx, 0.795), self.next_button: (bx + 0.16, 0.795),
-                         self.profile_title: (bx, 0.765)}
+            self._controls = {"time": (bx, 0.92 + s, 0.83, 0.96 + s), "now": (0.85, 0.92 + s, 0.905, 0.96 + s),
+                              "close": (0.91, 0.92 + s, 0.985, 0.96 + s),
+                              "previous": (bx, 0.79 + s, bx + 0.13, 0.825 + s),
+                              "next": (bx + 0.16, 0.79 + s, bx + 0.28, 0.825 + s),
+                              **{source: (bx, 0.625 + s, bx + 0.16, 0.66 + s) for source in SKY_METHODS[self._sky_method]},
+                              "legend": (0.02, 0.95 + s, 0.30, 0.995 + s)}
+            positions = {self.time_button: (bx, 0.93 + s), self.now_button: (0.85, 0.93 + s),
+                         self.close_button: (0.91, 0.93 + s), self.time_caption: (bx, 0.89 + s),
+                         self.previous_button: (bx, 0.795 + s), self.next_button: (bx + 0.16, 0.795 + s),
+                         self.profile_title: (bx, 0.765 + s)}
         else:
             self._plot_box = (0.61, 0.97, 0.12, 0.25)
             background = ((0.59, 0.055), (0.99, 0.055), (0.99, 0.35), (0.59, 0.35))
@@ -911,14 +988,16 @@ class MoonWindow:
             self._bg_points.SetPoint(index, x, y, 0)
         self._bg_points.Modified()
         self.profile_background.GetMapper().GetInput().Modified()
-        self.source_buttons["Skyfield"].SetPosition(0.64, 0.635)
+        for actor in self.source_buttons.values():
+            actor.SetPosition(0.64, 0.635 + s)
         self.legend_button.SetInput("[v] Point details" if self._legend_expanded else "[>] Point details")
         self.legend_button.SetVisibility(True)
-        self.stats.SetPosition(0.025, 0.93)
+        self.legend_button.SetPosition(0.025, 0.98 + s)
+        self.stats.SetPosition(0.025, 0.93 + s)
         self.stats.SetVisibility(self._legend_expanded)
         for source, actor in self.source_buttons.items():
             actor.SetInput(("[x] " if self._shown_sources[source] else "[ ] ") + source)
-            actor.SetVisibility(expanded)
+            actor.SetVisibility(expanded and source in SKY_METHODS[self._sky_method])
         for actor, (x, y) in positions.items():
             actor.SetPosition(x, y)
         x0, x1, y0, y1 = self._plot_box
@@ -931,12 +1010,158 @@ class MoonWindow:
                       self.previous_button, self.next_button):
             actor.SetVisibility(expanded)
         self.help.SetVisibility(not expanded)
+        self.layout_panels(s)
+        # Scroll bar: thumb length = visible fraction of the page.
+        thumb = []
+        if expanded:
+            top = 0.98 - 0.96 * s / PAGE_HEIGHT
+            thumb = [[(0.993, top), (0.993, top - 0.96 / PAGE_HEIGHT)]]
+        self.scrollbar.GetMapper().SetInputData(self.overlay_lines_data(thumb))
         # Re-add the stats text last so it is drawn above the fullscreen background.
         self.renderer.RemoveViewProp(self.stats)
         self.renderer.AddViewProp(self.stats)
 
+    def layout_panels(self, s):
+        """Place the extra graphs below the main one; page y = -PANEL_HEIGHT * k, screen y = page y + s."""
+        for k, key in enumerate(EXTRA_PANELS, start=1):
+            base = -PANEL_HEIGHT * k + s
+            x0, x1, y0, y1 = 0.08, 0.97, base + 0.10, base + 0.38
+            self._panel_boxes[key] = (x0, x1, y0, y1)
+            panel = self.panels[key]
+            verticals = [[(x0 + (x1 - x0) * f, y0), (x0 + (x1 - x0) * f, y1)] for f in (0.25, 0.5, 0.75)]
+            panel["axes"].GetMapper().SetInputData(self.overlay_lines_data(
+                [[(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)], *verticals]))
+            panel["title"].SetPosition(x0, base + 0.47)
+            for x, label in zip(np.linspace(x0, x1, 5), panel["xlabels"]):
+                label.SetPosition(float(x), y0 - 0.035)
+            panel["ylabels"][0].SetPosition(x0 - 0.005, y0)
+            panel["ylabels"][1].SetPosition(x0 - 0.005, y1)
+
+    def scroll_to(self, value):
+        if not self._graph_expanded:
+            return
+        value = float(np.clip(value, 0.0, PAGE_HEIGHT - 1.0))
+        if value == self._scroll:
+            return
+        self._scroll = value
+        self.apply_layout()
+        self.update_profile(self.horizon_angles)
+        self.window.Render()
+
+    def scroll_key(self, key):
+        if key == "home":
+            self.scroll_to(0.0)
+        elif key == "end":
+            self.scroll_to(PAGE_HEIGHT - 1.0)
+        else:
+            self.scroll_to(self._scroll + {"up": -SCROLL_STEP, "down": SCROLL_STEP,
+                                           "prior": -0.8, "next": 0.8}[key])
+
+    def wheel(self, direction):
+        """Wheel zooms the Moon, or scrolls the page while the graph window is open."""
+        if self._graph_expanded:
+            self.scroll_to(self._scroll + direction * SCROLL_STEP)
+        else:
+            self.zoom(1.08 if direction > 0 else 1 / 1.08)
+
+    def update_panels(self):
+        """Sun/Earth elevation vs time, and hours of light per day (the scrolled-to graphs)."""
+        expanded = self._graph_expanded
+        for panel in self.panels.values():
+            for actor in (panel["title"], *panel["xlabels"], *panel["ylabels"]):
+                actor.SetVisibility(expanded)
+        for actor in (*self.panel_terrain.values(), *self.panel_lines.values(),
+                      *self.light_lines.values(), self.time_cursor):
+            actor.GetMapper().SetInputData(self.overlay_lines_data([]))
+        for actor in self.light_points.values():
+            actor.GetMapper().SetInputData(self.overlay_point_data([]))
+        if not expanded:
+            return
+        data, epochs = self._sky_data, self._epochs
+        ready = data is not None and len(epochs) > 1
+        if data is None:
+            note = self._sky_status or "Waiting for Sun / Earth positions"
+        else:
+            note = "Needs an interval with 2 or more samples (Edit time interval)"
+
+        def hide_labels(panel):
+            for actor in (*panel["xlabels"], *panel["ylabels"]):
+                actor.SetVisibility(False)
+
+        def shown(name):
+            return data is not None and name in data and self._shown_sources[name.rsplit(" ", 1)[-1]]
+
+        seconds = np.array([(epoch - epochs[0]).total_seconds() for epoch in epochs])
+        span = float(seconds[-1])
+        cursor = []
+        for key in ("Sun", "Earth"):
+            panel, (x0, x1, y0, y1) = self.panels[key], self._panel_boxes[key]
+            title = f"{key} elevation above the horizon vs time (UTC)"
+            names = [name for name in SKY_COLORS if name.startswith(key + " ") and shown(name)]
+            if not ready or not names:
+                panel["title"].SetInput(title + "\n" + (note if not ready else "Source hidden (see the checkbox)"))
+                hide_labels(panel)
+                continue
+            low = min(float(min(np.min(data[n]["el"]), np.min(data[n]["terrain"]))) for n in names)
+            high = max(float(max(np.max(data[n]["el"]), np.max(data[n]["terrain"]))) for n in names)
+            padding = max((high - low) * 0.08, 0.01)
+            low, high = low - padding, high + padding
+            xs = x0 + (x1 - x0) * seconds / span
+            for name in names:
+                ys = y0 + (y1 - y0) * (data[name]["el"] - low) / (high - low)
+                ts = y0 + (y1 - y0) * (data[name]["terrain"] - low) / (high - low)
+                self.panel_lines[name].GetMapper().SetInputData(
+                    self.overlay_lines_data([np.column_stack((xs, ys))]))
+                self.panel_terrain[name].GetMapper().SetInputData(
+                    self.overlay_lines_data([np.column_stack((xs, ts))]))
+            panel["title"].SetInput(f"{title}\nColour: {key} centre   Cyan: terrain horizon at the {key}'s bearing\n"
+                                    f"Scale {low:+.1f} to {high:+.1f} deg")
+            for fraction, label in zip(np.linspace(0, 1, 5), panel["xlabels"]):
+                label.SetInput(f"{epochs[0] + timedelta(seconds=float(fraction) * span):%m-%d %H:%M}")
+                label.SetVisibility(True)
+            for label, value in zip(panel["ylabels"], (low, high)):
+                label.SetInput(f"{value:+.1f}")
+                label.SetVisibility(True)
+            x = float(xs[self._time_index])
+            cursor.append([(x, y0), (x, y1)])
+        self.time_cursor.GetMapper().SetInputData(self.overlay_lines_data(cursor))
+
+        panel, (x0, x1, y0, y1) = self.panels["Light"], self._panel_boxes["Light"]
+        title = "Sunlight per day (hours the Sun is visible, per UTC day)"
+        masks = {}
+        for source in SKY_LEGEND:
+            sun = f"Sun {source}"
+            if shown(sun):
+                masks[sun] = np.asarray(data[sun]["visible"], dtype=bool)
+        if not ready or not masks:
+            panel["title"].SetInput(title + "\n" + (note if not ready else "Source hidden (see the checkbox)"))
+            hide_labels(panel)
+            return
+        days, hours, average = daily_light_hours(epochs, masks)
+        count = len(days)
+        fractions = np.linspace(0.0, 1.0, count) if count > 1 else np.array([0.5])
+        xs = x0 + (x1 - x0) * fractions
+        for name, values in hours.items():
+            points = np.column_stack((xs, y0 + (y1 - y0) * values / 24.0))
+            self.light_lines[name].GetMapper().SetInputData(self.overlay_lines_data([points]))
+            self.light_points[name].GetMapper().SetInputData(self.overlay_point_data(points))
+        panel["title"].SetInput(
+            title + "\nAverage per day: " + "   ".join(f"{name} {value:.1f} h" for name, value in average.items())
+            + "\nSun counted while at least partly above the terrain horizon and not eclipsed by Earth; partial days scaled to 24 h")
+        for fraction, label in zip(np.linspace(0, 1, 5), panel["xlabels"]):
+            if count > 1:
+                label.SetInput(f"{days[int(round(float(fraction) * (count - 1)))]:%Y-%m-%d}")
+                label.SetVisibility(True)
+            else:
+                label.SetInput(f"{days[0]:%Y-%m-%d}")
+                label.SetVisibility(bool(abs(fraction - 0.5) < 1e-9))
+        for label, text in zip(panel["ylabels"], ("0 h", "24 h")):
+            label.SetInput(text)
+            label.SetVisibility(True)
+
     def close_graph(self):
         self._graph_expanded = False
+        self._scroll = 0.0
         self._now_mode = True
         self._sky_generation += 1  # discard any response still in flight
         self._sky_data = None
@@ -966,7 +1191,7 @@ class MoonWindow:
         self.profile_title.SetInput(
             f"360-degree horizon: selected observer\n"
             f"Elevation scale {self._profile_low:+.2f} to {self._profile_high:+.2f} deg"
-            + ("".join("\n" + SKY_LEGEND[source] for source in ("Skyfield",) if self._shown_sources[source])
+            + ("".join("\n" + SKY_LEGEND[source] for source in SKY_METHODS[self._sky_method] if self._shown_sources[source])
                if self._graph_expanded else ""))
         for name in SKY_COLORS:
             body = self._sky_data.get(name) if self._sky_data is not None and self._graph_expanded and self._shown_sources[name.rsplit(" ", 1)[-1]] else None
@@ -998,6 +1223,7 @@ class MoonWindow:
             self.sky_markers[name].GetMapper().SetInputData(self.overlay_point_data(marker))
             self.sky_labels[name].SetVisibility(bool(marker))
         self.update_time_caption()
+        self.update_panels()
 
     def profile_y(self, elevation):
         _, _, y0, y1 = self._plot_box
@@ -1047,7 +1273,7 @@ class MoonWindow:
             return
         request = (self._sky_generation, self.lon, self.lat,
                    (float(sample_dem_bilinear(self.lat, self.lon)) + 2.0) / 1000.0,
-                   list(self._epochs), self.horizon_angles.copy())
+                   list(self._epochs), self.horizon_angles.copy(), SKY_METHODS[self._sky_method])
         # Coalesce fast clicks: keep only the newest waiting location/interval.
         try:
             self._sky_jobs.get_nowait()
@@ -1057,6 +1283,45 @@ class MoonWindow:
         if self._sky_thread is None:
             self._sky_thread = threading.Thread(target=self.sky_worker, daemon=True)
             self._sky_thread.start()
+
+    @staticmethod
+    def fetch_jpl(lon, lat, altitude, epochs):
+        """JPL Horizons through get_angle.py (azimuth and elevation only)."""
+        try:
+            from get_angle import get_angle
+        except ImportError as error:
+            raise RuntimeError(f"Install astroquery and keep get_angle.py beside moon.py: {error}") from error
+        text = lambda moment: f"{moment:%Y-%m-%d %H:%M:%S}"
+        # Split into evenly spaced runs: get_angle takes start, stop and step.
+        runs, run = [], [epochs[0]]
+        for epoch in epochs[1:]:
+            if len(run) >= 2 and epoch - run[-1] != run[1] - run[0]:
+                runs.append(run)
+                run = [epoch]
+            else:
+                run.append(epoch)
+        runs.append(run)
+        result = {}
+        for name, body, radius in (("Sun", 10, SUN_RADIUS_DEG), ("Earth", "Earth", EARTH_RADIUS_DEG)):
+            az, el = [], []
+            for run in runs:
+                if len(run) == 1:
+                    table = get_angle(lon, lat, altitude, text(run[0]), text(run[0] + timedelta(minutes=1)), "1m", body)
+                else:
+                    seconds = int(round((run[1] - run[0]).total_seconds()))
+                    step = (f"{seconds // 86400}d" if seconds % 86400 == 0 else f"{seconds // 3600}h" if seconds % 3600 == 0
+                            else f"{seconds // 60}m" if seconds % 60 == 0 else f"{seconds}s")
+                    table = get_angle(lon, lat, altitude, text(run[0]), text(run[-1]), step, body)
+                values = (np.asarray(table["AZ"], dtype=float)[:len(run)], np.asarray(table["EL"], dtype=float)[:len(run)])
+                if any(len(v) != len(run) for v in values):
+                    raise RuntimeError(f"JPL returned an incomplete {name} time series.")
+                az.extend(values[0].tolist())
+                el.extend(values[1].tolist())
+            az, el = np.asarray(az), np.asarray(el)
+            if not (np.isfinite(az).all() and np.isfinite(el).all()):
+                raise RuntimeError(f"JPL returned unavailable {name} coordinates.")
+            result[name] = {"az": az % 360.0, "el": el, "radius": np.full(len(az), radius)}
+        return result
 
     @staticmethod
     def fetch_skyfield(lon, lat, altitude, epochs):
@@ -1087,9 +1352,11 @@ class MoonWindow:
                 request = self._sky_jobs.get(timeout=0.2)
             except queue.Empty:
                 continue
-            generation, lon, lat, altitude, epochs, horizon = request
+            generation, lon, lat, altitude, epochs, horizon, methods = request
             data, errors = {}, []
-            for source, fetch in (("Skyfield", self._ephemeris_fetcher),):
+            fetchers = {"JPL": self.fetch_jpl, "Skyfield": self.fetch_skyfield}
+            for source in methods:
+                fetch = self._ephemeris_fetcher or fetchers[source]
                 try:
                     classified = classify_sky(fetch(lon, lat, altitude, epochs), horizon)
                     data.update({f"{body} {source}": values for body, values in classified.items()})
@@ -1118,12 +1385,16 @@ class MoonWindow:
             self.update_stats()
             self.window.Render()
 
-    def set_time_interval(self, start, stop, step, unit="minutes"):
+    def set_time_interval(self, start, stop, step, unit="minutes", method=None):
         if unit not in TIME_UNITS:
             raise ValueError("Choose a valid time unit.")
+        method = self._sky_method if method is None else method
+        if method not in SKY_METHODS:
+            raise ValueError("Choose Skyfield or JPL Horizons.")
         epochs = time_samples(start, stop, float(step) * TIME_UNITS[unit])
-        self._saved_interval = (parse_utc(start), parse_utc(stop), float(step), unit)
-        save_interval(start, stop, step, unit)
+        self._sky_method = method
+        self._saved_interval = (parse_utc(start), parse_utc(stop), float(step), unit, method)
+        save_interval(start, stop, step, unit, method)
         self._graph_expanded = True
         self.apply_layout()
         self._now_mode = False
@@ -1215,12 +1486,12 @@ class MoonWindow:
             root = self.get_native_root()
             self.coordinate_editing = True
             if self._saved_interval is not None:
-                start, stop, step, unit = self._saved_interval
+                start, stop, step, unit, _ = self._saved_interval
             else:
                 start = utc_now()
                 stop = start + timedelta(days=1)
                 step, unit = 60, "minutes"
-            dialog = TimeIntervalDialog(root, start, stop, step, unit, self.set_time_interval)
+            dialog = TimeIntervalDialog(root, start, stop, step, unit, self.set_time_interval, self._sky_method)
             root.wait_window(dialog.window)
         except tk.TclError as error:
             print(f"Could not open time interval editor: {error}", file=sys.stderr)
@@ -1325,6 +1596,7 @@ class MoonWindow:
             actions = {"time": self.begin_time_entry, "now": self.set_now, "close": self.close_graph,
                        "previous": lambda: self.step_time(-1), "next": lambda: self.step_time(1),
                        "Skyfield": lambda: self.toggle_source("Skyfield"),
+                       "JPL": lambda: self.toggle_source("JPL"),
                        "legend": self.toggle_legend}
             for name, (left, bottom, right, top) in self._controls.items():
                 if left <= nx <= right and bottom <= ny <= top:
