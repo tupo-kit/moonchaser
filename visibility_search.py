@@ -62,6 +62,44 @@ def visibility_percent(epochs, mask):
     return float(100 * np.dot(durations, (values[:-1] + values[1:]) * 0.5) / durations.sum())
 
 
+def optimistic_horizon_floor(observer_elevation_m, min_terrain_m, max_dist_km=250.0):
+    """A conservative lower bound on every computed terrain-horizon angle.
+
+    The real horizon includes a terrain sample at max_dist_km in every
+    direction. Replacing its height with the minimum of the entire DEM (plus
+    a small margin) cannot raise that sample's angle. This accounts for lunar
+    curvature and an observer above the terrain; zero degrees would not be a
+    safe bound for high locations or nearby valleys.
+    """
+    theta = max_dist_km * 1000.0 / terrain.MOON_RADIUS_M
+    ground_radius = terrain.MOON_RADIUS_M + min_terrain_m - 1.0
+    observer_radius = terrain.MOON_RADIUS_M + observer_elevation_m + 2.0
+    angle = np.degrees(np.arctan2(ground_radius * np.cos(theta) - observer_radius,
+                                  ground_radius * np.sin(theta)))
+    return float(angle) - 1e-6
+
+
+def can_meet_thresholds_without_horizon(epochs, positions, floor_angle, min_sun, min_earth):
+    """Reject only when even an optimistic disk/horizon cannot meet a limit.
+
+    The whole disk is allowed above the global lower-bound horizon. Sun/Earth
+    mutual eclipses are ignored here, so this can only overestimate visibility
+    compared with the detailed sampled terrain and eclipse check.
+    """
+    possible_to_pass = True
+    for body, threshold in (("Sun", min_sun), ("Earth", min_earth)):
+        elevation = np.asarray(positions[body]["el"], dtype=float)
+        radius = np.asarray(positions[body]["radius"], dtype=float)
+        if elevation.shape != (len(epochs),) or radius.shape != (len(epochs),):
+            raise ValueError(f"{body} ephemeris length does not match the time samples.")
+        if not np.isfinite(elevation).all() or not np.isfinite(radius).all() or np.any(radius < 0):
+            raise ValueError(f"{body} ephemeris contains invalid values.")
+        possible = elevation + radius >= floor_angle
+        if visibility_percent(epochs, possible) + 1e-9 < threshold:
+            possible_to_pass = False
+    return possible_to_pass
+
+
 def search(points, epochs, min_sun, min_earth, fetch, cancel=None, progress=None):
     """Return passing sites; stop between sites if cancel is set.
 
@@ -73,21 +111,35 @@ def search(points, epochs, min_sun, min_earth, fetch, cancel=None, progress=None
         raise ValueError('Visibility thresholds must be between 0 and 100 percent.')
     if len(epochs) < 2 or epochs[-1] <= epochs[0]:
         raise ValueError('End time must be later than start time.')
+    if terrain.dem_km is None:
+        raise RuntimeError('The Moon elevation map has not been loaded.')
+    min_terrain_m = float(np.min(terrain.dem_km)) * 1000.0
+    if not np.isfinite(min_terrain_m):
+        raise ValueError('The elevation map contains invalid values.')
     results = []
     start = time.monotonic()
     completed = 0
+    filtered = 0
     for index, (lat, lon) in enumerate(points):
         if cancel is not None and cancel.is_set():
             break
         if progress:
             elapsed = time.monotonic() - start
-            progress(index, len(points), len(results), elapsed, lat, lon)
+            progress(index, len(points), len(results), elapsed, lat, lon, filtered)
         try:
-            horizon = terrain.compute_horizon_360(lat, lon)[0]
+            elevation_m = float(terrain.sample_dem_bilinear(lat, lon))
+            altitude = (elevation_m + 2.0) / 1000.0
+            positions = fetch(lon, lat, altitude, epochs)
             if cancel is not None and cancel.is_set():
                 break
-            altitude = (float(terrain.sample_dem_bilinear(lat, lon)) + 2.0) / 1000.0
-            positions = fetch(lon, lat, altitude, epochs)
+            floor_angle = optimistic_horizon_floor(elevation_m, min_terrain_m)
+            possible = can_meet_thresholds_without_horizon(
+                epochs, positions, floor_angle, min_sun, min_earth)
+            if not possible:
+                completed += 1
+                filtered += 1
+                continue
+            horizon = terrain.compute_horizon_360(lat, lon)[0]
             if cancel is not None and cancel.is_set():
                 break
             classified = sky.classify_sky(positions, horizon)
@@ -100,14 +152,14 @@ def search(points, epochs, min_sun, min_earth, fetch, cancel=None, progress=None
             results.append({'lat': lat, 'lon': lon, 'sun_percent': sun, 'earth_percent': earth})
     if progress:
         progress(completed,
-                 len(points), len(results), time.monotonic() - start, None, None)
+                 len(points), len(results), time.monotonic() - start, None, None, filtered)
     return sorted(results, key=lambda p: (min(p['sun_percent'] - min_sun, p['earth_percent'] - min_earth),
                                            p['sun_percent'] + p['earth_percent']), reverse=True)
 
 
 def _search_worker(messages, cancel, points, epochs, sun, earth, fetch):
-    def progress(done, total, matches, elapsed, lat, lon):
-        messages.put(('progress', (done, total, matches, elapsed, lat, lon)))
+    def progress(done, total, matches, elapsed, lat, lon, filtered):
+        messages.put(('progress', (done, total, matches, elapsed, lat, lon, filtered)))
     try:
         results = search(points, epochs, sun, earth, fetch, cancel, progress)
         messages.put(('done', (results, cancel.is_set())))
@@ -159,7 +211,7 @@ class SearchDialog:
             entry.grid(row=row, column=col * 2 + 1, sticky='ew', padx=(0, 12), pady=3)
             self.fields.append(entry)
         ttk.Label(frame, text='Skyfield; percentages include partial visibility and Earth blocking the Sun.\n'
-                              'Coarse samples are approximate; one lunar day is about 29.53 Earth days.',
+                              'Fast mathematical filter, then terrain checks. One lunar day is about 29.53 Earth days.',
                   wraplength=720).pack(anchor='w', pady=(8, 4))
         controls = ttk.Frame(frame)
         controls.pack(fill='x')
@@ -250,11 +302,11 @@ class SearchDialog:
             while True:
                 kind, value = self.messages.get_nowait()
                 if kind == 'progress':
-                    done, total, matches, elapsed, lat, lon = value
+                    done, total, matches, elapsed, lat, lon, filtered = value
                     self.progress.configure(value=done)
                     eta = f' | estimated {elapsed / done * (total - done) / 60:.1f} min left' if done else ''
                     where = f' | {lat:+.2f}, {lon:+.2f}' if lat is not None else ''
-                    self.status.configure(text=f'{done:,}/{total:,} points | {matches:,} matches | {elapsed / 60:.1f} min elapsed{eta}{where}')
+                    self.status.configure(text=f'{done:,}/{total:,} points | {matches:,} matches | {filtered:,} filtered | {elapsed / 60:.1f} min elapsed{eta}{where}')
                 elif kind == 'done':
                     self.results, cancelled = value
                     self.finished = True
