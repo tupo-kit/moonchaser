@@ -8,6 +8,7 @@ import json
 import math
 
 import numpy as np
+import terrain
 
 MAX_POINTS = 12
 POINT_COLORS = (
@@ -210,19 +211,20 @@ def build_tables(points, stats):
     for index, ((lat, lon), s) in enumerate(zip(points, stats)):
         name = f"P{index + 1}"
         place = [f"{lat:+.3f}", f"{lon:+.3f}"]
+        slope = f"{terrain.compute_slope_deg(lat, lon):.2f}"
         if s is None:
-            rows_a.append([name, *place, na, na, na, na])
+            rows_a.append([name, *place, slope, na, na, na, na])
             rows_b.append([name, *[na] * 8])
             continue
         sun, earth = s["Sun"], s["Earth"]
         period = format_duration(sun["mean_period_s"]) + ("*" if sun["period_partial"] else "")
-        rows_a.append([name, *place, f"{100.0 * sun['fraction']:.2f}",
+        rows_a.append([name, *place, slope, f"{100.0 * sun['fraction']:.2f}",
                        format_duration(sun["per_lunar_day_s"]), period, f"{100.0 * earth['fraction']:.2f}"])
         rows_b.append([name, _number(sun["az"], 0, ".2f"), _number(sun["az"], 1, ".2f"),
                        _number(sun["el"], 0, "+.2f"), _number(sun["el"], 1, ".2f"),
                        _number(earth["az"], 0, ".2f"), _number(earth["az"], 1, ".2f"),
                        _number(earth["el"], 0, "+.2f"), _number(earth["el"], 1, ".2f")])
-    columns_a = [("Point", ""), ("Lat", "deg"), ("Lon", "deg"), ("Sun above", "horizon %"),
+    columns_a = [("Point", ""), ("Lat", "deg"), ("Lon", "deg"), ("Slope", "deg"), ("Sun above", "horizon %"),
                  ("Sun above/", "lunar day"), ("Avg sunlit", "period"), ("Earth above", "horizon %")]
     columns_b = [("Point", ""), ("Sun AZ", "avg deg"), ("Sun AZ", "SD deg"), ("Sun EL", "avg deg"),
                  ("Sun EL", "SD deg"), ("Earth AZ", "avg deg"), ("Earth AZ", "SD deg"),

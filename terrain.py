@@ -297,14 +297,69 @@ def terrain_panorama_rgba(samples, low, high, rows=256):
     return pixels
 
 
+def _destination(lat, lon, bearing, distance_m):
+    lat, lon, bearing = np.radians(lat), np.radians(lon), np.asarray(bearing)
+    delta = np.asarray(distance_m) / MOON_RADIUS_M
+    target_lat = np.arcsin(np.clip(np.sin(lat) * np.cos(delta) + np.cos(lat) * np.sin(delta) * np.cos(bearing), -1, 1))
+    target_lon = lon + np.arctan2(np.sin(bearing) * np.sin(delta) * np.cos(lat),
+                                   np.cos(delta) - np.sin(lat) * np.sin(target_lat))
+    return np.degrees(target_lat), np.degrees(target_lon)
+
+
+def _compute_slope_deg_at(lat, lon):
+    """Local DEM slope at approximately one north/south pixel scale, including poles."""
+    step_m = np.pi * MOON_RADIUS_M / H
+    heights = [sample_dem_bilinear(*_destination(lat, lon, bearing, step_m))
+               for bearing in (0, np.pi, np.pi / 2, 3 * np.pi / 2)]
+    north = (heights[0] - heights[1]) / (2 * step_m)
+    east = (heights[2] - heights[3]) / (2 * step_m)
+    return np.degrees(np.arctan(np.hypot(north, east)))
+
+
+def slope_deg_at(lat, lon):
+    """Interpolate the saved slope grid when available, otherwise compute directly."""
+    try:
+        import map_modes
+    except ModuleNotFoundError as error:
+        if error.name != 'map_modes':
+            raise
+        return _compute_slope_deg_at(lat, lon)
+    grid = map_modes.get_cached_slope_grid()
+    if grid is None:
+        return _compute_slope_deg_at(lat, lon)
+    lat = np.asarray(lat, dtype=np.float64)
+    lon = np.asarray(lon, dtype=np.float64)
+    row = np.clip((90.0 - lat) / 180.0 * H - 0.5, 0, H - 1)
+    col = np.mod((lon + 180.0) / 360.0 * W - 0.5, W)
+    r0, c0 = np.floor(row).astype(int), np.floor(col).astype(int)
+    r1, c1 = np.minimum(r0 + 1, H - 1), np.mod(c0 + 1, W)
+    dr, dc = row - r0, col - c0
+    return (grid[r0, c0] * (1 - dr) * (1 - dc) + grid[r0, c1] * (1 - dr) * dc
+            + grid[r1, c0] * dr * (1 - dc) + grid[r1, c1] * dr * dc)
+
+
 def compute_slope_deg(lat, lon):
-    step = 180.0 / H  # one DEM pixel in degrees
-    lat_hi, lat_lo = min(lat + step, 90.0), max(lat - step, -90.0)
-    dy_m = np.radians(lat_hi - lat_lo) * MOON_RADIUS_M
-    dz_dy = (sample_dem_bilinear(lat_hi, lon) - sample_dem_bilinear(lat_lo, lon)) / dy_m
-    dx_m = max(np.radians(2 * 360.0 / W) / 2 * MOON_RADIUS_M * np.cos(np.radians(lat)) * 2, 1.0)
-    dz_dx = (sample_dem_bilinear(lat, lon + 360.0 / W) - sample_dem_bilinear(lat, lon - 360.0 / W)) / dx_m
-    return float(np.degrees(np.arctan(np.hypot(dz_dx, dz_dy))))
+    return float(slope_deg_at(lat, lon))
+
+
+def max_slope_in_radius(lat, lon, radius_km):
+    """Maximum sampled local slope in a disk, on a grid at half DEM pixel spacing."""
+    if not np.isfinite(radius_km) or not 0 <= radius_km <= 20:
+        raise ValueError('Slope radius must be between 0 and 20 km.')
+    step_m = np.pi * MOON_RADIUS_M / H / 2
+    radius_m = radius_km * 1000.0
+    if radius_m == 0:
+        return compute_slope_deg(lat, lon)
+    rings = max(1, int(np.ceil(radius_m / step_m)))
+    distances, bearings = [0.0], [0.0]
+    for distance in np.linspace(radius_m / rings, radius_m, rings):
+        count = max(6, int(np.ceil(2 * np.pi * distance / step_m)))
+        if len(distances) + count > 30000:
+            raise ValueError('Slope radius needs more than 30,000 samples; choose a smaller radius.')
+        distances.extend([distance] * count)
+        bearings.extend(np.linspace(0, 2 * np.pi, count, endpoint=False))
+    latitudes, longitudes = _destination(lat, lon, bearings, distances)
+    return float(np.max(slope_deg_at(latitudes, longitudes)))
 
 
 def parse_coordinates(text):

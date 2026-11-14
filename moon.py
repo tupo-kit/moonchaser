@@ -51,6 +51,7 @@ import terrain
 from compare import (MAX_POINTS, load_points, normalize_point, point_stats, same_point, save_points)
 from visibility_search import SearchDialog, MAX_DISPLAY_RESULTS, cluster_color
 from globe import GlobeMixin
+import map_modes
 from hud import SCROLL_STEP, HudMixin
 from sky import (MAX_TIME_SAMPLES, SKY_METHODS, TIME_UNITS, classify_sky, get_positions, load_interval, parse_utc,
                  preload, save_interval, time_samples, utc_now)
@@ -385,6 +386,56 @@ class PointsDialog:
 class MoonWindow(GlobeMixin, HudMixin):
     """VTK owns the desktop window and mouse interaction; no HTML is involved."""
 
+    def on_render_start(self, obj=None, event=None):
+        # The globe updates caption text and visibility first. Stack the HUD
+        # using measured pixel heights, including a possible two-line warning.
+        super().on_render_start(obj, event)
+        if not hasattr(self, '_map_label'):
+            return
+        settings = self._overlay_settings
+        expanded = self._graph_expanded
+        self._overlay_button.SetVisibility(not expanded)
+        self.help.SetVisibility(not expanded and settings['help'])
+        self.grid_caption.SetVisibility(self.grid_caption.GetVisibility() and settings['grid_caption'])
+        self.points_caption.SetVisibility(self.points_caption.GetVisibility() and settings['points_caption'])
+        self._map_label.SetVisibility(not expanded and settings['map_status'])
+        self.horizon.SetVisibility(not self._terrain_view and settings['horizon_outline'])
+        self.legend_button.SetVisibility(expanded or settings['point_details'])
+        self.stats.SetVisibility(self._legend_expanded and (expanded or settings['point_details']))
+        inset = expanded or settings['horizon_inset']
+        x0, x1, y0, y1 = self._plot_box
+        self._horizon_map_button.SetPosition(x1, y1 + (0.07 if expanded else 0.018))
+        self._horizon_map_button.SetVisibility(inset)
+        for actor in (self.profile_background, self.profile_title, self.profile, self.profile_axes, *self.profile_labels):
+            actor.SetVisibility(inset)
+        self.panorama.SetVisibility(inset and self._panorama_samples is not None)
+        for group in (self.sky_hlines, self.sky_trails_below, self.sky_trails,
+                      self.sky_samples_below, self.sky_samples):
+            for actor in group.values():
+                actor.SetVisibility(inset)
+        for rings in self.sky_markers.values():
+            for actor in rings:
+                actor.SetVisibility(inset)
+        if not inset:
+            for group in (self.sky_labels, self.sky_values):
+                for actor in group.values():
+                    actor.SetVisibility(False)
+        self.update_map_legend()
+        if self._graph_expanded:
+            return
+        height = max(self.window.GetSize()[1], 1)
+        bottom = self.help.GetPosition()[1] * height
+        if self.help.GetVisibility():
+            size = [0.0, 0.0]
+            self.help.GetSize(self.renderer, size)
+            bottom += size[1] + 6
+        for actor in (self.grid_caption, self.points_caption, self._map_label):
+            if actor.GetVisibility():
+                actor.SetPosition(0.025, bottom / height)
+                size = [0.0, 0.0]
+                actor.GetSize(self.renderer, size)
+                bottom += size[1] + 6
+
     def __init__(self, offscreen=False, enable_ephemeris=True, ephemeris_fetcher=None):
         import vtk
 
@@ -427,7 +478,7 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._search_session = None
         self._visibility_dialog = None
         self._tk_pump_active = False
-        self.GLOBE_HELP = self.GLOBE_HELP + "\nS: search visibility   |   I: analyze selected search point"
+        self.GLOBE_HELP = self.GLOBE_HELP + "\nS: search visibility   |   I: analyze selected search point\nM: change map   |   K: hide/show map legend"
         self._points = []              # [(lat, lon), ...] chosen with Shift+click / A / P
         self._compare_active = False   # True: the graph window compares _compare_points
         self._compare_points = []      # snapshot of _points used by the running comparison
@@ -458,11 +509,42 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._coordinate_root = None
         self._coordinate_timer = None
         self._coordinate_pump_observer = None
+        self._overlay_settings = {name: True for name in (
+            'help', 'horizon_inset', 'horizon_outline', 'point_details',
+            'grid_caption', 'points_caption', 'map_status', 'map_legend')}
+        self._overlay_dialog = None
+        self._overlay_vars = {}
 
         # Build the 3D globe first, then the 2D HUD on top (draw order matches the original single-file build).
         self._init_globe()
         self._init_hud()
         self._panorama_texture_rgb = self._color_rgb  # share the original-resolution color pixels
+        self._map_results = queue.Queue()
+        self._map_mode = self._map_wanted = 'Color'
+        self._horizon_mode = self._horizon_wanted = 'Color'
+        self._loaded_maps = {'Color': (self._color_rgb, self._color_texture_data, None)}
+        self._map_busy = None
+        self._map_rgb = self._map_image = None
+        self._map_label = self.make_text(0.025, 0.25, 14)
+        self._map_label.SetInput('Map: Color  |  M: change map')
+        self._horizon_map_button = self.make_text(0.97, 0.27, 14)
+        self._horizon_map_button.GetTextProperty().SetJustificationToRight()
+        self._horizon_map_button.SetInput('[ Horizon: Color > ]')
+        self._overlay_button = self.make_text(0.73, 0.975, 14, top=True)
+        self._overlay_button.SetInput('[ Display / H ]')
+        self._map_legend_open = True
+        self._map_legend_button = self.make_text(0.87, 0.82, 14)
+        self._map_legend_button.SetVisibility(False)
+        self._map_colorbar = vtk.vtkScalarBarActor()
+        self._map_colorbar.SetPosition(0.87, 0.37)
+        self._map_colorbar.SetWidth(0.12)
+        self._map_colorbar.SetHeight(0.42)
+        self._map_colorbar.SetNumberOfLabels(5)
+        self._map_colorbar.SetLabelFormat('%.1f')
+        self._map_colorbar.GetLabelTextProperty().SetColor(1, 1, 1)
+        self._map_colorbar.GetTitleTextProperty().SetColor(1, 1, 1)
+        self._map_colorbar.SetVisibility(False)
+        self.renderer.AddViewProp(self._map_colorbar)
 
         owner = self
 
@@ -598,6 +680,12 @@ class MoonWindow(GlobeMixin, HudMixin):
                     owner.add_current_point()
                 elif key == "p":
                     owner.begin_points_entry()
+                elif key == "m":
+                    owner.cycle_map_mode()
+                elif key == "k":
+                    owner.toggle_map_legend()
+                elif key == "h":
+                    owner.begin_overlay_settings()
                 elif key in ("comma", "less"):
                     owner.step_point(-1)
                 elif key in ("period", "greater"):
@@ -627,6 +715,188 @@ class MoonWindow(GlobeMixin, HudMixin):
         self.reset_camera()
         if self._enable_ephemeris and self._ephemeris_fetcher is None:
             self.start_skyfield_preload()
+
+    def cycle_map_mode(self):
+        if self.coordinate_editing or self._graph_expanded:
+            return
+        modes = ('Color', 'Elevation', 'Slope')
+        self._map_wanted = modes[(modes.index(self._map_wanted) + 1) % len(modes)]
+        self._horizon_wanted = self._map_wanted
+        self._apply_loaded_maps()
+        self._schedule_map_generation()
+        self.window.Render()
+
+    def cycle_horizon_map_mode(self):
+        """Cycle the horizon independently, without changing the globe."""
+        if self.coordinate_editing:
+            return
+        modes = ('Color', 'Elevation', 'Slope')
+        self._horizon_wanted = modes[(modes.index(self._horizon_wanted) + 1) % len(modes)]
+        self._apply_loaded_maps()
+        self._schedule_map_generation()
+        self.window.Render()
+
+    def _apply_loaded_maps(self):
+        if self._map_wanted in self._loaded_maps and self._map_wanted != self._map_mode:
+            rgb, image, legend = self._loaded_maps[self._map_wanted]
+            self._map_rgb, self._map_image = rgb, image
+            self.texture.SetInputData(image)
+            self._map_mode = self._map_wanted
+            self._map_label.SetInput(f'Map: {self._map_mode}  |  M: change map  |  K: legend')
+            self.update_map_legend(legend)
+        if self._horizon_wanted in self._loaded_maps and self._horizon_wanted != self._horizon_mode:
+            rgb, _, _ = self._loaded_maps[self._horizon_wanted]
+            self._panorama_texture_rgb = rgb
+            self._horizon_mode = self._horizon_wanted
+            self.update_panorama_samples(self.lat, self.lon)
+            self.update_profile(self.horizon_angles)
+        if self._horizon_wanted == self._horizon_mode:
+            self._horizon_map_button.SetInput(f'[ Horizon: {self._horizon_mode} > ]')
+        else:
+            self._horizon_map_button.SetInput(f'[ Horizon: {self._horizon_wanted}... ]')
+
+    def _schedule_map_generation(self):
+        if self._map_busy is not None:
+            return
+        for mode in (self._map_wanted, self._horizon_wanted):
+            if mode not in self._loaded_maps:
+                self._start_map_generation(mode)
+                return
+
+    def update_map_legend(self, legend=None):
+        if legend is not None:
+            lookup = self.vtk.vtkLookupTable()
+            lookup.SetNumberOfTableValues(len(legend['colors']))
+            lookup.SetTableRange(legend['low'], legend['high'])
+            lookup.Build()
+            for i, rgb in enumerate(legend['colors']):
+                lookup.SetTableValue(i, *(float(value) / 255 for value in rgb), 1.0)
+            self._map_colorbar.SetLookupTable(lookup)
+            self._map_colorbar.SetTitle(legend['title'])
+            self._map_lookup = lookup
+        visible = (self._map_mode in ('Elevation', 'Slope') and not self._graph_expanded
+                   and self._overlay_settings['map_legend'])
+        self._map_colorbar.SetVisibility(visible and self._map_legend_open)
+        self._map_legend_button.SetVisibility(visible)
+        self._map_legend_button.SetInput('[-] Legend' if self._map_legend_open else '[+] Legend')
+
+    def toggle_map_legend(self):
+        if self._map_mode not in ('Elevation', 'Slope') or self._graph_expanded:
+            return
+        self._map_legend_open = not self._map_legend_open
+        self.update_map_legend()
+        self.window.Render()
+
+    def begin_overlay_settings(self):
+        """Non-modal, individually switchable globe overlays."""
+        if self.coordinate_editing:
+            return
+        import tkinter as tk
+        from tkinter import ttk
+        if self._overlay_dialog is not None:
+            self._overlay_dialog.deiconify()
+            self._overlay_dialog.lift()
+            return
+        try:
+            root = self.get_native_root()
+            dialog = tk.Toplevel(root)
+            self._overlay_dialog = dialog
+            dialog.title('Display options')
+            frame = ttk.Frame(dialog, padding=14)
+            frame.pack(fill='both', expand=True)
+            ttk.Label(frame, text='Show on globe:').pack(anchor='w', pady=(0, 6))
+            labels = (('help', 'Keyboard and mouse help'), ('horizon_inset', 'Horizon graph'),
+                      ('horizon_outline', 'Horizon outline on globe'), ('point_details', 'Point details'),
+                      ('grid_caption', 'Grid information'), ('points_caption', 'Comparison points information'),
+                      ('map_status', 'Map mode information'), ('map_legend', 'Map color legend'))
+            for key, title in labels:
+                variable = tk.BooleanVar(master=dialog, value=self._overlay_settings[key])
+                self._overlay_vars[key] = variable
+                def changed(name=key, var=variable):
+                    self._overlay_settings[name] = bool(var.get())
+                    self.window.Render()
+                ttk.Checkbutton(frame, text=title, variable=variable, command=changed).pack(anchor='w', pady=2)
+            ttk.Label(frame, text='Use H or Display to reopen these options.').pack(anchor='w', pady=(8, 4))
+            ttk.Button(frame, text='Close', command=self.close_overlay_settings).pack(anchor='e')
+            dialog.protocol('WM_DELETE_WINDOW', self.close_overlay_settings)
+            dialog.bind('<Escape>', lambda event: self.close_overlay_settings())
+            dialog.deiconify()
+            dialog.lift()
+            dialog.focus_force()
+        except tk.TclError as error:
+            self._overlay_dialog = None
+            self._overlay_vars.clear()
+            print(f'Could not open display options: {error}', file=sys.stderr)
+
+    def close_overlay_settings(self):
+        dialog, self._overlay_dialog = self._overlay_dialog, None
+        self._overlay_vars.clear()  # Release Tk variables on the main thread.
+        if dialog is not None:
+            dialog.destroy()
+
+    def over_sky_controls(self, x, y):
+        if self._graph_expanded:
+            return True
+        width, height = self.window.GetSize()
+        nx, ny = x / max(width, 1), y / max(height, 1)
+        return ((self._overlay_settings['horizon_inset'] and 0.59 <= nx <= 0.99 and 0.055 <= ny <= 0.35)
+                or (self._overlay_settings['point_details'] and 0.02 <= nx <= 0.30 and 0.95 <= ny <= 0.995))
+
+    def _start_map_generation(self, mode):
+        self._map_busy = mode
+        self._map_label.SetInput(f'Preparing {mode} map...  |  M: change map')
+        self.window.Render()
+        def worker():
+            last = [None]
+            def progress(message):
+                if message != last[0]:
+                    self._map_results.put(('progress', mode, message))
+                    last[0] = message
+            try:
+                rgb, label = map_modes.generate(mode, progress)
+                self._map_results.put(('ready', mode, (rgb, label)))
+            except Exception as error:
+                self._map_results.put(('error', mode, str(error)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def poll_maps(self):
+        from vtk.util.numpy_support import numpy_to_vtk
+        changed = False
+        while True:
+            try:
+                kind, mode, value = self._map_results.get_nowait()
+            except queue.Empty:
+                break
+            if kind == 'progress':
+                if mode in (self._map_wanted, self._horizon_wanted):
+                    self._map_label.SetInput(value + '  |  M: change map')
+                    if self._horizon_wanted == mode:
+                        self._horizon_map_button.SetInput(f'[ Horizon: {value} ]')
+                    changed = True
+                continue
+            self._map_busy = None
+            if kind == 'error':
+                if mode in (self._map_wanted, self._horizon_wanted):
+                    if self._horizon_wanted == mode:
+                        self._horizon_wanted = self._horizon_mode
+                    if self._map_wanted == mode:
+                        self._map_wanted = self._map_mode
+                    self._map_label.SetInput(f'{mode} map failed: {value}')
+                    self._horizon_map_button.SetInput(f'[ Horizon: {self._horizon_mode} > ]')
+                    changed = True
+            else:
+                rgb, legend = value
+                height, width = rgb.shape[:2]
+                pixels = numpy_to_vtk(rgb.reshape(-1, 3), deep=False)
+                image = self.vtk.vtkImageData()
+                image.SetDimensions(width, height, 1)
+                image.GetPointData().SetScalars(pixels)
+                self._loaded_maps[mode] = (rgb, image, legend)
+                self._apply_loaded_maps()
+                changed = True
+            self._schedule_map_generation()
+        if changed:
+            self.window.Render()
 
     def start_skyfield_preload(self):
         with self._preload_lock:
@@ -667,6 +937,7 @@ class MoonWindow(GlobeMixin, HudMixin):
     def close_graph(self):
         was_compare = self._compare_active
         self._graph_expanded = False
+        self.update_map_legend()
         self._scroll = 0.0
         self._now_mode = True
         self._sky_generation += 1  # discard any response still in flight
@@ -786,6 +1057,7 @@ class MoonWindow(GlobeMixin, HudMixin):
             self._sky_results.put((generation, results, "; ".join(errors) or None))
 
     def poll_sky(self, obj=None, event=None):
+        self.poll_maps()
         changed = False
         finished = False
         progress_changed = False
@@ -838,6 +1110,7 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._saved_interval = (parse_utc(start), parse_utc(stop), float(step), unit, method)
         save_interval(start, stop, step, unit, method)
         self._graph_expanded = True
+        self.update_map_legend()
         self._compare_active = True
         self._analysis_single_point = None
         self._compare = None
@@ -916,7 +1189,7 @@ class MoonWindow(GlobeMixin, HudMixin):
                     self.analyze_selected_search_point(render=False, use_points=dialog.add_to_compare)
         self.window.Render()
 
-    def analyze_selected_search_point(self, render=True, use_points=False):
+    def analyze_selected_search_point(self, render=True, use_points=None):
         """Analyze the searched point or selected point set over the search interval."""
         if self._search_selected is None or self._search_parameters is None:
             return
@@ -926,8 +1199,11 @@ class MoonWindow(GlobeMixin, HudMixin):
         epochs = time_samples(start, stop, float(step_hours) * 60)
         self._sky_method = "Skyfield"
         self._graph_expanded = True
+        self.update_map_legend()
         self._scroll = 0.0
         self._compare_active = True
+        if use_points is None:
+            use_points = len(self._points) > 1
         self._analysis_single_point = None if use_points else normalize_point(
             self._search_selected['lat'], self._search_selected['lon'])
         self._compare_index = 0
@@ -1375,6 +1651,21 @@ class MoonWindow(GlobeMixin, HudMixin):
         width, height = self.window.GetSize()
         if self.coordinate_editing:
             return
+        if self._horizon_map_button.GetVisibility():
+            px, py = self._horizon_map_button.GetPosition()
+            size = [0.0, 0.0]
+            self._horizon_map_button.GetSize(self.renderer, size)
+            if px * width - size[0] - 5 <= x <= px * width + 5 and py * height - 5 <= y <= py * height + size[1] + 5:
+                self.cycle_horizon_map_mode()
+                return
+        if not self._graph_expanded and 0.73 <= x / width <= 0.87 and 0.94 <= y / height <= 1.0:
+            self.begin_overlay_settings()
+            return
+        if (not self._graph_expanded and self._map_mode in ('Elevation', 'Slope')
+                and self._overlay_settings['map_legend']
+                and 0.87 <= x / width <= 1.0 and 0.81 <= y / height <= 0.87):
+            self.toggle_map_legend()
+            return
         if self.over_sky_controls(x, y):
             nx, ny = x / width, y / height
             actions = {"now": self.set_now, "close": self.close_graph,
@@ -1430,6 +1721,8 @@ class MoonWindow(GlobeMixin, HudMixin):
                 self._visibility_dialog.on_close = None
                 self._visibility_dialog.close()
                 self._visibility_dialog = None
+            if self._overlay_dialog is not None:
+                self.close_overlay_settings()
             if self._coordinate_root is not None:
                 self._coordinate_root.destroy()
             self.window.Finalize()
