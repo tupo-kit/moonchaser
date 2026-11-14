@@ -1,6 +1,6 @@
 """Moon Horizon: a native desktop viewer, with no browser or web server.
 
-Install: python -m pip install numpy Pillow vtk astroquery skyfield
+Install: python -m pip install numpy Pillow vtk skyfield
 Coordinate editor: requires Tkinter (Linux package: python3-tk).
 Run:     python moon.py
 Texture: python moon.py --texture /path/to/moon_color_8k.jpg
@@ -12,7 +12,7 @@ Click the Moon to select an observer.
 Zoom stops above the terrain. The inset shows all 360 horizon bearings.
 Put moon_color_8k.jpg beside this script to use it automatically.
 Press G to enter latitude, longitude; R to reset; F for fullscreen; Escape to close.
-Sun/Earth positions use JPL Horizons over the internet. Time defaults to UTC now.
+Sun/Earth positions use Skyfield. Time defaults to UTC now.
 Click Edit time interval (or T) to choose a range; this opens a fullscreen horizon + Sun/Earth graph.
 Use Previous/Next to step samples and Close to return to the horizon-only view.
 """
@@ -45,8 +45,8 @@ R_MAX_M = MOON_RADIUS_M
 MAX_TIME_SAMPLES = 1000
 INTERVAL_PATH = os.path.join(os.path.expanduser("~"), ".moon_horizon_interval.json")
 TIME_UNITS = {"seconds": 1/60, "minutes": 1, "hours": 60, "days": 1440}
-SKY_LEGEND = {"JPL": "JPL Sun yellow / Earth blue", "Skyfield": "Skyfield Sun orange / Earth green"}
-SKY_COLORS = {"Sun JPL": (1.0, 0.8, 0.12), "Earth JPL": (0.35, 0.65, 1.0), "Sun Skyfield": (1.0, 0.35, 0.1), "Earth Skyfield": (0.3, 1.0, 0.5)}
+SKY_LEGEND = {"Skyfield": "Skyfield Sun orange / Earth green"}
+SKY_COLORS = {"Sun Skyfield": (1.0, 0.35, 0.1), "Earth Skyfield": (0.3, 1.0, 0.5)}
 
 
 def load_interval():
@@ -104,38 +104,6 @@ def time_samples(start, stop, step_minutes):
     if len(epochs) > MAX_TIME_SAMPLES:
         raise ValueError(f"Use a larger step: at most {MAX_TIME_SAMPLES} samples are allowed.")
     return epochs
-
-
-def query_sky_positions(lon, lat, altitude_km, epochs):
-    """Apparent airless positions at the actual lunar observer, in UTC."""
-    try:
-        from astroquery.jplhorizons import Horizons
-        from astropy.time import Time
-    except ImportError:
-        raise RuntimeError("Install astroquery: python -m pip install astroquery") from None
-    julian_dates = np.atleast_1d(Time(epochs, scale="utc").jd).tolist()
-    location = {"lon": float(lon), "lat": float(lat),
-                "elevation": float(altitude_km), "body": 301}
-    result = {}
-    for name, body_id in (("Sun", 10), ("Earth", 399)):
-        chunks = {"az": [], "el": [], "radius": []}
-        # Keep individual request URLs small even for long intervals.
-        for first in range(0, len(julian_dates), 100):
-            obj = Horizons(id=body_id, id_type=None, location=location,
-                           epochs=julian_dates[first:first + 100])
-            obj.TIMEOUT = 30
-            eph = obj.ephemerides(quantities="4,13", refraction=False)
-            for key, column in (("az", "AZ"), ("el", "EL"), ("radius", "ang_width")):
-                values = np.asarray(np.ma.filled(np.ma.asarray(eph[column], dtype=float), np.nan))
-                if not np.isfinite(values).all():
-                    raise RuntimeError(f"JPL returned unavailable {name} coordinates.")
-                chunks[key].extend(values.tolist())
-        result[name] = {key: np.asarray(values, dtype=float) for key, values in chunks.items()}
-        result[name]["az"] %= 360.0
-        result[name]["radius"] /= 7200.0  # angular diameter in arcsec -> radius in degrees
-        if any(len(values) != len(epochs) for values in result[name].values()):
-            raise RuntimeError(f"JPL returned an incomplete {name} time series.")
-    return result
 
 
 def sky_unit(azimuth, elevation):
@@ -555,7 +523,7 @@ class MoonWindow:
         self.lat, self.lon = -43.31, -11.36
         self.orbit_pivot = np.zeros(3)
         self._enable_ephemeris = enable_ephemeris
-        self._ephemeris_fetcher = ephemeris_fetcher or query_sky_positions
+        self._ephemeris_fetcher = ephemeris_fetcher or self.fetch_skyfield
         self._sky_jobs = queue.Queue(maxsize=1)
         self._sky_results = queue.Queue()
         self._sky_stop = threading.Event()
@@ -565,7 +533,7 @@ class MoonWindow:
         self._sky_data = None
         self._sky_status = "Waiting for Sun / Earth positions"
         self._now_mode = True
-        self._shown_sources = {"JPL": True, "Skyfield": True}
+        self._shown_sources = {"Skyfield": True}
         self._legend_expanded = True
         self._saved_interval = load_interval()
         self._graph_expanded = False  # False: horizon only. True: fullscreen horizon + Sun/Earth graph.
@@ -701,7 +669,7 @@ class MoonWindow:
         for name, actor in self.sky_labels.items():
             actor.GetTextProperty().SetColor(*SKY_COLORS[name])
             actor.SetVisibility(False)
-        self.source_buttons = {source: self.make_text(0.64, 0.7, 15) for source in ("JPL", "Skyfield")}
+        self.source_buttons = {source: self.make_text(0.64, 0.7, 15) for source in ("Skyfield",)}
         self.legend_button = self.make_text(0.025, 0.98, 16, top=True)
         self.time_button = self.make_text(0.61, 0.46, 16)
         self.time_button.SetInput("[ Edit time interval / T ]")
@@ -925,7 +893,7 @@ class MoonWindow:
             self._controls = {"time": (bx, 0.92, 0.83, 0.96), "now": (0.85, 0.92, 0.905, 0.96),
                               "close": (0.91, 0.92, 0.985, 0.96),
                               "previous": (bx, 0.79, bx + 0.13, 0.825), "next": (bx + 0.16, 0.79, bx + 0.28, 0.825),
-                              "JPL": (bx, 0.625, bx + 0.15, 0.66), "Skyfield": (bx + 0.17, 0.625, bx + 0.33, 0.66),
+                              "Skyfield": (bx, 0.625, bx + 0.16, 0.66),
                               "legend": (0.02, 0.95, 0.30, 0.995)}
             positions = {self.time_button: (bx, 0.93), self.now_button: (0.85, 0.93),
                          self.close_button: (0.91, 0.93), self.time_caption: (bx, 0.89),
@@ -943,8 +911,7 @@ class MoonWindow:
             self._bg_points.SetPoint(index, x, y, 0)
         self._bg_points.Modified()
         self.profile_background.GetMapper().GetInput().Modified()
-        self.source_buttons["JPL"].SetPosition(0.64, 0.635)
-        self.source_buttons["Skyfield"].SetPosition(0.81, 0.635)
+        self.source_buttons["Skyfield"].SetPosition(0.64, 0.635)
         self.legend_button.SetInput("[v] Point details" if self._legend_expanded else "[>] Point details")
         self.legend_button.SetVisibility(True)
         self.stats.SetPosition(0.025, 0.93)
@@ -999,7 +966,7 @@ class MoonWindow:
         self.profile_title.SetInput(
             f"360-degree horizon: selected observer\n"
             f"Elevation scale {self._profile_low:+.2f} to {self._profile_high:+.2f} deg"
-            + ("".join("\n" + SKY_LEGEND[source] for source in ("JPL", "Skyfield") if self._shown_sources[source])
+            + ("".join("\n" + SKY_LEGEND[source] for source in ("Skyfield",) if self._shown_sources[source])
                if self._graph_expanded else ""))
         for name in SKY_COLORS:
             body = self._sky_data.get(name) if self._sky_data is not None and self._graph_expanded and self._shown_sources[name.rsplit(" ", 1)[-1]] else None
@@ -1122,7 +1089,7 @@ class MoonWindow:
                 continue
             generation, lon, lat, altitude, epochs, horizon = request
             data, errors = {}, []
-            for source, fetch in (("JPL", self._ephemeris_fetcher), ("Skyfield", self.fetch_skyfield)):
+            for source, fetch in (("Skyfield", self._ephemeris_fetcher),):
                 try:
                     classified = classify_sky(fetch(lon, lat, altitude, epochs), horizon)
                     data.update({f"{body} {source}": values for body, values in classified.items()})
@@ -1357,7 +1324,7 @@ class MoonWindow:
             nx, ny = x / width, y / height
             actions = {"time": self.begin_time_entry, "now": self.set_now, "close": self.close_graph,
                        "previous": lambda: self.step_time(-1), "next": lambda: self.step_time(1),
-                       "JPL": lambda: self.toggle_source("JPL"), "Skyfield": lambda: self.toggle_source("Skyfield"),
+                       "Skyfield": lambda: self.toggle_source("Skyfield"),
                        "legend": self.toggle_legend}
             for name, (left, bottom, right, top) in self._controls.items():
                 if left <= nx <= right and bottom <= ny <= top:
