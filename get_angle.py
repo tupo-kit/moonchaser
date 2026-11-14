@@ -12,7 +12,7 @@ def get_angle(lon, lat, alt, t_start, t_stop, t_step, body):
     obj = Horizons(
         id=body, # sun id
         id_type=None,
-        location={"lon": 0.0, "lat": 0.0, "elevation": 0.0, "body": 301},  # lon/lat in deg, altitude in km, 301 - moon id
+        location={"lon": lon, "lat": lat, "elevation": alt, "body": 301},  # lon/lat in deg, altitude in km, 301 - moon id
         epochs={"start": t_start, "stop": t_stop, "step": f"{t_step}"},
     )
     eph = obj.ephemerides(quantities="4", refraction=False) #quantitis = "4" outputs azimuth and elevation in deg.

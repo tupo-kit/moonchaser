@@ -45,7 +45,7 @@ RELIEF_EXAGGERATION = 3.0
 dem_km = None
 H = W = 0
 R_MAX_M = MOON_RADIUS_M
-MAX_TIME_SAMPLES = 100_000
+MAX_TIME_SAMPLES = 10_000
 INTERVAL_PATH = os.path.join(os.path.expanduser("~"), ".moon_horizon_interval.json")
 TIME_UNITS = {"seconds": 1/60, "minutes": 1, "hours": 60, "days": 1440}
 SKY_METHODS = {"Skyfield": ("Skyfield",), "JPL Horizons": ("JPL",)}
