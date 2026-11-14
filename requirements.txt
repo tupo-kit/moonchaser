@@ -1,0 +1,6 @@
+astropy==8.0.2
+astroquery==0.4.11
+numpy==2.5.4
+Pillow==13.0.0
+skyfield==1.55
+vtk==9.7.2
