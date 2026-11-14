@@ -31,9 +31,11 @@ Files (keep them in one folder; run moon.py):
   hud.py      HudMixin: 2D overlay HUD, horizon inset, Sun/Earth graphs, slider, scroll bar.
   globe.py    GlobeMixin: 3D globe, camera/navigation, picking, grid, pole marks, terrain view.
   compare.py  point comparison without VTK/UI: palette, point-set files, statistics, table text.
+  point_data.py  memory-only store shared by the search window and the comparison (horizon + classified sky per
+              point and interval), so no point is calculated twice.
   visibility_search.py  coarse, terrain-aware search for visibility thresholds.
   moon.py     Tk dialogs, MoonWindow (glue: state, input handling, sky worker thread) and main().
-Dependencies: terrain <- sky <- compare <- hud, globe <- moon. Other files must use `terrain.COLOR_PATH`, not a copy.
+Dependencies: terrain <- sky <- compare <- point_data <- visibility_search, hud, globe <- moon. Other files must use `terrain.COLOR_PATH`, not a copy.
 """
 
 import argparse
@@ -52,6 +54,7 @@ from compare import (MAX_POINTS, load_points, normalize_point, point_stats, same
 from visibility_search import SearchDialog, MAX_DISPLAY_RESULTS, cluster_color
 from globe import GlobeMixin
 import map_modes
+import point_data
 from hud import SCROLL_STEP, HudMixin
 from sky import (MAX_TIME_SAMPLES, SKY_METHODS, TIME_UNITS, classify_sky, get_positions, load_interval, parse_utc,
                  preload, save_interval, time_samples, utc_now)
@@ -538,6 +541,7 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._search_selected = None
         self._search_parameters = None
         self._search_session = None
+        self._point_cache = point_data.CACHE  # shared with the search window: stored sky data is never recomputed
         self._visibility_dialog = None
         self._tk_pump_active = False
         self.GLOBE_HELP = self.GLOBE_HELP + "\nS: search visibility   |   I: analyze selected search point\nM: change map   |   K: hide/show map legend"
@@ -1076,16 +1080,23 @@ class MoonWindow(GlobeMixin, HudMixin):
         """Sun / Earth data of one point for every requested model: (data or None, error text or None)."""
         data, errors = {}, []
         fetchers = {"JPL": self.fetch_jpl, "Skyfield": self.fetch_skyfield}
+        shared = self._ephemeris_fetcher is None  # a test fetcher is never mixed with real stored data
         for source in methods:
             fetch = self._ephemeris_fetcher or fetchers[source]
             try:
-                progress(f"Starting {source} lookup")
-                if self._ephemeris_fetcher is not None:
-                    positions = fetch(lon, lat, altitude, epochs)
+                classified = self._point_cache.get_sky(lat, lon, epochs, source) if shared else None
+                if classified is not None:
+                    progress(f"Using stored {source} data")
                 else:
-                    positions = fetch(lon, lat, altitude, epochs, progress=progress)
-                progress("Checking terrain visibility and eclipses")
-                classified = classify_sky(positions, horizon)
+                    progress(f"Starting {source} lookup")
+                    if self._ephemeris_fetcher is not None:
+                        positions = fetch(lon, lat, altitude, epochs)
+                    else:
+                        positions = fetch(lon, lat, altitude, epochs, progress=progress)
+                    progress("Checking terrain visibility and eclipses")
+                    classified = classify_sky(positions, horizon)
+                    if shared:
+                        self._point_cache.put_sky(lat, lon, epochs, source, classified)
                 data.update({f"{body} {source}": values for body, values in classified.items()})
             except Exception as error:
                 message = str(error).strip().splitlines()
@@ -1106,9 +1117,15 @@ class MoonWindow(GlobeMixin, HudMixin):
                 entry = {"data": None, "horizon": None, "error": None}
                 try:
                     if horizon is None:  # comparison: the terrain horizon of every point is computed here
-                        progress("Computing terrain horizon")
-                        entry["horizon"] = compute_horizon_360(lat, lon)
-                        horizon = entry["horizon"][0]
+                        shared = self._ephemeris_fetcher is None
+                        stored = self._point_cache.get_horizon(lat, lon) if shared else None
+                        if stored is None:
+                            progress("Computing terrain horizon")
+                            stored = compute_horizon_360(lat, lon)
+                            if shared:
+                                self._point_cache.put_horizon(lat, lon, stored)
+                        entry["horizon"] = stored
+                        horizon = stored[0]
                     entry["data"], entry["error"] = self.sky_for_point(
                         lon, lat, altitude, epochs, horizon, methods, progress)
                 except Exception as error:
@@ -1213,7 +1230,8 @@ class MoonWindow(GlobeMixin, HudMixin):
             self._visibility_dialog = SearchDialog(root, self.fetch_skyfield,
                                                     self._search_session, self.finish_visibility_search,
                                                     existing_points=lambda: list(self._points),
-                                                    on_apply=self.apply_visibility_search)
+                                                    on_apply=self.apply_visibility_search,
+                                                    cache=self._point_cache)
         except tk.TclError as error:
             print(f"Could not open visibility search: {error}", file=sys.stderr)
 

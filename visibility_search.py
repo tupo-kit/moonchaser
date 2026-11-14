@@ -5,6 +5,11 @@ trapezoidal integration of sampled visibility (partly visible counts; Earth
 occulting the Sun is included). An optional sampled maximum slope filters sites.
 Minimum and maximum Sun / Earth visibility limit the results; for searches longer than 2 days the
 average Sun visibility per lunar day (and its standard deviation) can be added to each point.
+
+Shared data: every matching point is stored in point_data.CACHE (horizon and classified sky), so the comparison
+page opens without recomputing it. The optional columns of the results table (above-horizon time, azimuth /
+elevation statistics, lunar-day statistics, maximum slope) use exactly the statistics of compare.py; they never
+influence the search itself and are calculated afterwards, in the background, from the stored data.
 """
 import csv
 import colorsys
@@ -14,11 +19,11 @@ import time
 from datetime import timedelta
 
 import numpy as np
+import point_data
 import sky
 import terrain
-from compare import MAX_POINTS, next_sort, normalize_point, same_point
-
-LUNAR_DAY_DAYS = 29.530588861
+from compare import (LUNAR_DAY_DAYS, MAX_POINTS, format_duration, lunar_day_stats, max_slope_cached, next_sort,
+                     normalize_point, same_point, visibility_percent)  # visibility_percent, lunar_day_stats: re-exported
 MAX_GRID_POINTS = 100_000
 MAX_DISPLAY_RESULTS = 500
 LONG_INTERVAL_DAYS = 2.0  # lunar-day statistics are offered above this interval length
@@ -121,47 +126,7 @@ def grid_points(lat_min, lat_max, lon_min, lon_max, spacing):
     return points
 
 
-def visibility_percent(epochs, mask):
-    """Time-weight samples with midpoint crossings; handles a short last step."""
-    if len(epochs) < 2:
-        raise ValueError('Start and end must be different.')
-    values = np.asarray(mask, dtype=float)
-    if values.shape != (len(epochs),):
-        raise ValueError('Visibility result does not match the time samples.')
-    durations = np.array([(b - a).total_seconds() for a, b in zip(epochs[:-1], epochs[1:])])
-    if np.any(durations <= 0):
-        raise ValueError('Times must be in strictly increasing order.')
-    return float(100 * np.dot(durations, (values[:-1] + values[1:]) * 0.5) / durations.sum())
-
-
-def lunar_day_stats(epochs, visible):
-    """(mean %, standard deviation %, number of lunar days) of the Sun visibility per lunar day.
-
-    The interval is cut into consecutive lunar days (LUNAR_DAY_DAYS) from its start and the visibility
-    percentage of each complete lunar day is computed; the mean and the (population) standard deviation
-    are taken over these days. Shorter intervals count as a single day (SD 0).
-    """
-    values = np.asarray(visible, dtype=float)
-    seconds = np.array([(epoch - epochs[0]).total_seconds() for epoch in epochs])
-    if values.shape != seconds.shape or len(seconds) < 2:
-        raise ValueError('Visibility result does not match the time samples.')
-
-    def percent(lo, hi):
-        index = np.nonzero((seconds >= lo) & (seconds <= hi))[0]
-        if len(index) < 2:
-            return None
-        t, v = seconds[index], values[index]
-        span = t[-1] - t[0]
-        if span <= 0:
-            return None
-        return float(100.0 * np.sum((v[:-1] + v[1:]) * 0.5 * np.diff(t)) / span)
-
-    length = LUNAR_DAY_DAYS * 86400.0
-    days = [percent(k * length, (k + 1) * length) for k in range(int(seconds[-1] // length))]
-    days = [d for d in days if d is not None]
-    if not days:
-        days = [percent(0.0, float(seconds[-1])) or 0.0]
-    return float(np.mean(days)), float(np.std(days)), len(days)
+# visibility_percent() and lunar_day_stats() live in compare.py (shared with the comparison tables).
 
 
 def lunar_passes(lunar, limits):
@@ -210,7 +175,8 @@ def can_meet_thresholds_without_horizon(epochs, positions, floor_angle, min_sun,
     return possible_to_pass
 
 
-def search(points, epochs, min_sun, min_earth, fetch, cancel=None, progress=None):
+def search(points, epochs, min_sun, min_earth, fetch, cancel=None, progress=None,
+           cache=None, cache_source=point_data.DEFAULT_SOURCE):
     """Return passing sites; stop between sites if cancel is set.
 
     `fetch(lon, lat, altitude_km, epochs)` returns Sun and Earth Skyfield
@@ -249,10 +215,10 @@ def search(points, epochs, min_sun, min_earth, fetch, cancel=None, progress=None
                 completed += 1
                 filtered += 1
                 continue
-            horizon = terrain.compute_horizon_360(lat, lon)[0]
+            horizon_full = terrain.compute_horizon_360(lat, lon)
             if cancel is not None and cancel.is_set():
                 break
-            classified = sky.classify_sky(positions, horizon)
+            classified = sky.classify_sky(positions, horizon_full[0])
             sun = visibility_percent(epochs, classified['Sun']['visible'])
             earth = visibility_percent(epochs, classified['Earth']['visible'])
         except Exception as error:
@@ -260,6 +226,9 @@ def search(points, epochs, min_sun, min_earth, fetch, cancel=None, progress=None
         completed += 1
         if sun >= min_sun and earth >= min_earth:
             results.append({'lat': lat, 'lon': lon, 'sun_percent': sun, 'earth_percent': earth})
+            if cache is not None:
+                cache.put_horizon(lat, lon, horizon_full)
+                cache.put_sky(lat, lon, epochs, cache_source, classified)
     if progress:
         progress(completed,
                  len(points), len(results), time.monotonic() - start, None, None, filtered)
@@ -444,8 +413,12 @@ def cluster_results(results, wrap_longitude=False, longitude_bounds=None):
 def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
                  screen_horizon=2.0, screen_mode="Pessimistic center", cancel=None, progress=None,
                  use_ranges=True, range_progress=None, range_result=None, max_slope=None, slope_radius_km=1.0,
-                 horizon_result=None, max_sun=100.0, max_earth=100.0, lunar_stats=False, lunar_filter=None):
+                 horizon_result=None, max_sun=100.0, max_earth=100.0, lunar_stats=False, lunar_filter=None,
+                 cache=None, cache_source=point_data.DEFAULT_SOURCE):
     """Return at most one terrain-checked match per cell.
+
+    With a cache (point_data.PointDataCache) a point stored by an earlier search or by the comparison is not
+    fetched, horizon-scanned or classified again, and every matching point is stored for later use.
 
     The center is checked against real terrain first. If it fails, the optional
     pessimistic horizon screen decides whether to try the remaining samples.
@@ -507,7 +480,10 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
                     break
                 if point not in checked:
                     elevation = float(terrain.sample_dem_bilinear(*point))
+                    stored = cache.get_sky(point[0], point[1], epochs, cache_source) if cache is not None else None
+                    # A stored classified sky also holds the Sun / Earth az, el and radius of a plain ephemeris result.
                     pos = (center_positions if point == center and center_positions is not None else
+                           stored if stored is not None else
                            fetch(point[1], point[0], (elevation + terrain.EYE_HEIGHT_M) / 1000.0, epochs))
                     if point == center:
                         center_positions = pos
@@ -516,8 +492,11 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
                     floor = optimistic_horizon_floor(elevation, min_terrain)
                     if ((point == center and screen_mode == 'Pessimistic center') or
                             can_meet_thresholds_without_horizon(epochs, pos, floor, min_sun, min_earth)):
-                        horizon = terrain.compute_horizon_360(*point)[0]
-                        classified = sky.classify_sky(pos, horizon)
+                        if stored is not None:
+                            classified, horizon_full = stored, None
+                        else:
+                            horizon_full = terrain.compute_horizon_360(*point)
+                            classified = sky.classify_sky(pos, horizon_full[0])
                         sun = visibility_percent(epochs, classified["Sun"]["visible"])
                         earth = visibility_percent(epochs, classified["Earth"]["visible"])
                         if min_sun <= sun <= max_sun and min_earth <= earth <= max_earth:
@@ -531,6 +510,9 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
                             else:
                                 checked[point] = ((sun, earth, slope, area_slope, lunar)
                                                   if area_slope is None or area_slope <= max_slope else None)
+                                if checked[point] is not None and cache is not None and stored is None:
+                                    cache.put_horizon(point[0], point[1], horizon_full)
+                                    cache.put_sky(point[0], point[1], epochs, cache_source, classified)
                         else:
                             checked[point] = None
                     else:
@@ -629,7 +611,7 @@ def search_optimistic_sectors(cells, epochs, min_sun, min_earth, fetch, cancel=N
 
 def _search_worker(messages, cancel, cells, epochs, sun, earth, fetch, side, horizon, mode, use_ranges,
                    max_slope=None, slope_radius_km=1.0, use_terrain=True, max_sun=100.0, max_earth=100.0,
-                   lunar_stats=False, lunar_filter=None):
+                   lunar_stats=False, lunar_filter=None, cache=None):
     def progress(done, total, matches, elapsed, lat, lon, filtered):
         messages.put(('progress', (done, total, matches, elapsed, lat, lon, filtered)))
     try:
@@ -644,7 +626,7 @@ def _search_worker(messages, cancel, cells, epochs, sun, earth, fetch, side, hor
         if use_terrain:
             results = search_cells(cells, epochs, sun, earth, fetch, side, horizon, mode, cancel, progress,
                                    use_ranges, range_progress, range_result, max_slope, slope_radius_km, horizon_result,
-                                   max_sun, max_earth, lunar_stats, lunar_filter)
+                                   max_sun, max_earth, lunar_stats, lunar_filter, cache)
         else:
             results = search_optimistic_sectors(cells, epochs, sun, earth, fetch, cancel, progress, horizon_result)
         messages.put(('done', (results, cancel.is_set())))
@@ -652,12 +634,105 @@ def _search_worker(messages, cancel, cells, epochs, sun, earth, fetch, side, hor
         messages.put(('error', str(error)))
 
 
+def _num(form):
+    return lambda value, row: '-' if value is None else format(value, form)
+
+
+def _duration(value, row):
+    return format_duration(value)
+
+
+def _period(partial_key):
+    return lambda value, row: format_duration(value) + ('*' if value is not None and row.get(partial_key) else '')
+
+
+# key, heading, group, width, row key (None: built by populate_results), formatter, CSV name
+COLUMN_SPECS = (
+    ('lat', 'Latitude', 'Position', 90, 'lat', _num('+.3f'), 'latitude_deg'),
+    ('lon', 'Longitude', 'Position', 90, 'lon', _num('+.3f'), 'longitude_deg'),
+    ('sun', 'Sun visible %', 'Visible % of the interval', 110, 'sun_percent', _num('.1f'), 'sun_visible_percent'),
+    ('earth', 'Earth visible %', 'Visible % of the interval', 115, 'earth_percent', _num('.1f'), 'earth_visible_percent'),
+    ('lunar_mean', 'Sun avg %/lunar day', 'Sun per lunar day', 135, 'sun_lunar_mean', _num('.2f'),
+     'sun_avg_percent_per_lunar_day'),
+    ('lunar_sd', 'Sun SD %', 'Sun per lunar day', 80, 'sun_lunar_std', _num('.2f'), 'sun_percent_per_lunar_day_sd'),
+    ('elevation', 'Elevation m', 'Terrain', 95, 'elevation_m', _num('+,.0f'), 'elevation_m'),
+    ('slope', 'Slope deg', 'Terrain', 80, 'slope_deg', _num('.2f'), 'slope_deg'),
+    ('max_slope', 'Max slope deg', 'Terrain', 100, 'max_slope_deg', _num('.2f'), 'max_sampled_slope_deg'),
+    ('sun_center', 'Sun above horizon %', 'Centre above the horizon', 140, 'sun_center_pct', _num('.2f'),
+     'sun_center_above_horizon_percent'),
+    ('earth_center', 'Earth above horizon %', 'Centre above the horizon', 150, 'earth_center_pct', _num('.2f'),
+     'earth_center_above_horizon_percent'),
+    ('sun_per_day', 'Sun above / lunar day', 'Centre above the horizon', 145, 'sun_per_lunar_day_s', _duration,
+     'sun_above_per_lunar_day_s'),
+    ('earth_per_day', 'Earth above / lunar day', 'Centre above the horizon', 155, 'earth_per_lunar_day_s', _duration,
+     'earth_above_per_lunar_day_s'),
+    ('sun_period', 'Avg sunlit period', 'Centre above the horizon', 125, 'sun_mean_period_s',
+     _period('sun_period_partial'), 'sun_mean_sunlit_period_s'),
+    ('earth_period', 'Avg Earth period', 'Centre above the horizon', 125, 'earth_mean_period_s',
+     _period('earth_period_partial'), 'earth_mean_visible_period_s'),
+    ('sun_az', 'Sun AZ avg deg', 'Directions (samples above the horizon)', 110, 'sun_az_mean', _num('.2f'), 'sun_az_avg_deg'),
+    ('sun_az_sd', 'Sun AZ SD deg', 'Directions (samples above the horizon)', 110, 'sun_az_sd', _num('.2f'), 'sun_az_sd_deg'),
+    ('sun_el', 'Sun EL avg deg', 'Directions (samples above the horizon)', 110, 'sun_el_mean', _num('+.2f'), 'sun_el_avg_deg'),
+    ('sun_el_sd', 'Sun EL SD deg', 'Directions (samples above the horizon)', 110, 'sun_el_sd', _num('.2f'), 'sun_el_sd_deg'),
+    ('earth_az', 'Earth AZ avg deg', 'Directions (samples above the horizon)', 115, 'earth_az_mean', _num('.2f'),
+     'earth_az_avg_deg'),
+    ('earth_az_sd', 'Earth AZ SD deg', 'Directions (samples above the horizon)', 115, 'earth_az_sd', _num('.2f'),
+     'earth_az_sd_deg'),
+    ('earth_el', 'Earth EL avg deg', 'Directions (samples above the horizon)', 115, 'earth_el_mean', _num('+.2f'),
+     'earth_el_avg_deg'),
+    ('earth_el_sd', 'Earth EL SD deg', 'Directions (samples above the horizon)', 115, 'earth_el_sd', _num('.2f'),
+     'earth_el_sd_deg'),
+    ('cells', 'Cells', 'Position', 60, None, None, None),
+    ('cell', 'Cell bounds (lat / lon)', 'Position', 250, None, None, None),
+)
+SPEC = {spec[0]: spec for spec in COLUMN_SPECS}
+DEFAULT_COLUMNS = ('lat', 'lon', 'sun', 'earth', 'slope', 'max_slope', 'cells', 'cell')
+# Columns that need the sky statistics of compare.py (calculated in the background from the shared data).
+STATS_KEYS = frozenset(spec[0] for spec in COLUMN_SPECS
+                       if spec[2] in ('Sun per lunar day', 'Centre above the horizon')
+                       or spec[2].startswith('Directions'))
+LUNAR_KEYS = frozenset(('lunar_mean', 'lunar_sd'))
+# Not available for candidate sectors (they are regions, not points).
+SECTOR_HIDDEN = STATS_KEYS | {'elevation', 'max_slope', 'slope'}
+FILL_REFRESH_SECONDS = 1.5
+
+
+def _fill_worker(messages, cancel, generation, rows, epochs, fetch, cache, need_stats, need_slope, radius):
+    """Optional columns: statistics from the shared sky data (or calculated and stored), and maximum slopes."""
+    total = len(rows)
+    try:
+        for done, row in enumerate(rows, start=1):
+            if cancel.is_set():
+                break
+            update = {}
+            if need_stats and not row.get('_stats'):
+                classified = point_data.sky_for(row['lat'], row['lon'], epochs, fetch, cache)
+                update.update(point_data.metrics_from_sky(epochs, classified))
+                update['_stats'] = True
+            if need_slope and row.get('max_slope_deg') is None:
+                update['max_slope_deg'] = max_slope_cached(row['lat'], row['lon'], radius)
+            messages.put(('fill_row', (generation, row, update)))
+            if done % 25 == 0 or done == total:
+                messages.put(('fill_progress', (generation, done, total)))
+        messages.put(('fill_done', (generation, cancel.is_set())))
+    except Exception as error:
+        messages.put(('fill_error', (generation, str(error))))
+
+
 class SearchDialog:
     """Tk-only UI; all horizon and ephemeris work stays in a worker thread."""
-    def __init__(self, parent, fetch, previous=None, on_close=None, existing_points=None, on_apply=None):
+    def __init__(self, parent, fetch, previous=None, on_close=None, existing_points=None, on_apply=None,
+                 cache=None):
         import tkinter as tk
         from tkinter import ttk
         self.tk, self.ttk, self.fetch = tk, ttk, fetch
+        self.cache = cache  # point_data.PointDataCache shared with the comparison (None: no sharing)
+        self._fill_cancel = threading.Event()
+        self._fill_generation = 0
+        self._fill_running = False
+        self._fill_dirty = False
+        self._fill_refreshed = 0.0
+        self._tick = 0
         self.on_close = on_close
         # Called when a button wants the viewer to act (show on globe, add points, analyze, clear).
         # The window stays open; only Close (or the window's own close button) closes it.
@@ -779,6 +854,10 @@ class SearchDialog:
         self.progress.pack(fill='x', pady=(8, 3))
         self.status = ttk.Label(frame, text='Choose criteria and start the search.', wraplength=720)
         self.status.pack(anchor='w')
+        self.fill_label = ttk.Label(frame, text='', wraplength=840)
+        self.fill_label.pack(anchor='w')
+        self.cache_label = ttk.Label(frame, text='', wraplength=840)
+        self.cache_label.pack(anchor='w')
         self.range_label = ttk.Label(frame, text='', wraplength=840)
         self.range_label.pack(anchor='w')
         self.horizon_label = ttk.Label(frame, text='', wraplength=840)
@@ -790,20 +869,21 @@ class SearchDialog:
         self.view_mode.set('Points')
         self.view_mode.pack(side='left', padx=5)
         self.view_mode.bind('<<ComboboxSelected>>', lambda event: self.populate_results('Showing'))
-        columns = ('lat', 'lon', 'sun', 'earth', 'lunar_mean', 'lunar_sd', 'slope', 'max_slope', 'cells', 'cell')
+        columns = tuple(spec[0] for spec in COLUMN_SPECS)
         self._columns = columns
-        self._heading_labels = {'lat': 'Latitude', 'lon': 'Longitude', 'sun': 'Sun visible %',
-                                'earth': 'Earth visible %', 'lunar_mean': 'Sun avg %/lunar day',
-                                'lunar_sd': 'Sun SD %', 'slope': 'Slope deg', 'max_slope': 'Max slope deg',
-                                'cells': 'Cells', 'cell': 'Cell bounds (lat / lon)'}
+        self._heading_labels = {spec[0]: spec[1] for spec in COLUMN_SPECS}
+        self.column_vars = {key: tk.BooleanVar(master=self.window, value=key in DEFAULT_COLUMNS) for key in columns}
         table_frame = ttk.Frame(frame)
         table_frame.pack(fill='both', expand=True, pady=8)
+        self.table_frame = table_frame
         self.table = ttk.Treeview(table_frame, columns=columns, show='headings', height=8, selectmode='extended')
         scrollbar = ttk.Scrollbar(table_frame, orient='vertical', command=self.table.yview)
-        self.table.configure(yscrollcommand=scrollbar.set)
+        h_scrollbar = ttk.Scrollbar(table_frame, orient='horizontal', command=self.table.xview)
+        self.table.configure(yscrollcommand=scrollbar.set, xscrollcommand=h_scrollbar.set)
         scrollbar.pack(side='right', fill='y')
-        for key in columns:
-            self.table.column(key, width=250 if key == 'cell' else (60 if key == 'cells' else 115), anchor='center')
+        h_scrollbar.pack(side='bottom', fill='x')
+        for spec in COLUMN_SPECS:
+            self.table.column(spec[0], width=spec[3], minwidth=spec[3], stretch=False, anchor='center')
         self._refresh_headings()
         self.table.pack(side='left', fill='both', expand=True)
         self.table.bind('<Double-1>', self.view_selected)
@@ -822,7 +902,7 @@ class SearchDialog:
         self.select_all_button.pack(side='left', padx=5)
         self.add_button = ttk.Button(actions, text='Add selected', command=self.add_selected, state='disabled')
         self.add_button.pack(side='left')
-        self.analyze_button = ttk.Button(actions, text='Analyze selected', command=self.analyze_selected, state='disabled')
+        self.analyze_button = ttk.Button(actions, text='Compare selected', command=self.analyze_selected, state='disabled')
         self.analyze_button.pack(side='left', padx=5)
         self.marks_button = ttk.Button(more_actions, text='Show all on globe', command=self.show_all, state='disabled')
         self.marks_button.pack(side='left', padx=5)
@@ -832,6 +912,27 @@ class SearchDialog:
         self.export_button.pack(side='left', padx=5)
         ttk.Button(more_actions, text='Close', command=self.close).pack(side='right')
         ttk.Button(more_actions, text='Clear markers', command=self.clear).pack(side='right', padx=5)
+        # Column choice: a collapsible set of check boxes, in sections, right above the table heading.
+        columns_bar = ttk.Frame(frame)
+        columns_bar.pack(fill='x', before=table_frame)
+        self.columns_toggle = ttk.Button(columns_bar, text='Columns \u25b8', command=self._toggle_column_panel)
+        self.columns_toggle.pack(side='left')
+        ttk.Label(columns_bar, text='  Tick the columns to show. The optional sections are calculated afterwards, '
+                                    'from the data shared with the comparison; they do not change the search.',
+                  wraplength=900).pack(side='left')
+        self.columns_panel = ttk.Frame(frame)
+        self._columns_panel_open = False
+        groups = []
+        for spec in COLUMN_SPECS:
+            if spec[2] not in groups:
+                groups.append(spec[2])
+        for number, group in enumerate(groups):
+            box = ttk.LabelFrame(self.columns_panel, text=group, padding=(6, 2))
+            box.grid(row=number // 3, column=number % 3, sticky='nw', padx=3, pady=2)
+            members = [spec for spec in COLUMN_SPECS if spec[2] == group]
+            for index, spec in enumerate(members):
+                ttk.Checkbutton(box, text=spec[1], variable=self.column_vars[spec[0]],
+                                command=self._columns_changed).grid(row=index % 4, column=index // 4, sticky='w', padx=4)
         self.window.bind('<Escape>', lambda event: self.close())
         if previous is not None:
             self.restore(previous)
@@ -883,20 +984,84 @@ class SearchDialog:
         self.lunar_note.configure(text=note)
 
     def _refresh_headings(self):
-        """Heading texts (with the sort arrow) and the columns that apply to the current results."""
-        parameters = self.last_parameters or ()
+        """Heading texts (with the sort arrow) and the columns that are ticked and apply to the current results."""
         sector = self.is_sector_results()
         labels = dict(self._heading_labels)
         if sector:
             labels['sun'], labels['earth'] = 'Sun optimistic %', 'Earth optimistic %'
-        lunar_avg = len(parameters) > 19 and bool(parameters[19]) and not sector
-        lunar_sd = len(parameters) > 20 and bool(parameters[20]) and not sector
         shown = [key for key in self._columns
-                 if not (key == 'lunar_mean' and not lunar_avg) and not (key == 'lunar_sd' and not lunar_sd)]
+                 if self.column_vars[key].get() and not (sector and key in SECTOR_HIDDEN)] or ['lat']
         self.table.configure(displaycolumns=shown)
         for key in self._columns:
             arrow = (' \u25bc' if self._sort[1] else ' \u25b2') if self._sort and self._sort[0] == key else ''
             self.table.heading(key, text=labels[key] + arrow, command=lambda k=key: self._sort_by(k))
+
+    def _toggle_column_panel(self):
+        self._columns_panel_open = not self._columns_panel_open
+        if self._columns_panel_open:
+            self.columns_panel.pack(fill='x', before=self.table_frame)
+        else:
+            self.columns_panel.pack_forget()
+        self.columns_toggle.configure(text='Columns \u25be' if self._columns_panel_open else 'Columns \u25b8')
+
+    def _columns_changed(self):
+        self._refresh_headings()
+        if self.results:
+            self.populate_results('Showing')
+            self._maybe_fill()
+
+    def _visible_keys(self):
+        return [key for key in self._columns if self.column_vars[key].get()]
+
+    def _fill_plan(self):
+        """(rows that need work, need statistics, need max slope) for the ticked optional columns."""
+        if not self.results or not self.finished or self.is_sector_results() or self.last_parameters is None:
+            return [], False, False
+        keys = set(self._visible_keys())
+        stats_keys = keys & STATS_KEYS
+        need_stats = bool(stats_keys)
+        if need_stats and stats_keys <= LUNAR_KEYS:
+            # Only the lunar-day columns: rows that already have them from the search are complete.
+            rows_stats = [r for r in self.results if not r.get('_stats') and r.get('sun_lunar_mean') is None]
+        else:
+            rows_stats = [r for r in self.results if not r.get('_stats')] if need_stats else []
+        need_slope = 'max_slope' in keys
+        rows_slope = [r for r in self.results if r.get('max_slope_deg') is None] if need_slope else []
+        wanted = {id(r): r for r in rows_stats}
+        wanted.update({id(r): r for r in rows_slope})
+        shown = {id(row) for members in self._display_items for row in members}
+        rows = sorted(wanted.values(), key=lambda r: id(r) not in shown)  # rows on screen first
+        return rows, bool(rows_stats), bool(rows_slope)
+
+    def _maybe_fill(self):
+        """Start the background calculation of the ticked optional columns, if something is missing."""
+        if self._fill_running or self._closed:
+            return
+        rows, need_stats, need_slope = self._fill_plan()
+        if not rows:
+            return
+        start, stop, step_hours = self.last_parameters[:3]
+        try:
+            epochs = sky.time_samples(start, stop, float(step_hours) * 60)
+        except Exception as error:
+            self.fill_label.configure(text=f'Optional columns unavailable: {error}')
+            return
+        radius = self.last_parameters[15] if len(self.last_parameters) > 15 else 1.0
+        self._fill_generation += 1
+        self._fill_cancel = threading.Event()
+        self._fill_running = True
+        self._fill_dirty = False
+        self._fill_refreshed = time.monotonic()
+        self.fill_label.configure(text=f'Calculating optional columns for {len(rows):,} points (from the shared data where stored)...')
+        threading.Thread(target=_fill_worker, daemon=True,
+                         args=(self.messages, self._fill_cancel, self._fill_generation, rows, epochs, self.fetch,
+                               self.cache, need_stats, need_slope, radius)).start()
+
+    def _stop_fill(self):
+        self._fill_cancel.set()
+        self._fill_generation += 1  # messages of the stopped calculation are ignored
+        self._fill_running = False
+        self.fill_label.configure(text='')
 
     def _sort_by(self, key):
         self._sort = next_sort(self._sort, key)
@@ -972,6 +1137,7 @@ class SearchDialog:
         except (ValueError, OverflowError) as error:
             self.status.configure(text=str(error))
             return
+        self._stop_fill()
         self.cancel.clear()
         self._refinement_sectors = None
         self.results = []
@@ -984,6 +1150,10 @@ class SearchDialog:
                                 max_sun, max_earth, lunar_avg, lunar_sd, lunar_filter)
         self.view_mode.configure(values=('Points', 'Clusters') if use_terrain else ('Clusters',))
         self.view_mode.set('Points' if use_terrain else 'Clusters')
+        if lunar_avg:  # the lunar-day values are being calculated: show them (they can be unticked again)
+            self.column_vars['lunar_mean'].set(True)
+        if lunar_sd:
+            self.column_vars['lunar_sd'].set(True)
         self._refresh_headings()
         self.table.delete(*self.table.get_children())
         for button in (self.view_button, self.select_all_button, self.add_button, self.analyze_button, self.marks_button, self.export_button, self.sector_button):
@@ -1002,7 +1172,8 @@ class SearchDialog:
         self.status.configure(text=text)
         self.worker = threading.Thread(target=_search_worker,
             args=(self.messages, self.cancel, cells, epochs, min_sun, min_earth, self.fetch, side, horizon, mode,
-                  range_mode == 'On', max_slope, radius, use_terrain, max_sun, max_earth, lunar_avg, lunar_filter),
+                  range_mode == 'On', max_slope, radius, use_terrain, max_sun, max_earth, lunar_avg, lunar_filter,
+                  self.cache),
             daemon=True)
         self.worker.start()
 
@@ -1010,6 +1181,9 @@ class SearchDialog:
         try:
             while True:
                 kind, value = self.messages.get_nowait()
+                if kind.startswith('fill_'):
+                    self._handle_fill_message(kind, value)
+                    continue
                 if kind == 'phase':
                     self.status.configure(text=value)
                 elif kind == 'optimistic_horizon':
@@ -1038,13 +1212,44 @@ class SearchDialog:
                     self.populate_results('Cancelled' if cancelled else 'Complete')
                     self.start_button.configure(state='normal')
                     self.cancel_button.configure(state='disabled')
+                    self._maybe_fill()
                 else:
                     self.status.configure(text=value)
                     self.start_button.configure(state='normal')
                     self.cancel_button.configure(state='disabled')
         except queue.Empty:
             pass
+        self._tick += 1
+        if self.cache is not None and self._tick % 10 == 1:
+            count, megabytes = self.cache.info()
+            self.cache_label.configure(
+                text=f'Shared data: {count:,} points stored in memory ({megabytes:,.0f} MB); the comparison reuses them.')
         self.timer = self.window.after(100, self.poll)
+
+    def _handle_fill_message(self, kind, value):
+        generation = value[0]
+        if generation != self._fill_generation:
+            return  # belongs to a stopped calculation or an older search
+        if kind == 'fill_row':
+            row, update = value[1], value[2]
+            row.update(update)
+            self._fill_dirty = True
+        elif kind == 'fill_progress':
+            self.fill_label.configure(text=f'Calculating optional columns: {value[1]:,}/{value[2]:,} points')
+            if self._fill_dirty and time.monotonic() - self._fill_refreshed >= FILL_REFRESH_SECONDS:
+                self._fill_dirty, self._fill_refreshed = False, time.monotonic()
+                self.populate_results('Showing')
+        else:  # fill_done / fill_error
+            self._fill_running = False
+            if kind == 'fill_error':
+                self.fill_label.configure(text=f'Optional columns stopped: {value[1]}')
+            else:
+                self.fill_label.configure(text='Optional columns ready.' if not value[1] else '')
+            if self._fill_dirty:
+                self._fill_dirty = False
+                self.populate_results('Showing')
+            if kind == 'fill_done' and not value[1]:
+                self._maybe_fill()  # columns ticked while it was running
 
     def _clusters(self):
         if self.last_parameters:
@@ -1071,10 +1276,13 @@ class SearchDialog:
             'lat': None if sector else row['lat'], 'lon': None if sector else row['lon'],
             'sun': max(m['sun_percent'] for m in members) if sector else row['sun_percent'],
             'earth': max(m['earth_percent'] for m in members) if sector else row['earth_percent'],
-            'lunar_mean': row.get('sun_lunar_mean'), 'lunar_sd': row.get('sun_lunar_std'),
-            'slope': row.get('slope_deg'), 'max_slope': row.get('max_slope_deg'),
             'cells': len(members) if clustered else 1,
         }
+        for spec in COLUMN_SPECS:  # every other column is a plain value of the row (None when not calculated)
+            if spec[0] not in values and spec[4] is not None:
+                values[spec[0]] = None if sector else row.get(spec[4])
+        if not sector and values['elevation'] is None and self.column_vars['elevation'].get():
+            row['elevation_m'] = values['elevation'] = float(terrain.sample_dem_bilinear(row['lat'], row['lon']))
         lat_min = min(x.get('cell_lat_min', x['lat']) for x in members)
         lon_min = min(x.get('cell_lon_min', x['lon']) for x in members)
         sort = dict(values, cell=(lat_min, lon_min))
@@ -1125,11 +1333,10 @@ class SearchDialog:
                         f"{row.get('cell_lon_min', row['lon']):g}..{row.get('cell_lon_max', row['lon']):g}")
             tag = f'cluster_{cluster_index}'
             self.table.tag_configure(tag, foreground=cluster_text_color(cluster_index))
-            self.table.insert('', 'end', iid=str(index), tags=(tag,), values=(
-                number(values['lat'], '+.3f'), number(values['lon'], '+.3f'),
-                f"{values['sun']:.1f}", f"{values['earth']:.1f}",
-                number(values['lunar_mean'], '.2f'), number(values['lunar_sd'], '.2f'),
-                number(values['slope'], '.2f'), number(values['max_slope'], '.2f'), values['cells'], area))
+            texts = {'cells': values['cells'], 'cell': area, 'sun': f"{values['sun']:.1f}",
+                     'earth': f"{values['earth']:.1f}"}
+            self.table.insert('', 'end', iid=str(index), tags=(tag,), values=tuple(
+                texts[key] if key in texts else SPEC[key][5](values[key], row) for key in self._columns))
             if id(row) in previous:
                 reselect.append(str(index))
         if reselect:
@@ -1181,9 +1388,14 @@ class SearchDialog:
             self._set(name, '' if value is None else value)
         self.lunar_avg.set(len(parameters) > 19 and bool(parameters[19]))
         self.lunar_sd.set(len(parameters) > 20 and bool(parameters[20]))
+        if self.lunar_avg.get():
+            self.column_vars['lunar_mean'].set(True)
+        if self.lunar_sd.get():
+            self.column_vars['lunar_sd'].set(True)
         self._update_lunar_state()
         self._refresh_headings()
         self.populate_results('Previous partial search' if self.was_cancelled else 'Previous search')
+        self._maybe_fill()
 
     def view_selected(self, event=None):
         if self.is_sector_results():
@@ -1325,33 +1537,48 @@ class SearchDialog:
                                          self.was_cancelled))
                     self.status.configure(text=f'Saved {len(self._clusters()):,} candidate clusters to {path}')
                     return
-                writer.writerow(('result_kind', 'latitude_deg', 'longitude_deg', 'sun_percent_or_sector_upper_bound', 'earth_percent_or_sector_upper_bound',
-                                 'slope_deg', 'max_sampled_slope_deg', 'slope_limit_deg', 'slope_radius_km',
-                                 'start_utc', 'end_utc', 'step_hours', 'min_sun_percent', 'min_earth_percent',
+                # The visible table columns first (raw numbers), then the settings of this search.
+                exported = [SPEC[key] for key in self._visible_keys() if key not in ('cells', 'cell')]
+                with_cell = self.column_vars['cell'].get()
+                parameters = self.last_parameters
+                start, stop, step, sun, earth, spacing, lat_min, lat_max, lon_min, lon_max = parameters[:10]
+                side, horizon, mode = parameters[10:13] if len(parameters) >= 13 else (3, 2.0, "Pessimistic center")
+                max_sun = parameters[17] if len(parameters) > 17 else 100
+                max_earth = parameters[18] if len(parameters) > 18 else 100
+                lunar_limits = parameters[21] if len(parameters) > 21 and parameters[21] else (None,) * 4
+                writer.writerow(('result_kind', *[spec[6] for spec in exported],
+                                 *(('cell_latitude_min', 'cell_latitude_max', 'cell_longitude_min',
+                                    'cell_longitude_max') if with_cell else ()),
+                                 'slope_limit_deg', 'slope_radius_km', 'start_utc', 'end_utc', 'step_hours',
+                                 'min_sun_percent', 'min_earth_percent', 'max_sun_percent', 'max_earth_percent',
                                  'grid_spacing_deg', 'latitude_min', 'latitude_max', 'longitude_min', 'longitude_max',
-                                 'partial_search', 'cell_latitude_min', 'cell_latitude_max', 'cell_longitude_min', 'cell_longitude_max',
-                                 'samples_per_side', 'screen_horizon_deg', 'screen_mode', 'optimistic_range_filter',
-                                 'max_sun_percent', 'max_earth_percent', 'sun_avg_percent_per_lunar_day',
-                                 'sun_percent_per_lunar_day_sd', 'complete_lunar_days',
+                                 'partial_search', 'samples_per_side', 'screen_horizon_deg', 'screen_mode',
+                                 'optimistic_range_filter', 'complete_lunar_days',
                                  'min_avg_sun_per_lunar_day', 'max_avg_sun_per_lunar_day',
                                  'min_sd_sun_per_lunar_day', 'max_sd_sun_per_lunar_day'))
-                start, stop, step, sun, earth, spacing, lat_min, lat_max, lon_min, lon_max = self.last_parameters[:10]
-                side, horizon, mode = self.last_parameters[10:13] if len(self.last_parameters) >= 13 else (3, 2.0, "Pessimistic center")
-                max_sun = self.last_parameters[17] if len(self.last_parameters) > 17 else 100
-                max_earth = self.last_parameters[18] if len(self.last_parameters) > 18 else 100
-                lunar_limits = (self.last_parameters[21] if len(self.last_parameters) > 21 and self.last_parameters[21]
-                                else (None,) * 4)
+                pending = 0
                 for row in self.results:
-                    writer.writerow((row.get('kind', 'point'), row['lat'], row['lon'], row['sun_percent'], row['earth_percent'],
-                                     row.get('slope_deg'), row.get('max_slope_deg'),
-                                     self.last_parameters[14] if len(self.last_parameters) > 14 else None,
-                                     self.last_parameters[15] if len(self.last_parameters) > 15 else None,
-                                     start.isoformat(), stop.isoformat(), step, sun, earth, spacing,
-                                     lat_min, lat_max, lon_min, lon_max, self.was_cancelled,
-                                     row.get('cell_lat_min'), row.get('cell_lat_max'), row.get('cell_lon_min'), row.get('cell_lon_max'),
-                                     side, horizon, mode, self.last_parameters[13] if len(self.last_parameters) > 13 else 'Off',
-                                     max_sun, max_earth, row.get('sun_lunar_mean'), row.get('sun_lunar_std'),
+                    values = []
+                    for spec in exported:
+                        value = row.get(spec[4])
+                        if value is None and spec[0] == 'elevation':
+                            value = float(terrain.sample_dem_bilinear(row['lat'], row['lon']))
+                        if value is None and spec[0] in STATS_KEYS:
+                            pending += 1
+                        values.append(value)
+                    writer.writerow((row.get('kind', 'point'), *values,
+                                     *((row.get('cell_lat_min'), row.get('cell_lat_max'), row.get('cell_lon_min'),
+                                        row.get('cell_lon_max')) if with_cell else ()),
+                                     parameters[14] if len(parameters) > 14 else None,
+                                     parameters[15] if len(parameters) > 15 else None,
+                                     start.isoformat(), stop.isoformat(), step, sun, earth, max_sun, max_earth,
+                                     spacing, lat_min, lat_max, lon_min, lon_max, self.was_cancelled,
+                                     side, horizon, mode, parameters[13] if len(parameters) > 13 else 'Off',
                                      row.get('lunar_days'), *lunar_limits))
+            if pending and self._fill_running:
+                self.status.configure(text=f'Saved {len(self.results):,} results to {path}; optional columns that '
+                                           'were still being calculated are empty.')
+                return
             self.status.configure(text=f'Saved {len(self.results):,} results to {path}')
         except OSError as error:
             self.status.configure(text=f'Could not save results: {error}')
@@ -1361,6 +1588,7 @@ class SearchDialog:
             return
         self._closed = True
         self.cancel.set()
+        self._fill_cancel.set()
         if self.timer is not None:
             try:
                 self.window.after_cancel(self.timer)

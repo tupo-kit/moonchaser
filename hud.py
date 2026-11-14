@@ -8,15 +8,15 @@ after the renderer exists. All overlay coordinates are normalized viewport (x ri
 Pure helpers (split_at_zero, dash_polyline, dim_color) have no VTK dependency.
 
 Point comparison (see compare.py): while self._compare_active, the page shows the horizon graph of one
-point (arrow buttons switch it), Sun/Earth graphs that combine every point (one colour per point, one
-on/off button per point) and, below them, the comparison tables. Extra host state: _compare_active,
+point (arrow buttons switch it), Sun/Earth graphs and a "Sun visible % per lunar day" graph that combine every
+point (one colour per point, one on/off button per point) and, below them, the comparison tables. Extra host state: _compare_active,
 _compare_points, _compare_index, _compare_visible, _compare (results), _stats_above_only.
 """
 from datetime import timedelta
 
 import numpy as np
 
-from compare import POINT_COLORS, build_tables, next_sort, table_notes
+from compare import POINT_COLORS, SYNODIC_DAYS, TABLE_COUNT, build_tables, lunar_day_series, next_sort, table_notes
 from sky import SKY_METHODS
 from terrain import terrain_panorama_rgba, terrain_panorama_samples
 
@@ -24,7 +24,9 @@ SKY_LEGEND = {"JPL": "JPL Sun yellow / Earth blue", "Skyfield": "Skyfield Sun or
 SKY_COLORS = {"Sun JPL": (1.0, 0.8, 0.12), "Earth JPL": (0.35, 0.65, 1.0), "Sun Skyfield": (1.0, 0.35, 0.1), "Earth Skyfield": (0.3, 1.0, 0.5)}
 PANEL_HEIGHT = 0.5  # each extra graph is half a window tall; the page scrolls under the window
 EXTRA_PANELS = ("Sun", "Earth")
+COMPARE_PANELS = EXTRA_PANELS + ("Lunar",)   # a comparison adds the lunar-day visibility graph
 PAGE_HEIGHT = 1.0 + PANEL_HEIGHT * len(EXTRA_PANELS)
+COMPARE_PAGE_HEIGHT = 1.0 + PANEL_HEIGHT * len(COMPARE_PANELS)
 SCROLL_STEP = 0.08
 TABLE_ROW = 0.034      # comparison table: one text row, in window heights
 TOGGLES_PER_ROW = 6    # comparison graphs: point on/off buttons per row
@@ -144,7 +146,7 @@ class HudMixin:
         self.close_button = self.make_text(0.91, 0.46, 16)
         self.close_button.SetInput("[ Close ]")
         self.panels = {}
-        for key in EXTRA_PANELS:
+        for key in COMPARE_PANELS:
             title = self.make_text(0.08, 0.0, 14, top=True)
             axes = self.make_overlay_lines([], (0.4, 0.48, 0.58), 1)
             xlabels, ylabels = [], []
@@ -185,7 +187,7 @@ class HudMixin:
             actor.SetVisibility(False)
         self._cmp_lines, self._cmp_markers, self._cmp_toggles, self._cmp_state = {}, {}, {}, {}
         self._table_pool = []
-        self._table_sorts = [None, None]    # per table: (column, descending) or None
+        self._table_sorts = [None] * TABLE_COUNT    # per table: (column, descending) or None
         self._table_headers = []            # per table: (text slot, column character spans), set by update_table
         self._scrollbar_grab = 0.0
         self.scrollbar_track = self.make_overlay_lines([], (0.16, 0.2, 0.28), 8)
@@ -431,7 +433,7 @@ class HudMixin:
 
     def layout_panels(self, s):
         """Place the extra graphs below the main one; page y = -PANEL_HEIGHT * k, screen y = page y + s."""
-        for k, key in enumerate(EXTRA_PANELS, start=1):
+        for k, key in enumerate(self.panel_keys(), start=1):
             base = -PANEL_HEIGHT * k + s
             x0, x1, y0, y1 = 0.08, 0.97, base + 0.10, base + 0.38
             self._panel_boxes[key] = (x0, x1, y0, y1)
@@ -449,14 +451,23 @@ class HudMixin:
     def compare_n(self):
         return len(self._compare_points) if self._compare_active and self._graph_expanded else 0
 
+    def panel_keys(self):
+        """The graphs below the horizon graph: Sun and Earth, plus the lunar-day graph in a comparison."""
+        return COMPARE_PANELS if self._compare_active and self._graph_expanded else EXTRA_PANELS
+
+    @staticmethod
+    def table_top():
+        """Page y (down from the horizon page) where the comparison tables start."""
+        return PANEL_HEIGHT * len(COMPARE_PANELS)
+
     def page_height(self):
-        """Pages are 2 window heights (horizon + Sun + Earth); a comparison adds the tables."""
+        """Pages are 2 window heights (horizon + Sun + Earth); a comparison adds the lunar graph and the tables."""
         if self._compare_active and self._graph_expanded:
-            return PAGE_HEIGHT + self.table_layout(len(self._compare_points))[1]
+            return COMPARE_PAGE_HEIGHT + self.table_layout(len(self._compare_points))[1]
         return PAGE_HEIGHT
 
     def ensure_compare_actors(self, n):
-        for key in EXTRA_PANELS:
+        for key in COMPARE_PANELS:
             for i in range(n):
                 if (key, i) in self._cmp_lines:
                     continue
@@ -477,7 +488,7 @@ class HudMixin:
             toggle.SetVisibility(active)
             if not active:
                 continue
-            base = -PANEL_HEIGHT * (EXTRA_PANELS.index(key) + 1) + s
+            base = -PANEL_HEIGHT * (COMPARE_PANELS.index(key) + 1) + s
             x = 0.40 + (i % TOGGLES_PER_ROW) * 0.095
             y = base + 0.45 - (i // TOGGLES_PER_ROW) * 0.03
             toggle.SetPosition(x, y)
@@ -488,7 +499,7 @@ class HudMixin:
         """Text slots of the table section: y offsets down from its top, and the section height."""
         y, slots = 0.03, [0.03]  # slot 0: the "stats over" button
         y += 0.05
-        for _ in range(2):  # slot per table: title, two header lines, then one slot per point
+        for _ in range(TABLE_COUNT):  # slot per table: title, two header lines, then one slot per point
             slots.append(y)
             y += 0.045
             slots.append(y)
@@ -498,7 +509,7 @@ class HudMixin:
                 y += TABLE_ROW
             y += 0.03
         slots.append(y)  # notes
-        return slots, y + 0.18
+        return slots, y + 0.28
 
     def table_actor(self, slot):
         while len(self._table_pool) <= slot:
@@ -515,8 +526,9 @@ class HudMixin:
             return
         slots, _ = self.table_layout(n)
         for slot, offset in enumerate(slots):
-            self.table_actor(slot).SetPosition(0.03, s - 1.0 - offset)
-        self._controls["stats_mode"] = (0.03, s - 1.0 - slots[0] - 0.035, 0.52, s - 1.0 - slots[0] + 0.005)
+            self.table_actor(slot).SetPosition(0.03, s - self.table_top() - offset)
+        top = self.table_top()
+        self._controls["stats_mode"] = (0.03, s - top - slots[0] - 0.035, 0.52, s - top - slots[0] + 0.005)
 
     def table_font(self, chars):
         width, height = self.window.GetSize()
@@ -637,9 +649,9 @@ class HudMixin:
     def update_panels(self):
         """Sun and Earth elevation graphs."""
         expanded = self._graph_expanded
-        for panel in self.panels.values():
+        for key, panel in self.panels.items():
             for actor in (panel["title"], *panel["xlabels"], *panel["ylabels"]):
-                actor.SetVisibility(expanded)
+                actor.SetVisibility(expanded and key in self.panel_keys())
         for actor in (*self.panel_terrain.values(), *self.panel_lines.values()):
             actor.GetMapper().SetInputData(self.overlay_lines_data([]))
         self._panel_state = {}
@@ -753,15 +765,58 @@ class HudMixin:
             for label, value in zip(panel["ylabels"], (0.0, high)):
                 label.SetInput(f"{value:+.1f}")
                 label.SetVisibility(True)
+        self.update_lunar_panel(compare, ready and span > 0, note, seconds, span, source)
         self.update_panel_markers()
         self.update_table()
+
+    def update_lunar_panel(self, compare, ready, note, seconds, span, source):
+        """Sun visible % of every complete lunar day, one step line per point (a short interval is one step)."""
+        key, n, epochs = "Lunar", self.compare_n(), self._epochs
+        panel, (x0, x1, y0, y1) = self.panels[key], self._panel_boxes[key]
+        title = f"Sun visible % per lunar day vs time (UTC), {n} points"
+        name = f"Sun {source}"
+        shown = []
+        if ready and self._shown_sources[source]:
+            shown = [i for i in range(n) if self._compare_visible[i] and compare["data"][i] is not None
+                     and name in compare["data"][i]]
+        if not shown:
+            if not ready:
+                detail = note
+            elif not self._shown_sources[source]:
+                detail = "Source hidden (see the checkbox)"
+            else:
+                detail = "No point selected: use the buttons on the right"
+            panel["title"].SetInput(title + "\n" + detail)
+            for actor in (*panel["xlabels"], *panel["ylabels"]):
+                actor.SetVisibility(False)
+            return
+        xs = x0 + (x1 - x0) * seconds / span
+        values = {}
+        for i in shown:
+            step = np.full(len(seconds), np.nan)  # value of the lunar day each sample belongs to
+            outline = []
+            for first, last, percent in lunar_day_series(seconds, compare["data"][i][name]["visible"]):
+                step[(seconds >= first) & (seconds <= last)] = percent
+                y = y0 + (y1 - y0) * percent / 100.0
+                outline += [(x0 + (x1 - x0) * first / span, y), (x0 + (x1 - x0) * last / span, y)]
+            values[i] = step
+            self._cmp_lines[(key, i)].GetMapper().SetInputData(self.overlay_lines_data([np.array(outline)]))
+        self._cmp_state[key] = {"xs": xs, "high": 100.0, "values": values}
+        panel["title"].SetInput(f"{title}\nOne value per complete lunar day ({SYNODIC_DAYS:.2f} d)\n"
+                                "Shorter interval: one value; scale 0 to 100 %")
+        for fraction, label in zip(np.linspace(0, 1, 5), panel["xlabels"]):
+            label.SetInput(f"{epochs[0] + timedelta(seconds=float(fraction) * span):%m-%d %H:%M}")
+            label.SetVisibility(True)
+        for label, value in zip(panel["ylabels"], (0.0, 100.0)):
+            label.SetInput(f"{value:.0f}%")
+            label.SetVisibility(True)
 
     def update_compare_markers(self):
         """Selected sample: a marker per point on each combined graph, and the on/off buttons with values."""
         n = self.compare_n()
         for marker in self._cmp_markers.values():
             self.set_bullseye(marker, [])
-        for key in EXTRA_PANELS:
+        for key in COMPARE_PANELS:
             state = self._cmp_state.get(key)
             x0, x1, y0, y1 = self._panel_boxes[key]
             for i in range(n):
@@ -771,9 +826,12 @@ class HudMixin:
                 if state is not None and i in state["values"]:
                     index = min(self._time_index, len(state["xs"]) - 1)
                     value = float(state["values"][i][index])
-                    text += f" {value:5.1f}"
-                    self.set_bullseye(self._cmp_markers[(key, i)], [
-                        (float(state["xs"][index]), y0 + (y1 - y0) * value / state["high"])])
+                    if np.isfinite(value):  # the lunar graph has no value after its last complete day
+                        text += f" {value:5.1f}"
+                        self.set_bullseye(self._cmp_markers[(key, i)], [
+                            (float(state["xs"][index]), y0 + (y1 - y0) * value / state["high"])])
+                    else:
+                        text += "     -"
                 toggle = self._cmp_toggles[(key, i)]
                 toggle.SetInput(text)
                 toggle.GetTextProperty().SetColor(*(color if on else dim_color(color)))

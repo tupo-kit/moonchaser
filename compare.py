@@ -1,11 +1,15 @@
 """Point comparison helpers: palette, point-set files, per-point statistics, table text and sorting. No VTK, no UI.
 
-Statistics are computed from the classified sky data of sky.classify_sky() ("az", "el", "terrain" arrays).
-"Above horizon" means the body centre is above the local terrain horizon (eclipses are not counted).
+Statistics are computed from the classified sky data of sky.classify_sky() ("az", "el", "terrain", "visible").
+Two different definitions are available everywhere (comparison tables and search columns):
+  "Visible"       sky.classify_sky()["visible"]: centre or part of the disk is clear of terrain, and for the Sun
+                  not eclipsed by Earth. This is what the search filters on.
+  "Above horizon" the body centre is above the local terrain horizon (eclipses are not counted).
 All table text is plain ASCII so it renders with the built-in monospace font.
 """
 import json
 import math
+from functools import lru_cache
 
 import numpy as np
 import terrain
@@ -18,7 +22,10 @@ POINT_COLORS = (
 )
 SYNODIC_DAYS = 29.530588861  # one lunar day (new moon to new moon), in Earth days
 SYNODIC_SECONDS = SYNODIC_DAYS * 86400.0
+LUNAR_DAY_DAYS = SYNODIC_DAYS  # name used by the search window
 MIN_RELIABLE_DAYS = 2.0
+TABLE_COUNT = 4                # comparison tables built by build_tables()
+TABLE_SLOPE_RADIUS_KM = 1.0    # "max slope" columns: largest sampled slope within this radius
 
 
 # --------------------------------------------------------------------------- points and files
@@ -89,6 +96,88 @@ def load_points(path):
     return points
 
 
+# --------------------------------------------------------------------------- visibility maths
+
+def _trapezoid_percent(durations, values):
+    """Percent of the time a 0/1 series is on; every step counts the mean of its two end samples."""
+    return float(100 * np.dot(durations, (values[:-1] + values[1:]) * 0.5) / durations.sum())
+
+
+def visibility_percent(epochs, mask):
+    """Time-weight samples with midpoint crossings; handles a short last step."""
+    if len(epochs) < 2:
+        raise ValueError('Start and end must be different.')
+    values = np.asarray(mask, dtype=float)
+    if values.shape != (len(epochs),):
+        raise ValueError('Visibility result does not match the time samples.')
+    durations = np.array([(b - a).total_seconds() for a, b in zip(epochs[:-1], epochs[1:])])
+    if np.any(durations <= 0):
+        raise ValueError('Times must be in strictly increasing order.')
+    return _trapezoid_percent(durations, values)
+
+
+def lunar_day_series(seconds, visible):
+    """[(start_s, end_s, percent)] for every complete lunar day counted from the first sample.
+
+    A day without two samples is left out. An interval shorter than one lunar day gives a single entry
+    that covers the whole interval.
+    """
+    values = np.asarray(visible, dtype=float)
+    t = np.asarray(seconds, dtype=float)
+    if values.shape != t.shape or len(t) < 2:
+        raise ValueError('Visibility result does not match the time samples.')
+
+    def percent(lo, hi):
+        index = np.nonzero((t >= lo) & (t <= hi))[0]
+        if len(index) < 2:
+            return None
+        ts, vs = t[index], values[index]
+        span = ts[-1] - ts[0]
+        if span <= 0:
+            return None
+        return float(100.0 * np.sum((vs[:-1] + vs[1:]) * 0.5 * np.diff(ts)) / span)
+
+    length = LUNAR_DAY_DAYS * 86400.0
+    series = []
+    for k in range(int(t[-1] // length)):
+        value = percent(k * length, (k + 1) * length)
+        if value is not None:
+            series.append((k * length, (k + 1) * length, value))
+    if not series:
+        series = [(float(t[0]), float(t[-1]), percent(0.0, float(t[-1])) or 0.0)]
+    return series
+
+
+def lunar_day_stats(epochs, visible):
+    """(mean %, standard deviation %, number of lunar days) of the Sun visibility per lunar day.
+
+    The interval is cut into consecutive lunar days (LUNAR_DAY_DAYS) from its start and the visibility
+    percentage of each complete lunar day is computed; the mean and the (population) standard deviation
+    are taken over these days. Shorter intervals count as a single day (SD 0).
+    """
+    seconds = np.array([(epoch - epochs[0]).total_seconds() for epoch in epochs])
+    days = [value for _, _, value in lunar_day_series(seconds, visible)]
+    return float(np.mean(days)), float(np.std(days)), len(days)
+
+
+@lru_cache(maxsize=4096)
+def max_slope_cached(lat, lon, radius_km=TABLE_SLOPE_RADIUS_KM):
+    """terrain.max_slope_in_radius, remembered (the DEM never changes while the program runs)."""
+    return float(terrain.max_slope_in_radius(lat, lon, radius_km))
+
+
+@lru_cache(maxsize=4096)
+def location_values(lat, lon):
+    """(elevation m, slope deg, max slope deg within TABLE_SLOPE_RADIUS_KM or None) of a point."""
+    elevation = float(terrain.sample_dem_bilinear(lat, lon))
+    slope = float(terrain.compute_slope_deg(lat, lon))
+    try:
+        steepest = max_slope_cached(lat, lon, TABLE_SLOPE_RADIUS_KM)
+    except ValueError:
+        steepest = None
+    return elevation, slope, steepest
+
+
 # --------------------------------------------------------------------------- statistics
 
 def above_periods(seconds, clearance):
@@ -151,7 +240,11 @@ def body_stats(seconds, body, only_above=True):
     partial = not complete and bool(periods)
     lengths = complete or [end - start for start, end, _ in periods]
     mask = clearance > 0.0 if only_above else np.ones(len(clearance), dtype=bool)
+    visible = body.get("visible")
+    durations = np.diff(seconds)
     return {
+        "visible_pct": (_trapezoid_percent(durations, np.asarray(visible, dtype=float))
+                        if visible is not None and np.all(durations > 0) else None),
         "fraction": fraction,
         "per_lunar_day_s": fraction * SYNODIC_SECONDS,
         "mean_period_s": float(np.mean(lengths)) if lengths else None,
@@ -173,6 +266,10 @@ def point_stats(epochs, data, source, only_above=True):
         return None
     result = {key: body_stats(seconds, data[name], only_above) for key, name in names.items()}
     result["span_s"] = float(seconds[-1])
+    try:
+        result["lunar"] = lunar_day_stats(epochs, data[names["Sun"]]["visible"])
+    except (KeyError, ValueError):
+        result["lunar"] = None
     return result
 
 
@@ -249,51 +346,74 @@ def next_sort(current, column):
 
 
 def build_tables(points, stats, sorts=None):
-    """Two tables, one row per point.
+    """TABLE_COUNT tables, one row per point (location, visibility, time above the horizon, directions).
 
-    sorts: [sort_of_table_1, sort_of_table_2], each (column, descending) or None.
+    sorts: one (column, descending) or None per table.
     Returns [(title, (header1, header2), [row, ...], order, spans), ...]; order[i] is the point index
     shown in row i (the rows are sorted, the point names P1, P2, ... stay with their points).
     """
-    sorts = list(sorts or [None, None]) + [None, None]
+    sorts = list(sorts or []) + [None] * TABLE_COUNT
     na = "n/a"
-    rows_a, rows_b, keys_a, keys_b = [], [], [], []
+
+    def num(value, form):
+        return "-" if value is None or not math.isfinite(value) else format(value, form)
+
+    def span(mean, partial):
+        return format_duration(mean) + ("*" if partial and mean is not None else "")
+
+    # Each table: columns [(line1, line2)], then per point (text cells, sort keys) after the point name.
+    columns = [
+        [("Point", ""), ("Lat", "deg"), ("Lon", "deg"), ("Elevation", "m"), ("Slope", "deg"),
+         ("Max slope", f"deg {TABLE_SLOPE_RADIUS_KM:g} km")],
+        [("Point", ""), ("Sun visible", "%"), ("Earth visible", "%"), ("Sun/lunar day", "avg %"),
+         ("Sun/lunar day", "SD %"), ("Lunar", "days")],
+        [("Point", ""), ("Sun above", "horizon %"), ("Sun above/", "lunar day"), ("Avg sunlit", "period"),
+         ("Earth above", "horizon %"), ("Earth above/", "lunar day"), ("Avg Earth", "period")],
+        [("Point", ""), ("Sun AZ", "avg deg"), ("Sun AZ", "SD deg"), ("Sun EL", "avg deg"),
+         ("Sun EL", "SD deg"), ("Earth AZ", "avg deg"), ("Earth AZ", "SD deg"),
+         ("Earth EL", "avg deg"), ("Earth EL", "SD deg")],
+    ]
+    titles = ("Location", "Sun / Earth visible (disk, partly visible counts; Sun eclipses)",
+              "Time with the body centre above the horizon", "Direction statistics")
+    rows = [[] for _ in range(TABLE_COUNT)]
+    keys = [[] for _ in range(TABLE_COUNT)]
     for index, ((lat, lon), s) in enumerate(zip(points, stats)):
         name = f"P{index + 1}"
-        place = [f"{lat:+.3f}", f"{lon:+.3f}"]
-        slope_value = terrain.compute_slope_deg(lat, lon)
-        slope = f"{slope_value:.2f}"
+        elevation, slope, steepest = location_values(lat, lon)
+        rows[0].append([name, f"{lat:+.3f}", f"{lon:+.3f}", f"{elevation:+,.0f}", f"{slope:.2f}", num(steepest, ".2f")])
+        keys[0].append([index, lat, lon, _finite(elevation), _finite(slope), _finite(steepest)])
         if s is None:
-            rows_a.append([name, *place, slope, na, na, na, na])
-            rows_b.append([name, *[na] * 8])
-            keys_a.append([index, lat, lon, _finite(slope_value), None, None, None, None])
-            keys_b.append([index] + [None] * 8)
+            for t, width in ((1, 5), (2, 6), (3, 8)):
+                rows[t].append([name] + [na] * width)
+                keys[t].append([index] + [None] * width)
             continue
-        sun, earth = s["Sun"], s["Earth"]
-        period = format_duration(sun["mean_period_s"]) + ("*" if sun["period_partial"] else "")
-        rows_a.append([name, *place, slope, f"{100.0 * sun['fraction']:.2f}",
-                       format_duration(sun["per_lunar_day_s"]), period, f"{100.0 * earth['fraction']:.2f}"])
-        keys_a.append([index, lat, lon, _finite(slope_value), sun["fraction"], sun["per_lunar_day_s"],
-                       sun["mean_period_s"], earth["fraction"]])
-        rows_b.append([name, _number(sun["az"], 0, ".2f"), _number(sun["az"], 1, ".2f"),
-                       _number(sun["el"], 0, "+.2f"), _number(sun["el"], 1, ".2f"),
-                       _number(earth["az"], 0, ".2f"), _number(earth["az"], 1, ".2f"),
-                       _number(earth["el"], 0, "+.2f"), _number(earth["el"], 1, ".2f")])
-        keys_b.append([index, _value(sun["az"], 0), _value(sun["az"], 1), _value(sun["el"], 0), _value(sun["el"], 1),
-                       _value(earth["az"], 0), _value(earth["az"], 1), _value(earth["el"], 0), _value(earth["el"], 1)])
-    columns_a = [("Point", ""), ("Lat", "deg"), ("Lon", "deg"), ("Slope", "deg"), ("Sun above", "horizon %"),
-                 ("Sun above/", "lunar day"), ("Avg sunlit", "period"), ("Earth above", "horizon %")]
-    columns_b = [("Point", ""), ("Sun AZ", "avg deg"), ("Sun AZ", "SD deg"), ("Sun EL", "avg deg"),
-                 ("Sun EL", "SD deg"), ("Earth AZ", "avg deg"), ("Earth AZ", "SD deg"),
-                 ("Earth EL", "avg deg"), ("Earth EL", "SD deg")]
+        sun, earth, lunar = s["Sun"], s["Earth"], s.get("lunar")
+        rows[1].append([name, num(sun.get("visible_pct"), ".2f"), num(earth.get("visible_pct"), ".2f"),
+                        num(lunar[0] if lunar else None, ".2f"), num(lunar[1] if lunar else None, ".2f"),
+                        str(lunar[2]) if lunar else "-"])
+        keys[1].append([index, _finite(sun.get("visible_pct")), _finite(earth.get("visible_pct")),
+                        _finite(lunar[0]) if lunar else None, _finite(lunar[1]) if lunar else None,
+                        lunar[2] if lunar else None])
+        rows[2].append([name, f"{100.0 * sun['fraction']:.2f}", format_duration(sun["per_lunar_day_s"]),
+                        span(sun["mean_period_s"], sun["period_partial"]), f"{100.0 * earth['fraction']:.2f}",
+                        format_duration(earth["per_lunar_day_s"]),
+                        span(earth["mean_period_s"], earth["period_partial"])])
+        keys[2].append([index, sun["fraction"], sun["per_lunar_day_s"], sun["mean_period_s"],
+                        earth["fraction"], earth["per_lunar_day_s"], earth["mean_period_s"]])
+        rows[3].append([name, _number(sun["az"], 0, ".2f"), _number(sun["az"], 1, ".2f"),
+                        _number(sun["el"], 0, "+.2f"), _number(sun["el"], 1, ".2f"),
+                        _number(earth["az"], 0, ".2f"), _number(earth["az"], 1, ".2f"),
+                        _number(earth["el"], 0, "+.2f"), _number(earth["el"], 1, ".2f")])
+        keys[3].append([index, _value(sun["az"], 0), _value(sun["az"], 1), _value(sun["el"], 0), _value(sun["el"], 1),
+                        _value(earth["az"], 0), _value(earth["az"], 1), _value(earth["el"], 0), _value(earth["el"], 1)])
     result = []
-    for title, columns, rows, keys, sort in (("Time above the horizon", columns_a, rows_a, keys_a, sorts[0]),
-                                             ("Direction statistics", columns_b, rows_b, keys_b, sorts[1])):
-        if sort is not None and not 0 <= sort[0] < len(columns):
+    for t in range(TABLE_COUNT):
+        sort = sorts[t]
+        if sort is not None and not 0 <= sort[0] < len(columns[t]):
             sort = None
-        order = sort_order(keys, sort)
-        header, lines, spans = _render(_mark(columns, sort), [rows[i] for i in order])
-        result.append((title, header, lines, order, spans))
+        order = sort_order(keys[t], sort)
+        header, lines, spans = _render(_mark(columns[t], sort), [rows[t][i] for i in order])
+        result.append((titles[t], header, lines, order, spans))
     return result
 
 
@@ -306,7 +426,11 @@ def table_notes(span_s, only_above):
         elif days < SYNODIC_DAYS:
             lines.append(f"! Interval is shorter than one lunar day ({SYNODIC_DAYS:.2f} d): 'above/lunar day' is extrapolated.")
     lines += [
+        "Visible = centre or part of the disk clear of terrain; the Sun also must not be eclipsed by Earth.",
         "Above horizon = body centre above the local terrain horizon (eclipses not counted).",
+        f"Sun/lunar day = Sun visible % of each complete lunar day ({SYNODIC_DAYS:.2f} d) from the interval start;"
+        " mean and SD over those days (a shorter interval counts as one day, SD 0).",
+        f"Max slope = largest sampled slope within {TABLE_SLOPE_RADIUS_KM:g} km of the point.",
         f"Above/lunar day = share of time above horizon x {SYNODIC_DAYS:.2f} d (one lunar day).",
         "Avg sunlit period = mean length of one continuous Sun-above-horizon stretch; * = cut by the interval edge.",
         "AZ: north = 0, clockwise; avg and SD are circular. EL: elevation above the local horizontal plane.",
