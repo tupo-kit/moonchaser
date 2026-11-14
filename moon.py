@@ -16,7 +16,7 @@ Sun/Earth positions use Skyfield (offline, limited date range) or JPL Horizons v
 you pick the model in the time interval window, and only that model is queried. Time defaults to UTC now.
 Click Edit time interval (or T) to choose a range; this opens a fullscreen horizon + Sun/Earth graph.
 That window scrolls (mouse wheel, Up/Down, PageUp/PageDown, Home/End) to more graphs: Sun elevation vs
-time, Earth elevation vs time, and hours of sunlight per day.
+time and Earth elevation vs time.
 Use Previous/Next to step samples and Close to return to the horizon-only view.
 """
 
@@ -53,41 +53,10 @@ SUN_RADIUS_DEG = float(np.degrees(np.arcsin(695700.0 / 149597870.7)))  # mean, 1
 EARTH_RADIUS_DEG = float(np.degrees(np.arcsin(6378.1366 / 384400.0)))  # mean Earth-Moon distance
 SKY_LEGEND = {"JPL": "JPL Sun yellow / Earth blue", "Skyfield": "Skyfield Sun orange / Earth green"}
 SKY_COLORS = {"Sun JPL": (1.0, 0.8, 0.12), "Earth JPL": (0.35, 0.65, 1.0), "Sun Skyfield": (1.0, 0.35, 0.1), "Earth Skyfield": (0.3, 1.0, 0.5)}
-LIGHT_COLORS = {name: color for name, color in SKY_COLORS.items() if name.startswith("Sun ")}
 PANEL_HEIGHT = 0.5  # each extra graph is half a window tall; the page scrolls under the window
-EXTRA_PANELS = ("Sun", "Earth", "Light")
+EXTRA_PANELS = ("Sun", "Earth")
 PAGE_HEIGHT = 1.0 + PANEL_HEIGHT * len(EXTRA_PANELS)
 SCROLL_STEP = 0.08
-
-
-def daily_light_hours(epochs, masks):
-    """Hours of light per UTC day, and the average per day, from sampled visibility.
-
-    Each sample is taken to hold until the next one. Days only partly covered by the
-    interval are scaled to 24 h, and the average is total lit time / total time * 24.
-    Returns (days, {name: hours per day}, {name: average hours per day}).
-    """
-    first_day = epochs[0].replace(hour=0, minute=0, second=0, microsecond=0)
-    count = (epochs[-1] - first_day).days + 1
-    covered = np.zeros(count)
-    lit = {name: np.zeros(count) for name in masks}
-    for i in range(len(epochs) - 1):
-        start, stop = epochs[i], epochs[i + 1]
-        while start < stop:
-            index = (start - first_day).days
-            end = min(stop, first_day + timedelta(days=index + 1))
-            seconds = (end - start).total_seconds()
-            covered[index] += seconds
-            for name, mask in masks.items():
-                if mask[i]:
-                    lit[name][index] += seconds
-            start = end
-    keep = covered > 0
-    days = [first_day + timedelta(days=int(index)) for index in np.nonzero(keep)[0]]
-    total = float(covered.sum())
-    hours = {name: lit[name][keep] / covered[keep] * 24.0 for name in masks}
-    average = {name: (float(lit[name].sum()) / total * 24.0 if total > 0 else 0.0) for name in masks}
-    return days, hours, average
 
 
 def load_interval():
@@ -764,8 +733,6 @@ class MoonWindow:
             self.panels[key] = {"title": title, "axes": axes, "xlabels": xlabels, "ylabels": ylabels}
         self.panel_terrain = {name: self.make_overlay_lines([], (0.0, 0.9, 1.0), 1) for name in SKY_COLORS}
         self.panel_lines = {name: self.make_overlay_lines([], color, 2) for name, color in SKY_COLORS.items()}
-        self.light_lines = {name: self.make_overlay_lines([], color, 2) for name, color in LIGHT_COLORS.items()}
-        self.light_points = {name: self.make_overlay_points([], color, 6) for name, color in LIGHT_COLORS.items()}
         self.time_cursor = self.make_overlay_lines([], (0.9, 0.95, 1.0), 1)
         self.scrollbar = self.make_overlay_lines([], (0.45, 0.55, 0.7), 6)
         self.apply_layout()
@@ -1079,16 +1046,13 @@ class MoonWindow:
             self.zoom(1.08 if direction > 0 else 1 / 1.08)
 
     def update_panels(self):
-        """Sun/Earth elevation vs time, and hours of light per day (the scrolled-to graphs)."""
+        """Sun and Earth elevation graphs."""
         expanded = self._graph_expanded
         for panel in self.panels.values():
             for actor in (panel["title"], *panel["xlabels"], *panel["ylabels"]):
                 actor.SetVisibility(expanded)
-        for actor in (*self.panel_terrain.values(), *self.panel_lines.values(),
-                      *self.light_lines.values(), self.time_cursor):
+        for actor in (*self.panel_terrain.values(), *self.panel_lines.values(), self.time_cursor):
             actor.GetMapper().SetInputData(self.overlay_lines_data([]))
-        for actor in self.light_points.values():
-            actor.GetMapper().SetInputData(self.overlay_point_data([]))
         if not expanded:
             return
         data, epochs = self._sky_data, self._epochs
@@ -1116,20 +1080,35 @@ class MoonWindow:
                 panel["title"].SetInput(title + "\n" + (note if not ready else "Source hidden (see the checkbox)"))
                 hide_labels(panel)
                 continue
-            low = min(float(min(np.min(data[n]["el"]), np.min(data[n]["terrain"]))) for n in names)
-            high = max(float(max(np.max(data[n]["el"]), np.max(data[n]["terrain"]))) for n in names)
-            padding = max((high - low) * 0.08, 0.01)
-            low, high = low - padding, high + padding
             xs = x0 + (x1 - x0) * seconds / span
-            for name in names:
-                ys = y0 + (y1 - y0) * (data[name]["el"] - low) / (high - low)
-                ts = y0 + (y1 - y0) * (data[name]["terrain"] - low) / (high - low)
-                self.panel_lines[name].GetMapper().SetInputData(
-                    self.overlay_lines_data([np.column_stack((xs, ys))]))
-                self.panel_terrain[name].GetMapper().SetInputData(
-                    self.overlay_lines_data([np.column_stack((xs, ts))]))
-            panel["title"].SetInput(f"{title}\nColour: {key} centre   Cyan: terrain horizon at the {key}'s bearing\n"
-                                    f"Scale {low:+.1f} to {high:+.1f} deg")
+            if key == "Sun":
+                # Measure the Sun's centre against the local terrain horizon.
+                # Below-horizon values are clamped to the zero baseline.
+                low = 0.0
+                high = max(0.01, max(float(np.max(np.maximum(
+                    data[n]["el"] - data[n]["terrain"], 0.0))) for n in names) * 1.08)
+                for name in names:
+                    clearance = np.maximum(data[name]["el"] - data[name]["terrain"], 0.0)
+                    ys = y0 + (y1 - y0) * clearance / high
+                    self.panel_lines[name].GetMapper().SetInputData(
+                        self.overlay_lines_data([np.column_stack((xs, ys))]))
+                panel["title"].SetInput("Sun centre above terrain horizon vs time (UTC)\n"
+                                        "0 deg = terrain horizon; below horizon shown as 0\n"
+                                        f"Scale 0 to {high:.1f} deg")
+            else:
+                low = min(float(min(np.min(data[n]["el"]), np.min(data[n]["terrain"]))) for n in names)
+                high = max(float(max(np.max(data[n]["el"]), np.max(data[n]["terrain"]))) for n in names)
+                padding = max((high - low) * 0.08, 0.01)
+                low, high = low - padding, high + padding
+                for name in names:
+                    ys = y0 + (y1 - y0) * (data[name]["el"] - low) / (high - low)
+                    ts = y0 + (y1 - y0) * (data[name]["terrain"] - low) / (high - low)
+                    self.panel_lines[name].GetMapper().SetInputData(
+                        self.overlay_lines_data([np.column_stack((xs, ys))]))
+                    self.panel_terrain[name].GetMapper().SetInputData(
+                        self.overlay_lines_data([np.column_stack((xs, ts))]))
+                panel["title"].SetInput(f"{title}\nColour: {key} centre   Cyan: terrain horizon at the {key}'s bearing\n"
+                                        f"Scale {low:+.1f} to {high:+.1f} deg")
             for fraction, label in zip(np.linspace(0, 1, 5), panel["xlabels"]):
                 label.SetInput(f"{epochs[0] + timedelta(seconds=float(fraction) * span):%m-%d %H:%M}")
                 label.SetVisibility(True)
@@ -1139,39 +1118,6 @@ class MoonWindow:
             x = float(xs[self._time_index])
             cursor.append([(x, y0), (x, y1)])
         self.time_cursor.GetMapper().SetInputData(self.overlay_lines_data(cursor))
-
-        panel, (x0, x1, y0, y1) = self.panels["Light"], self._panel_boxes["Light"]
-        title = "Sunlight per day (hours the Sun is visible, per UTC day)"
-        masks = {}
-        for source in SKY_LEGEND:
-            sun = f"Sun {source}"
-            if shown(sun):
-                masks[sun] = np.asarray(data[sun]["visible"], dtype=bool)
-        if not ready or not masks:
-            panel["title"].SetInput(title + "\n" + (note if not ready else "Source hidden (see the checkbox)"))
-            hide_labels(panel)
-            return
-        days, hours, average = daily_light_hours(epochs, masks)
-        count = len(days)
-        fractions = np.linspace(0.0, 1.0, count) if count > 1 else np.array([0.5])
-        xs = x0 + (x1 - x0) * fractions
-        for name, values in hours.items():
-            points = np.column_stack((xs, y0 + (y1 - y0) * values / 24.0))
-            self.light_lines[name].GetMapper().SetInputData(self.overlay_lines_data([points]))
-            self.light_points[name].GetMapper().SetInputData(self.overlay_point_data(points))
-        panel["title"].SetInput(
-            title + "\nAverage per day: " + "   ".join(f"{name} {value:.1f} h" for name, value in average.items())
-            + "\nSun counted while at least partly above the terrain horizon and not eclipsed by Earth; partial days scaled to 24 h")
-        for fraction, label in zip(np.linspace(0, 1, 5), panel["xlabels"]):
-            if count > 1:
-                label.SetInput(f"{days[int(round(float(fraction) * (count - 1)))]:%Y-%m-%d}")
-                label.SetVisibility(True)
-            else:
-                label.SetInput(f"{days[0]:%Y-%m-%d}")
-                label.SetVisibility(bool(abs(fraction - 0.5) < 1e-9))
-        for label, text in zip(panel["ylabels"], ("0 h", "24 h")):
-            label.SetInput(text)
-            label.SetVisibility(True)
 
     def close_graph(self):
         self._graph_expanded = False
