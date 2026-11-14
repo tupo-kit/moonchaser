@@ -1,4 +1,0 @@
-skyfield_data/pck00011.tpc filter=lfs diff=lfs merge=lfs -text
-skyfield_data/de440.bsp filter=lfs diff=lfs merge=lfs -text
-skyfield_data/moon_de440_250416.tf filter=lfs diff=lfs merge=lfs -text
-skyfield_data/moon_pa_de440_200625.bpc filter=lfs diff=lfs merge=lfs -text
