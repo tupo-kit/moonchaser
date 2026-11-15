@@ -671,7 +671,7 @@ class HudMixin:
         index = min(self._time_index, total - 1)
         for key in self.panel_keys():
             series = self.selected_graph_series(key)
-            text = f"UTC: {self._epochs[index]:%m-%d %H:%M}  |  Sample {index+1} / {total}"
+            text = f"UTC: {self._epochs[index]:%Y-%m-%d %H:%M}  |  Sample {index+1} / {total}"
             if series is not None and len(series) > index and np.isfinite(series[index]):
                 unit = '%' if key == 'Lunar' else '°'
                 label = 'Visibility' if key == 'Lunar' else 'Height'
@@ -975,7 +975,7 @@ class HudMixin:
             self.update_graph_fill(key, self._panel_state[key])
             panel["title"].SetInput(f"{key} height above terrain")
             for fraction, label in zip(np.linspace(0, 1, 5), panel["xlabels"]):
-                label.SetInput(f"{epochs[0] + timedelta(seconds=float(fraction) * span):%m-%d %H:%M}")
+                label.SetInput(f"{epochs[0] + timedelta(seconds=float(fraction) * span):%Y-%m-%d %H:%M}")
                 label.SetVisibility(True)
             for label, value in zip(panel["ylabels"], np.linspace(low, high, 5)):
                 label.SetInput(f"{value:+.1f}")
@@ -1030,7 +1030,7 @@ class HudMixin:
             self.update_graph_fill(key, self._cmp_state[key])
             panel["title"].SetInput(title)
             for fraction, label in zip(np.linspace(0, 1, 5), panel["xlabels"]):
-                label.SetInput(f"{epochs[0] + timedelta(seconds=float(fraction) * span):%m-%d %H:%M}")
+                label.SetInput(f"{epochs[0] + timedelta(seconds=float(fraction) * span):%Y-%m-%d %H:%M}")
                 label.SetVisibility(True)
             for label, value in zip(panel["ylabels"], np.linspace(0.0, high, 5)):
                 label.SetInput(f"{value:+.1f}")
@@ -1073,7 +1073,7 @@ class HudMixin:
         self.update_graph_fill(key, self._cmp_state[key])
         panel["title"].SetInput(title)
         for fraction, label in zip(np.linspace(0, 1, 5), panel["xlabels"]):
-            label.SetInput(f"{epochs[0] + timedelta(seconds=float(fraction) * span):%m-%d %H:%M}")
+            label.SetInput(f"{epochs[0] + timedelta(seconds=float(fraction) * span):%Y-%m-%d %H:%M}")
             label.SetVisibility(True)
         for label, value in zip(panel["ylabels"], np.linspace(0.0, 100.0, 5)):
             label.SetInput(f"{value:.0f}%")
@@ -1197,7 +1197,7 @@ class HudMixin:
         self.slider_track.GetMapper().SetInputData(self.overlay_lines_data([[(x0, y), (x1, y)]]))
         self.slider_fill.GetMapper().SetInputData(self.overlay_lines_data([[(x0, y), (handle, y)]] if index else []))
         self.set_bullseye(self.slider_handle, [(handle, y)])
-        form = "%m-%d %H:%M:%S" if self._interval_step_minutes < 1 else "%m-%d %H:%M"
+        form = "%Y-%m-%d %H:%M:%S" if self._interval_step_minutes < 1 else "%Y-%m-%d %H:%M"
         placements = {"start": (x0, epochs[0]), "end": (x1, epochs[-1]),
                       "current": (float(np.clip(handle, x0 + 0.12, x1 - 0.12)), epochs[index])}
         for key, (x, epoch) in placements.items():

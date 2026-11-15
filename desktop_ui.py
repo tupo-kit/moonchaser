@@ -1604,7 +1604,7 @@ class GraphHeader(QtWidgets.QFrame):
             self.mean.setStyleSheet(f'color: {color};')
         series = owner.selected_graph_series(self.key)
         sample = min(owner._time_index, len(owner._epochs) - 1)
-        meta = f"UTC: {owner._epochs[sample]:%m-%d %H:%M}  |  Sample {sample + 1} / {len(owner._epochs)}"
+        meta = f"UTC: {owner._epochs[sample]:%Y-%m-%d %H:%M}  |  Sample {sample + 1} / {len(owner._epochs)}"
         if series is not None and len(series) > sample and np.isfinite(series[sample]):
             unit = '%' if self.key == 'Lunar' else '°'
             label = 'Visibility' if self.key == 'Lunar' else 'Height'
@@ -1661,7 +1661,7 @@ class AnalysisTimeBar(QtWidgets.QFrame):
         self.slider.setValue(index)
         self.slider.setEnabled(len(epochs) > 1)
         self.slider.blockSignals(False)
-        fmt = '%m-%d %H:%M'
+        fmt = '%Y-%m-%d %H:%M'
         self.start.setText(epochs[0].strftime(fmt))
         self.current.setText(epochs[index].strftime(fmt))
         self.end.setText(epochs[-1].strftime(fmt))
