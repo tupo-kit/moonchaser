@@ -11,12 +11,20 @@ page opens without recomputing it. The optional columns of the results table (ab
 elevation statistics, lunar-day statistics, maximum slope) use exactly the statistics of compare.py; they never
 influence the search itself and are calculated afterwards, in the background, from the stored data.
 """
+import atexit
 import csv
 import colorsys
+import multiprocessing
+import os
 import queue
+import sys
 import threading
 import time
+from contextlib import contextmanager
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures.process import BrokenProcessPool
 from datetime import timedelta
+from functools import partial
 
 import numpy as np
 import point_data
@@ -414,8 +422,11 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
                  screen_horizon=2.0, screen_mode="Pessimistic center", cancel=None, progress=None,
                  use_ranges=True, range_progress=None, range_result=None, max_slope=None, slope_radius_km=1.0,
                  horizon_result=None, max_sun=100.0, max_earth=100.0, lunar_stats=False, lunar_filter=None,
-                 cache=None, cache_source=point_data.DEFAULT_SOURCE):
+                 cache=None, cache_source=point_data.DEFAULT_SOURCE, workers=None):
     """Return at most one terrain-checked match per cell.
+
+    workers: None or 1 = this thread only; 0 = one worker process per core (minus two); n > 1 = n processes.
+    The processes always use Skyfield directly (the `fetch` argument is not used by them).
 
     With a cache (point_data.PointDataCache) a point stored by an earlier search or by the comparison is not
     fetched, horizon-scanned or classified again, and every matching point is stored for later use.
@@ -452,6 +463,11 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
     min_terrain = float(np.min(terrain.dem_km)) * 1000.0
     if not np.isfinite(min_terrain):
         raise ValueError("The elevation map contains invalid values.")
+    if workers is not None and workers != 1:
+        return search_cells_parallel(cells, epochs, min_sun, min_earth, samples_per_side, screen_horizon, screen_mode,
+                                     cancel, progress, use_ranges, range_progress, range_result, max_slope,
+                                     slope_radius_km, horizon_result, max_sun, max_earth, lunar_stats, lunar_filter,
+                                     cache, cache_source, workers)
     start = time.monotonic()
     total_cells = len(cells)
     precomputed = {}
@@ -552,7 +568,8 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
                                            p['sun_percent'] + p['earth_percent']), reverse=True)
 
 
-def search_optimistic_sectors(cells, epochs, min_sun, min_earth, fetch, cancel=None, progress=None, horizon_result=None):
+def search_optimistic_sectors(cells, epochs, min_sun, min_earth, fetch, cancel=None, progress=None, horizon_result=None,
+                              workers=None):
     """Keep cells with optimistic visibility estimates, without terrain horizon rays.
 
     Each body is allowed the cell's full angular margin and full disk visibility;
@@ -572,6 +589,8 @@ def search_optimistic_sectors(cells, epochs, min_sun, min_earth, fetch, cancel=N
     floor = optimistic_horizon_floor(median_height, min_height)
     if horizon_result:
         horizon_result(min_height, median_height, floor)
+    if workers is not None and workers != 1:   # 0 = automatic, n > 1 = n processes (Skyfield is used directly)
+        return _sectors_parallel(cells, epochs, min_sun, min_earth, floor, cancel, progress, workers)
     results, filtered, start, completed = [], 0, time.monotonic(), 0
     total = len(cells)
     for index, cell in enumerate(cells):
@@ -609,9 +628,343 @@ def search_optimistic_sectors(cells, epochs, min_sun, min_earth, fetch, cancel=N
                                           p['sun_percent'] + p['earth_percent']), reverse=True)
 
 
+# ======================================================================================================
+# Multi-process evaluation. The serial search runs one point after another in one thread (one core, and the GIL
+# stops threads from helping). Here worker processes each evaluate whole cells; they read the DEM from one shared
+# memory block (terrain.share_dem), so RAM grows by the per-process Python / Skyfield data only, not 1 GB each.
+# ======================================================================================================
+_POOL = None
+_POOL_KEY = None
+_POOL_LOCK = threading.Lock()
+
+
+@contextmanager
+def _main_hidden():
+    """A spawned worker normally re-imports the program's main script (here moon.py: VTK, Qt, PIL ...). Workers only
+    need terrain / sky / this module, so hide the main script from multiprocessing while they are being started."""
+    main = sys.modules.get('__main__')
+    saved = {name: getattr(main, name) for name in ('__file__', '__spec__') if main is not None and hasattr(main, name)}
+    try:
+        for name in saved:
+            if name == '__spec__':
+                main.__spec__ = None
+            else:
+                delattr(main, name)
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(main, name, value)
+
+
+def default_workers():
+    return max(1, (os.cpu_count() or 2) - 2)   # two logical cores stay free for the GUI and the system
+
+
+def _init_worker(shm_name, shape, r_max_m):
+    terrain.attach_dem(shm_name, shape, r_max_m)
+    terrain.slope_deg_at = terrain._compute_slope_deg_at   # no map_modes (VTK side) in a worker; same formula
+    sky.preload()
+
+
+def _get_pool(workers):
+    """One persistent pool: workers start (and attach the DEM / ephemeris) once, not once per search."""
+    global _POOL, _POOL_KEY
+    sky.preload()   # validate / download the kernels once here, never in all workers at the same time
+    name, shape, r_max_m = terrain.share_dem()
+    with _POOL_LOCK:
+        if _POOL is not None and _POOL_KEY == (workers, name):
+            return _POOL
+        if _POOL is not None:
+            _POOL.shutdown(wait=False, cancel_futures=True)
+        # 'spawn': never fork a process that owns Qt / VTK / Tk threads.
+        _POOL = ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context('spawn'),
+                                    initializer=_init_worker, initargs=(name, shape, r_max_m))
+        _POOL_KEY = (workers, name)
+        # Start every worker now, while the main script is hidden (they are busy initialising, so each submit
+        # starts a new process). A worker started later would still work, only slower to start.
+        with _main_hidden():
+            for index in range(workers):
+                _POOL.submit(_ping, index)
+        return _POOL
+
+
+def shutdown_pool():
+    global _POOL, _POOL_KEY
+    with _POOL_LOCK:
+        pool, _POOL, _POOL_KEY = _POOL, None, None
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+atexit.register(shutdown_pool)
+
+
+def _ping(_):
+    return os.getpid()
+
+
+def warm_up(workers=0):
+    """Optional: start the workers in the background (for example when the search window opens)."""
+    _get_pool(workers or default_workers())
+
+
+def _evaluate_cell(cell, p):
+    """One terrain-checked cell: (row or None, screened out, (point, horizon, classified) or None)."""
+    epochs, min_sun, min_earth = p['epochs'], p['min_sun'], p['min_earth']
+    max_sun, max_earth = p['max_sun'], p['max_earth']
+    points = cell_sample_points(cell, p['side'])
+    center = points[0]
+    for point in points:
+        elevation = float(terrain.sample_dem_bilinear(*point))
+        pos = sky.get_positions_nocache(point[1], point[0], (elevation + terrain.EYE_HEIGHT_M) / 1000.0, epochs)
+        floor = optimistic_horizon_floor(elevation, p['min_terrain'])
+        # The cheap optimistic bound also guards the centre (the serial code skipped it there). That is safe: if even
+        # the optimistic estimate fails, the real terrain cannot pass, and the horizon scan is saved.
+        if can_meet_thresholds_without_horizon(epochs, pos, floor, min_sun, min_earth):
+            horizon_full = terrain.compute_horizon_360(*point)
+            classified = sky.classify_sky(pos, horizon_full[0])
+            sun = visibility_percent(epochs, classified['Sun']['visible'])
+            earth = visibility_percent(epochs, classified['Earth']['visible'])
+            if min_sun <= sun <= max_sun and min_earth <= earth <= max_earth:
+                area_slope = (terrain.max_slope_in_radius(*point, p['slope_radius_km'])
+                              if p['max_slope'] is not None else None)
+                lunar = (lunar_day_stats(epochs, classified['Sun']['visible'])
+                         if p['lunar_stats'] or p['lunar_filter'] is not None else None)
+                if ((lunar is None or p['lunar_filter'] is None or lunar_passes(lunar, p['lunar_filter']))
+                        and (area_slope is None or area_slope <= p['max_slope'])):
+                    row = {'lat': point[0], 'lon': point[1], 'sun_percent': sun, 'earth_percent': earth,
+                           'slope_deg': None, 'max_slope_deg': area_slope,   # slope_deg is filled in by the caller
+                           'sun_lunar_mean': lunar[0] if lunar else None,
+                           'sun_lunar_std': lunar[1] if lunar else None,
+                           'lunar_days': lunar[2] if lunar else None,
+                           'cell_lat_min': cell[0], 'cell_lat_max': cell[1],
+                           'cell_lon_min': cell[2], 'cell_lon_max': cell[3]}
+                    return row, False, (point, horizon_full, classified)
+        if point == center and p['mode'] == 'Pessimistic center':
+            approx = sky.classify_sky(pos, np.full(360, p['screen_horizon']))
+            if (visibility_percent(epochs, approx['Sun']['visible']) < min_sun or
+                    visibility_percent(epochs, approx['Earth']['visible']) < min_earth):
+                return None, True, None   # the other samples are not tried
+    return None, False, None
+
+
+def _run_cells(cells, p):
+    terrain.EYE_HEIGHT_M = p['eye']
+    return [_evaluate_cell(cell, p) for cell in cells]
+
+
+def _run_blocks(items, p):
+    """Optimistic range screen of 4x4 blocks; items are (bounds, cells). One bool per block."""
+    terrain.EYE_HEIGHT_M = p['eye']
+    epochs, out = p['epochs'], []
+    for bounds, _cells in items:
+        center = cell_sample_points(bounds, 3)[0]
+        height = float(terrain.sample_dem_bilinear(*center))
+        pos = sky.get_positions_nocache(center[1], center[0], (height + terrain.EYE_HEIGHT_M) / 1000.0, epochs)
+        margin = min(180.0, (bounds[1] - bounds[0] + bounds[3] - bounds[2]) / 2.0 + 2.0)
+        ok = True
+        for body, threshold in (('Sun', p['min_sun']), ('Earth', p['min_earth'])):
+            el = np.asarray(pos[body]['el'], dtype=float)
+            radius = np.asarray(pos[body]['radius'], dtype=float)
+            if (el.shape != (len(epochs),) or radius.shape != (len(epochs),) or not np.isfinite(el).all()
+                    or not np.isfinite(radius).all() or np.any(radius < 0)):
+                raise ValueError(f'Invalid {body} ephemeris in optimistic range screen.')
+            if visibility_percent(epochs, el + radius + margin >= p['floor']) + 1e-9 < threshold:
+                ok = False
+        out.append(ok)
+    return out
+
+
+def _run_sky(points, p):
+    """Terrain horizon + classified Sun / Earth sky of several points (for the optional columns)."""
+    terrain.EYE_HEIGHT_M = p['eye']
+    out = []
+    for lat, lon in points:
+        elevation = float(terrain.sample_dem_bilinear(lat, lon))
+        pos = sky.get_positions_nocache(lon, lat, (elevation + terrain.EYE_HEIGHT_M) / 1000.0, p['epochs'])
+        horizon = terrain.compute_horizon_360(lat, lon)
+        out.append((horizon, sky.classify_sky(pos, horizon[0])))
+    return out
+
+
+def _stream(pool, function, items, chunk, window, cancel, handler):
+    """Submit chunks with a bounded number in flight (so Cancel reacts quickly); handler(part, result) per chunk."""
+    starts = iter(range(0, len(items), chunk))
+    pending = {}
+
+    def fill():
+        while len(pending) < window:
+            first = next(starts, None)
+            if first is None:
+                return
+            part = items[first:first + chunk]
+            pending[pool.submit(function, part)] = part
+    fill()
+    try:
+        while pending:
+            if cancel is not None and cancel.is_set():
+                break
+            done, _ = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+            for future in done:
+                handler(pending.pop(future), future.result())   # a worker's exception is raised here
+            fill()
+    finally:
+        for future in pending:
+            future.cancel()
+
+
+def prefetch_sky(points, epochs, cache, source, cancel, workers=0):
+    """Calculate (in worker processes) and store the sky data of points that the cache does not have yet."""
+    todo = [pt for pt in points if cache.get_sky(pt[0], pt[1], epochs, source) is None]
+    if not todo:
+        return
+    workers = workers or default_workers()
+    p = {'epochs': epochs, 'eye': terrain.EYE_HEIGHT_M}
+
+    def store(part, outputs):
+        for (lat, lon), (horizon, classified) in zip(part, outputs):
+            cache.put_horizon(lat, lon, horizon)
+            cache.put_sky(lat, lon, epochs, source, classified)
+    try:
+        _stream(_get_pool(workers), partial(_run_sky, p=p), todo, max(1, min(16, len(todo) // (workers * 4) or 1)),
+                workers * 3, cancel, store)
+    except BrokenProcessPool:
+        shutdown_pool()   # the caller falls back to the serial calculation, point by point
+
+
+def search_cells_parallel(cells, epochs, min_sun, min_earth, side, screen_horizon, screen_mode, cancel, progress,
+                          use_ranges, range_progress, range_result, max_slope, slope_radius_km, horizon_result,
+                          max_sun, max_earth, lunar_stats, lunar_filter, cache, cache_source, workers=0):
+    """The same result as the serial search_cells, evaluated by a pool of processes."""
+    workers = workers or default_workers()
+    heights = global_elevation_stats(cancel)
+    if heights is None:
+        return []
+    min_height, median_height = heights
+    floor = optimistic_horizon_floor(median_height, min_height)
+    if horizon_result:
+        horizon_result(min_height, median_height, floor)
+    p = dict(epochs=epochs, min_sun=min_sun, min_earth=min_earth, max_sun=max_sun, max_earth=max_earth,
+             side=side, screen_horizon=screen_horizon, mode=screen_mode, max_slope=max_slope,
+             slope_radius_km=slope_radius_km, lunar_stats=lunar_stats, lunar_filter=lunar_filter,
+             min_terrain=float(np.min(terrain.dem_km)) * 1000.0, floor=floor, eye=terrain.EYE_HEIGHT_M)
+    pool = _get_pool(workers)
+    window = workers * 3
+    start = time.monotonic()
+    total_cells = len(cells)
+    try:
+        if use_ranges:
+            lat_index = {x: i for i, x in enumerate(sorted({c[0] for c in cells}))}
+            lon_index = {x: i for i, x in enumerate(sorted({c[2] for c in cells}))}
+            blocks = {}
+            for cell in cells:
+                blocks.setdefault((lat_index[cell[0]] // 4, lon_index[cell[2]] // 4), []).append(cell)
+            items = [((min(c[0] for c in b), max(c[1] for c in b), min(c[2] for c in b), max(c[3] for c in b)), b)
+                     for b in blocks.values()]
+            eligible, state = [], {'done': 0}
+
+            def on_blocks(part, flags):
+                for (_bounds, block), ok in zip(part, flags):
+                    state['done'] += len(block)
+                    if ok:
+                        eligible.extend(block)
+                if range_progress:
+                    range_progress(state['done'], total_cells, len(eligible), None)
+            _stream(pool, partial(_run_blocks, p=p), items, max(1, min(16, len(items) // (workers * 4) or 1)),
+                    window, cancel, on_blocks)
+            if cancel is not None and cancel.is_set():
+                return []
+            if range_result:
+                range_result(interval_union((c[0], c[1]) for c in eligible),
+                             interval_union((c[2], c[3]) for c in eligible), len(eligible), total_cells)
+            cells = eligible
+        filtered = completed = total_cells - len(cells)
+        results = []
+
+        def on_cells(part, outputs):
+            nonlocal filtered, completed
+            for cell, (row, screened, item) in zip(part, outputs):
+                completed += 1
+                filtered += bool(screened)
+                if row is not None:
+                    row['slope_deg'] = terrain.compute_slope_deg(row['lat'], row['lon'])   # same source as the table
+                    results.append(row)
+                    if cache is not None and item is not None:
+                        point, horizon_full, classified = item
+                        cache.put_horizon(point[0], point[1], horizon_full)
+                        cache.put_sky(point[0], point[1], epochs, cache_source, classified)
+            if progress:
+                progress(completed, total_cells, len(results), time.monotonic() - start,
+                         part[-1][0], part[-1][2], filtered)
+        _stream(pool, partial(_run_cells, p=p), cells, max(1, min(32, len(cells) // (workers * 8) or 1)),
+                window, cancel, on_cells)
+    except BrokenProcessPool:
+        shutdown_pool()   # the next search starts a fresh pool
+        raise RuntimeError('A search worker process died (out of memory?). Use fewer worker processes.')
+    if progress:
+        progress(completed, total_cells, len(results), time.monotonic() - start, None, None, filtered)
+    return sorted(results, key=lambda r: (min(r['sun_percent'] - min_sun, r['earth_percent'] - min_earth),
+                                          r['sun_percent'] + r['earth_percent']), reverse=True)
+
+
+def _run_sectors(cells, p):
+    """Optimistic Sun / Earth bounds of several sectors: per cell None or (sun %, earth %)."""
+    terrain.EYE_HEIGHT_M = p['eye']
+    epochs, out = p['epochs'], []
+    for cell in cells:
+        center = cell_sample_points(cell, 2)[0]
+        elevation = float(terrain.sample_dem_bilinear(*center))
+        pos = sky.get_positions_nocache(center[1], center[0], (elevation + terrain.EYE_HEIGHT_M) / 1000.0, epochs)
+        margin = min(180.0, (cell[1] - cell[0] + cell[3] - cell[2]) / 2.0 + 2.0)
+        bounds = []
+        for body in ('Sun', 'Earth'):
+            el = np.asarray(pos[body]['el'], dtype=float)
+            radius = np.asarray(pos[body]['radius'], dtype=float)
+            if (el.shape != (len(epochs),) or radius.shape != (len(epochs),) or not np.isfinite(el).all()
+                    or not np.isfinite(radius).all() or np.any(radius < 0)):
+                raise ValueError(f'Invalid {body} ephemeris.')
+            bounds.append(visibility_percent(epochs, el + radius + margin >= p['floor']))
+        ok = bounds[0] + 1e-9 >= p['min_sun'] and bounds[1] + 1e-9 >= p['min_earth']
+        out.append((bounds[0], bounds[1], center) if ok else None)
+    return out
+
+
+def _sectors_parallel(cells, epochs, min_sun, min_earth, floor, cancel, progress, workers):
+    workers = workers or default_workers()
+    p = dict(epochs=epochs, min_sun=min_sun, min_earth=min_earth, floor=floor, eye=terrain.EYE_HEIGHT_M)
+    pool = _get_pool(workers)
+    start = time.monotonic()
+    total = len(cells)
+    results, state = [], {'done': 0, 'filtered': 0}
+
+    def on_cells(part, outputs):
+        for cell, value in zip(part, outputs):
+            state['done'] += 1
+            if value is None:
+                state['filtered'] += 1
+                continue
+            sun, earth, center = value
+            results.append({'kind': 'sector', 'lat': center[0], 'lon': center[1], 'sun_percent': sun,
+                            'earth_percent': earth, 'cell_lat_min': cell[0], 'cell_lat_max': cell[1],
+                            'cell_lon_min': cell[2], 'cell_lon_max': cell[3]})
+        if progress:
+            progress(state['done'], total, len(results), time.monotonic() - start,
+                     part[-1][0], part[-1][2], state['filtered'])
+    try:
+        _stream(pool, partial(_run_sectors, p=p), cells, max(1, min(64, len(cells) // (workers * 8) or 1)),
+                workers * 3, cancel, on_cells)
+    except BrokenProcessPool:
+        shutdown_pool()
+        raise RuntimeError('A search worker process died (out of memory?). Use fewer worker processes.')
+    if progress:
+        progress(state['done'], total, len(results), time.monotonic() - start, None, None, state['filtered'])
+    return sorted(results, key=lambda r: (min(r['sun_percent'] - min_sun, r['earth_percent'] - min_earth),
+                                          r['sun_percent'] + r['earth_percent']), reverse=True)
+
+
 def _search_worker(messages, cancel, cells, epochs, sun, earth, fetch, side, horizon, mode, use_ranges,
                    max_slope=None, slope_radius_km=1.0, use_terrain=True, max_sun=100.0, max_earth=100.0,
-                   lunar_stats=False, lunar_filter=None, cache=None):
+                   lunar_stats=False, lunar_filter=None, cache=None, workers=None):
     def progress(done, total, matches, elapsed, lat, lon, filtered):
         messages.put(('progress', (done, total, matches, elapsed, lat, lon, filtered)))
     try:
@@ -626,9 +979,10 @@ def _search_worker(messages, cancel, cells, epochs, sun, earth, fetch, side, hor
         if use_terrain:
             results = search_cells(cells, epochs, sun, earth, fetch, side, horizon, mode, cancel, progress,
                                    use_ranges, range_progress, range_result, max_slope, slope_radius_km, horizon_result,
-                                   max_sun, max_earth, lunar_stats, lunar_filter, cache)
+                                   max_sun, max_earth, lunar_stats, lunar_filter, cache,
+                                   point_data.DEFAULT_SOURCE, workers)
         else:
-            results = search_optimistic_sectors(cells, epochs, sun, earth, fetch, cancel, progress, horizon_result)
+            results = search_optimistic_sectors(cells, epochs, sun, earth, fetch, cancel, progress, horizon_result, workers)
         messages.put(('done', (results, cancel.is_set())))
     except Exception as error:
         messages.put(('error', str(error)))
@@ -699,10 +1053,15 @@ SECTOR_HIDDEN = STATS_KEYS | {'elevation', 'max_slope', 'slope'}
 FILL_REFRESH_SECONDS = 1.5
 
 
-def _fill_worker(messages, cancel, generation, rows, epochs, fetch, cache, need_stats, need_slope, radius):
+def _fill_worker(messages, cancel, generation, rows, epochs, fetch, cache, need_stats, need_slope, radius, workers=1):
     """Optional columns: statistics from the shared sky data (or calculated and stored), and maximum slopes."""
     total = len(rows)
     try:
+        if need_stats and cache is not None and workers != 1:
+            # Missing sky data is calculated by the worker processes first; the loop below then only reads it.
+            messages.put(('fill_progress', (generation, 0, total)))
+            prefetch_sky([(r['lat'], r['lon']) for r in rows if not r.get('_stats')], epochs, cache,
+                          point_data.DEFAULT_SOURCE, cancel, workers)
         for done, row in enumerate(rows, start=1):
             if cancel.is_set():
                 break
@@ -722,7 +1081,291 @@ def _fill_worker(messages, cancel, generation, rows, epochs, fetch, cache, need_
 
 
 class SearchDialog:
-    """Search engine and results logic; the UI is provided by desktop_ui.SearchPanel."""
+    """Tk-only UI; all horizon and ephemeris work stays in a worker thread."""
+    workers_setting = 0   # worker processes: 0 = automatic, 1 = this thread only (class default: SearchPanel in
+                          # desktop_ui does not call __init__)
+    def __init__(self, parent, fetch, previous=None, on_close=None, existing_points=None, on_apply=None,
+                 cache=None):
+        import tkinter as tk
+        from tkinter import ttk
+        self.tk, self.ttk, self.fetch = tk, ttk, fetch
+        self.cache = cache  # point_data.PointDataCache shared with the comparison (None: no sharing)
+        self.workers_setting = 0       # worker processes: 0 = automatic, 1 = this thread only
+        self._fill_cancel = threading.Event()
+        self._fill_generation = 0
+        self._fill_running = False
+        self._fill_dirty = False
+        self._fill_refreshed = 0.0
+        self._tick = 0
+        self.on_close = on_close
+        # Called when a button wants the viewer to act (show on globe, add points, analyze, clear).
+        # The window stays open; only Close (or the window's own close button) closes it.
+        self.on_apply = on_apply
+        self.existing_points = existing_points or (lambda: [])
+        self._closed = False
+        self.window = tk.Toplevel(parent)
+        self.window.title('Search lunar visibility')
+        self.window.protocol('WM_DELETE_WINDOW', self.close)
+        width = min(1320, max(640, self.window.winfo_screenwidth() - 40))
+        height = min(860, max(520, self.window.winfo_screenheight() - 80))
+        self.window.geometry(f'{width}x{height}')
+        self.messages = queue.Queue()
+        self.cancel = threading.Event()
+        self.worker = None
+        self.timer = None
+        self.results = []
+        self.selected = None
+        self.selected_points = []
+        self.add_to_compare = False
+        self.show_matches = False
+        self.clear_markers = False
+        self.analyze = False
+        self.marker_results = None
+        self.marker_mode = 'Points'
+        self._display_items = []
+        self.last_parameters = None
+        self._refinement_sectors = None
+        self._sort = None              # (column key, descending) of the results table, or None
+        self._cluster_cache = None
+        self.finished = False
+        self.was_cancelled = False
+        shell = ttk.Frame(self.window, padding=(16, 12))
+        shell.pack(fill='both', expand=True)
+        heading = ttk.Frame(shell)
+        heading.pack(fill='x', pady=(0, 10))
+        ttk.Label(heading, text='Visibility search', font=('TkDefaultFont', 16, 'bold')).pack(side='left')
+        ttk.Label(heading, text='  Set criteria, run a search, then inspect the results.').pack(side='left')
+        self.workspace_tabs = None
+        if width < 1000:
+            panes = ttk.Notebook(shell)
+            settings_pane = ttk.Frame(panes, padding=(0, 8))
+            results_pane = ttk.Frame(panes, padding=(0, 8))
+            panes.add(settings_pane, text='Search settings')
+            panes.add(results_pane, text='Results')
+            self.workspace_tabs = panes
+            self.workspace_settings, self.workspace_results = settings_pane, results_pane
+        else:
+            panes = ttk.Panedwindow(shell, orient='horizontal')
+            settings_pane = ttk.Frame(panes, padding=(0, 0, 12, 0), width=420)
+            results_pane = ttk.Frame(panes, padding=(12, 0, 0, 0), width=720)
+            panes.add(settings_pane, weight=0)
+            panes.add(results_pane, weight=1)
+        panes.pack(fill='both', expand=True)
+        ttk.Label(settings_pane, text='SEARCH SETTINGS', font=('TkDefaultFont', 10, 'bold')).pack(anchor='w', pady=(0, 6))
+        now = sky.utc_now()
+        self.f = {}  # name -> Entry
+        self.use_terrain = tk.BooleanVar(master=self.window, value=True)
+        self.lunar_avg = tk.BooleanVar(master=self.window, value=False)
+        self.lunar_sd = tk.BooleanVar(master=self.window, value=False)
+        sections = ttk.Notebook(settings_pane)
+        sections.pack(fill='both', expand=True)
+        pages, page_tabs = [], []
+        for title in ('Basics', 'Area & slope', 'Advanced'):
+            tab = ttk.Frame(sections)
+            page_tabs.append(tab)
+            sections.add(tab, text=title)
+            canvas = tk.Canvas(tab, height=300, highlightthickness=0, borderwidth=0)
+            scroll = ttk.Scrollbar(tab, orient='vertical', command=canvas.yview)
+            canvas.configure(yscrollcommand=scroll.set)
+            scroll.pack(side='right', fill='y')
+            canvas.pack(side='left', fill='both', expand=True)
+            page = ttk.Frame(canvas, padding=(8, 8))
+            window_id = canvas.create_window((0, 0), window=page, anchor='nw')
+            page.bind('<Configure>', lambda event, c=canvas: c.configure(scrollregion=c.bbox('all')))
+            canvas.bind('<Configure>', lambda event, c=canvas, item=window_id: c.itemconfigure(item, width=event.width))
+            pages.append(page)
+        self.settings_tabs, self.area_page = sections, pages[1]
+        self.area_tab = page_tabs[1]
+        for page in pages:
+            page.columnconfigure(0, weight=1)
+
+        def section(title, row, column):
+            box = ttk.LabelFrame(pages[row], text=title, padding=(8, 6))
+            box.grid(row=column, column=0, sticky='ew', pady=(0, 8))
+            box.columnconfigure(1, weight=1)
+            box.columnconfigure(3, weight=1)
+            return box
+
+        def field(box, name, label, value, row, column=0):
+            ttk.Label(box, text=label).grid(row=row, column=column * 2, sticky='w', padx=(0, 5), pady=2)
+            entry = ttk.Entry(box, width=11 if column else 14)
+            entry.insert(0, value)
+            entry.grid(row=row, column=column * 2 + 1, sticky='ew', padx=(0, 10), pady=2)
+            self.f[name] = entry
+
+        time_box = section('Time', 0, 0)
+        field(time_box, 'start', 'Start (UTC)', now.strftime('%Y-%m-%d %H:%M:%S'), 0)
+        field(time_box, 'end', 'End (UTC)', (now + timedelta(days=LUNAR_DAY_DAYS)).strftime('%Y-%m-%d %H:%M:%S'), 1)
+        field(time_box, 'step', 'Step (hours)', '2', 2)
+        visible_box = section('Visible % of the time', 0, 1)
+        field(visible_box, 'min_earth', 'Min Earth', '50', 0, 0)
+        field(visible_box, 'max_earth', 'Max Earth', '100', 0, 1)
+        field(visible_box, 'min_sun', 'Min Sun', '30', 1, 0)
+        field(visible_box, 'max_sun', 'Max Sun', '100', 1, 1)
+        ttk.Label(visible_box, text='Maximums need the terrain search (not used by optimistic sectors).',
+                  wraplength=420).grid(row=2, column=0, columnspan=4, sticky='w')
+        area_box = section('Area', 1, 0)
+        field(area_box, 'spacing', 'Grid spacing (deg)', '10', 0)
+        field(area_box, 'lat', 'Latitude min, max', '-90, 90', 1)
+        field(area_box, 'lon', 'Longitude start, end', '-180, 180', 2)
+        slope_box = section('Slope', 1, 1)
+        field(slope_box, 'max_slope', 'Max slope (deg; blank = off)', '', 0)
+        field(slope_box, 'slope_radius', 'Slope radius (km; 0-20)', '1', 1)
+        lunar_box = section('Lunar-day statistics', 2, 0)
+        self.lunar_avg_check = ttk.Checkbutton(lunar_box, text='Calculate and show average Sun % per lunar day for each point',
+                                               variable=self.lunar_avg, command=self._update_lunar_state)
+        self.lunar_avg_check.grid(row=0, column=0, columnspan=4, sticky='w')
+        self.lunar_sd_check = ttk.Checkbutton(lunar_box, text='Calculate and show its standard deviation',
+                                              variable=self.lunar_sd, command=self._update_lunar_state)
+        self.lunar_sd_check.grid(row=1, column=0, columnspan=4, sticky='w')
+        field(lunar_box, 'lunar_min_avg', 'Min avg Sun %', '', 2, 0)
+        field(lunar_box, 'lunar_max_avg', 'Max avg Sun %', '', 2, 1)
+        field(lunar_box, 'lunar_min_sd', 'Min SD %', '', 3, 0)
+        field(lunar_box, 'lunar_max_sd', 'Max SD %', '', 3, 1)
+        self.lunar_note = ttk.Label(lunar_box, text='Blank limit = no limit. Limits also apply when the columns are hidden.',
+                                    wraplength=470)
+        self.lunar_note.grid(row=4, column=0, columnspan=4, sticky='w')
+        other_box = section('Screening', 2, 1)
+        ttk.Checkbutton(settings_pane, text='Use terrain horizon  (off: candidate clusters)', variable=self.use_terrain, command=self._update_lunar_state
+                        ).pack(anchor='w', before=sections, pady=(0, 6))
+        field(other_box, 'side', 'Samples per side (2-9)', '3', 0)
+        field(other_box, 'horizon', 'Pessimistic horizon (deg)', '2', 1)
+        ttk.Label(other_box, text='Cell screening').grid(row=2, column=0, sticky='w', pady=2)
+        self.screen_mode = ttk.Combobox(other_box, values=('Pessimistic center', 'All cells'), state='readonly', width=14)
+        self.screen_mode.set('Pessimistic center')
+        self.screen_mode.grid(row=2, column=1, sticky='ew', padx=(0, 10), pady=2)
+        ttk.Label(other_box, text='Optimistic range estimate').grid(row=3, column=0, sticky='w', pady=2)
+        self.range_mode = ttk.Combobox(other_box, values=('On', 'Off'), state='readonly', width=14)
+        self.range_mode.set('On')
+        self.range_mode.grid(row=3, column=1, sticky='ew', pady=2)
+        field(other_box, 'workers', 'Worker processes (0 = auto, 1 = off)', '0', 4)
+        for name in ('start', 'end'):
+            self.f[name].bind('<KeyRelease>', lambda event: self._update_lunar_state())
+            self.f[name].bind('<FocusOut>', lambda event: self._update_lunar_state())
+        self._update_lunar_state()
+        ttk.Label(settings_pane, text='Screening is approximate and can miss suitable cells.',
+                  wraplength=390).pack(anchor='w', pady=(8, 3))
+        controls = ttk.Frame(settings_pane)
+        controls.pack(fill='x', before=sections, pady=(3, 0))
+        self.start_button = ttk.Button(controls, text='Start search', command=self.start)
+        self.start_button.pack(side='left')
+        self.cancel_button = ttk.Button(controls, text='Cancel search', command=self.cancel.set, state='disabled')
+        self.cancel_button.pack(side='left', padx=6)
+        self.progress = ttk.Progressbar(settings_pane, mode='determinate')
+        self.progress.pack(fill='x', before=sections, pady=(8, 3))
+        self.status = ttk.Label(settings_pane, text='Choose criteria and start the search.', wraplength=380)
+        self.status.pack(anchor='w', before=sections)
+        self._details_open = False
+        self.details_toggle = ttk.Button(settings_pane, text='Show calculation details', command=self._toggle_status_details)
+        self.details_toggle.pack(anchor='w', before=sections, pady=(6, 3))
+        self.details_panel = ttk.Frame(settings_pane)
+        self.fill_label = ttk.Label(self.details_panel, text='', wraplength=380)
+        self.fill_label.pack(anchor='w')
+        self.cache_label = ttk.Label(self.details_panel, text='', wraplength=380)
+        self.cache_label.pack(anchor='w')
+        self.range_label = ttk.Label(self.details_panel, text='', wraplength=380)
+        self.range_label.pack(anchor='w')
+        self.horizon_label = ttk.Label(self.details_panel, text='', wraplength=380)
+        self.horizon_label.pack(anchor='w')
+        frame = results_pane
+        ttk.Label(frame, text='RESULTS', font=('TkDefaultFont', 10, 'bold')).pack(anchor='w')
+        ttk.Label(frame, text='Select with Shift or Ctrl. Click a column heading to sort.',
+                  wraplength=600).pack(anchor='w', pady=(2, 6))
+        mode_frame = ttk.Frame(frame)
+        mode_frame.pack(fill='x', pady=(4, 0))
+        ttk.Label(mode_frame, text='Results:').pack(side='left')
+        self.view_mode = ttk.Combobox(mode_frame, values=('Points', 'Clusters'), state='readonly', width=14)
+        self.view_mode.set('Points')
+        self.view_mode.pack(side='left', padx=5)
+        self.view_mode.bind('<<ComboboxSelected>>', lambda event: self.populate_results('Showing'))
+        columns = tuple(spec[0] for spec in COLUMN_SPECS)
+        self._columns = columns
+        self._heading_labels = {spec[0]: spec[1] for spec in COLUMN_SPECS}
+        self.column_vars = {key: tk.BooleanVar(master=self.window, value=key in DEFAULT_COLUMNS) for key in columns}
+        table_frame = ttk.Frame(frame)
+        table_frame.pack(fill='both', expand=True, pady=8)
+        self.table_frame = table_frame
+        self.table = ttk.Treeview(table_frame, columns=columns, show='headings', height=8, selectmode='extended')
+        scrollbar = ttk.Scrollbar(table_frame, orient='vertical', command=self.table.yview)
+        h_scrollbar = ttk.Scrollbar(table_frame, orient='horizontal', command=self.table.xview)
+        self.table.configure(yscrollcommand=scrollbar.set, xscrollcommand=h_scrollbar.set)
+        scrollbar.pack(side='right', fill='y')
+        h_scrollbar.pack(side='bottom', fill='x')
+        for spec in COLUMN_SPECS:
+            self.table.column(spec[0], width=spec[3], minwidth=spec[3], stretch=False, anchor='center')
+        self._refresh_headings()
+        self.table.pack(side='left', fill='both', expand=True)
+        self.table.bind('<Double-1>', self.view_selected)
+        self.table.bind('<Control-a>', self.select_all)
+        self.table.bind('<Control-A>', self.select_all)
+        buttons = ttk.Frame(frame)
+        # Pack actions before the expanding table so small windows do not clip them.
+        buttons.pack(fill='x', before=table_frame, pady=(3, 0))
+        actions = ttk.Frame(buttons)
+        actions.pack(fill='x')
+        more_actions = ttk.Frame(buttons)
+        more_actions.pack(fill='x', pady=(3, 0))
+        self.view_button = ttk.Button(actions, text='View selected', command=self.view_selected, state='disabled')
+        self.view_button.pack(side='left')
+        self.select_all_button = ttk.Button(actions, text='Select all', command=self.select_all, state='disabled')
+        self.select_all_button.pack(side='left', padx=5)
+        self.add_button = ttk.Button(actions, text='Add selected', command=self.add_selected, state='disabled')
+        self.add_button.pack(side='left')
+        self.analyze_button = ttk.Button(actions, text='Compare selected', command=self.analyze_selected, state='disabled')
+        self.analyze_button.pack(side='left', padx=5)
+        self.marks_button = ttk.Button(more_actions, text='Show all on globe', command=self.show_all, state='disabled')
+        self.marks_button.pack(side='left', padx=5)
+        self.sector_button = ttk.Button(more_actions, text='Search selected cluster', command=self.refine_selected_sector, state='disabled')
+        self.sector_button.pack(side='left', padx=5)
+        self.export_button = ttk.Button(more_actions, text='Save CSV', command=self.export, state='disabled')
+        self.export_button.pack(side='left', padx=5)
+        ttk.Button(more_actions, text='Close', command=self.close).pack(side='right')
+        ttk.Button(more_actions, text='Clear markers', command=self.clear).pack(side='right', padx=5)
+        # Column choice: a collapsible set of check boxes, in sections, right above the table heading.
+        columns_bar = ttk.Frame(frame)
+        columns_bar.pack(fill='x', before=table_frame)
+        self.columns_toggle = ttk.Button(columns_bar, text='Choose columns', command=self._toggle_column_panel)
+        self.columns_toggle.pack(side='left')
+        ttk.Label(columns_bar, text='  Optional columns are calculated after the search.').pack(side='left')
+        self.columns_panel = tk.Toplevel(self.window)
+        self.columns_panel.title('Result columns')
+        self.columns_panel.withdraw()
+        self.columns_panel.protocol('WM_DELETE_WINDOW', self._toggle_column_panel)
+        column_content = ttk.Frame(self.columns_panel, padding=14)
+        column_content.pack(fill='both', expand=True)
+        ttk.Label(column_content, text='Result columns', font=('TkDefaultFont', 14, 'bold')).pack(anchor='w')
+        ttk.Label(column_content, text='Choose the information to show in the table.').pack(anchor='w', pady=(2, 8))
+        column_tabs = ttk.Notebook(column_content)
+        column_tabs.pack(fill='both', expand=True)
+        self._columns_panel_open = False
+        groups = []
+        for spec in COLUMN_SPECS:
+            if spec[0] not in PERCENT_COLUMNS:
+                continue
+            if spec[2] not in groups:
+                groups.append(spec[2])
+        for number, group in enumerate(groups):
+            box = ttk.Frame(column_tabs, padding=10)
+            tab_name = {'Visible % of the interval': 'Visibility', 'Sun per lunar day': 'Lunar day',
+                        'Centre above the horizon': 'Above horizon',
+                        'Directions (samples above the horizon)': 'Directions'}.get(group, group)
+            column_tabs.add(box, text=tab_name)
+            members = [spec for spec in COLUMN_SPECS if spec[2] == group and spec[0] in PERCENT_COLUMNS]
+            for index, spec in enumerate(members):
+                ttk.Checkbutton(box, text=spec[1], variable=self.column_vars[spec[0]],
+                                command=self._columns_changed).grid(row=index // 2, column=index % 2, sticky='w', padx=6, pady=3)
+        ttk.Button(column_content, text='Done', command=self._toggle_column_panel).pack(anchor='e', pady=(10, 0))
+        self.window.bind('<Escape>', lambda event: self.close())
+        if previous is not None:
+            self.restore(previous)
+        # The Tk root is withdrawn and is not the VTK window. Making this
+        # dialog transient or grabbing it can leave it hidden behind VTK.
+        self.window.deiconify()
+        self.window.update_idletasks()
+        self.window.lift()
+        self.window.focus_force()
+        self.poll()
+
     @staticmethod
     def _pair(text):
         values = text.replace(';', ',').split(',')
@@ -830,7 +1473,7 @@ class SearchDialog:
         self.fill_label.configure(text=f'Calculating optional columns for {len(rows):,} points (from the shared data where stored)...')
         threading.Thread(target=_fill_worker, daemon=True,
                          args=(self.messages, self._fill_cancel, self._fill_generation, rows, epochs, self.fetch,
-                               self.cache, need_stats, need_slope, radius)).start()
+                               self.cache, need_stats, need_slope, radius, self.workers_setting)).start()
 
     def _stop_fill(self):
         self._fill_cancel.set()
@@ -883,6 +1526,10 @@ class SearchDialog:
             epochs = sky.time_samples(start, stop, step_hours * 60)
             if len(epochs) < 2:
                 raise ValueError('End time must be later than start time.')
+            workers_value = float((get('workers') if 'workers' in self.f else '0') or 0)
+            if not np.isfinite(workers_value) or not workers_value.is_integer() or not 0 <= workers_value <= 128:
+                raise ValueError('Worker processes must be an integer from 0 (automatic) to 128.')
+            workers = int(workers_value)
             limits = np.array([min_sun, max_sun, min_earth, max_earth])
             if not np.isfinite(limits).all() or np.any(limits < 0) or np.any(limits > 100):
                 raise ValueError('Visibility limits must be between 0 and 100 percent.')
@@ -915,6 +1562,7 @@ class SearchDialog:
             self.status.configure(text=str(error))
             return
         self._stop_fill()
+        self.workers_setting = workers
         self.cancel.clear()
         self._refinement_sectors = None
         self.results = []
@@ -950,7 +1598,7 @@ class SearchDialog:
         self.worker = threading.Thread(target=_search_worker,
             args=(self.messages, self.cancel, cells, epochs, min_sun, min_earth, self.fetch, side, horizon, mode,
                   range_mode == 'On', max_slope, radius, use_terrain, max_sun, max_earth, lunar_avg, lunar_filter,
-                  self.cache),
+                  self.cache, workers),
             daemon=True)
         self.worker.start()
 

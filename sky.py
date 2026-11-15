@@ -237,13 +237,34 @@ def preload(data_dir=None):
     _load_resources(str(folder.resolve()))
 
 
+# Converting hundreds of datetimes to Skyfield times costs milliseconds per point; the same epochs are used for
+# every point of a search, so the last few conversions are kept.
+_TIMES_CACHE = OrderedDict()
+_TIMES_LOCK = Lock()
+
+
+def _times_for(ts, epochs):
+    key = (id(ts), tuple(epochs))
+    with _TIMES_LOCK:
+        hit = _TIMES_CACHE.get(key)
+        if hit is not None:
+            _TIMES_CACHE.move_to_end(key)
+            return hit
+    times = ts.from_datetimes(epochs)
+    value = (times, np.atleast_1d(times.tdb))
+    with _TIMES_LOCK:
+        _TIMES_CACHE[key] = value
+        while len(_TIMES_CACHE) > 4:
+            _TIMES_CACHE.popitem(last=False)
+    return value
+
+
 def _calculate_positions(lon, lat, altitude_km, epochs, data_dir=None, progress=None):
     folder = Path(data_dir) if data_dir else Path(__file__).resolve().parent / 'skyfield_data'
     if progress is not None:
         progress("Loading Skyfield data (first request may download files)")
     ts, eph, constants, frames = _load_resources(str(folder.resolve()))
-    times = ts.from_datetimes(epochs)
-    dates = np.atleast_1d(times.tdb)
+    times, dates = _times_for(ts, epochs)
     if np.any((dates < 2287184.5) | (dates > 2688976.5)):
         raise ValueError("DE440 lunar orientation covers 1549-12-31 to 2650-01-25 TDB.")
     result = {name: {key: np.empty(len(dates)) for key in ("az", "el", "radius")}
@@ -276,6 +297,12 @@ def _calculate_positions(lon, lat, altitude_km, epochs, data_dir=None, progress=
 _POSITION_CACHE = OrderedDict()
 _POSITION_CACHE_LOCK = Lock()
 _POSITION_CACHE_LIMIT = 100_000
+
+
+def get_positions_nocache(lon, lat, altitude_km, epochs, data_dir=None):
+    """Like get_positions without the per-sample cache. For a search over many different sites that cache never
+    hits, and its per-sample Python loops cost more than they save."""
+    return _calculate_positions(lon, lat, altitude_km, list(epochs), data_dir)
 
 
 def get_positions(lon, lat, altitude_km, epochs, data_dir=None, progress=None):
