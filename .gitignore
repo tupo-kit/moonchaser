@@ -3,4 +3,3 @@ __pycache__
 *.jpg
 skyfield_data
 terrain_cache
-.venv
