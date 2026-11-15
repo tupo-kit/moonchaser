@@ -39,6 +39,7 @@ Dependencies: terrain <- sky <- compare <- point_data <- visibility_search, hud,
 
 import argparse
 import queue
+import signal
 import sys
 import threading
 import time
@@ -93,17 +94,19 @@ class MoonWindow(GlobeMixin, HudMixin):
         self.grid_caption.SetVisibility(False)
         self.points_caption.SetVisibility(False)
         self._map_label.SetVisibility(not expanded and settings['map_status'] and self._desktop_shell is None)
-        self.horizon.SetVisibility(not self._terrain_view and settings['horizon_outline'])
+        self.horizon.SetVisibility(not self._terrain_view and settings['horizon_outline'] and not getattr(self, '_observer_suppressed', False))
+        if getattr(self, '_observer_suppressed', False):
+            self.observer.SetVisibility(False)
         if self._selection_actor is not None:
             self._selection_actor.SetVisibility(not self._terrain_view and not expanded)
         self.legend_button.SetVisibility(False)
         self.stats.SetVisibility(expanded and self._desktop_shell is None)
-        inset = expanded or settings['horizon_inset']
+        inset = expanded or (settings['horizon_inset'] and not getattr(self, '_observer_suppressed', False))
         x0, x1, y0, y1 = self._plot_box
         self._horizon_map_button.SetPosition(x1, y1 + (0.07 if expanded else 0.018))
         self._horizon_map_button.SetVisibility(inset and not (expanded and self._desktop_shell is not None))
         self._horizon_close.SetPosition(self._horizon_preview_rect[2] - 0.025, self._horizon_preview_rect[3] - 0.035)
-        self._horizon_close.SetVisibility(inset and not expanded)
+        self._horizon_close.SetVisibility(False)
         for actor in (self.profile_background, self.profile_title, self.profile, self.profile_axes, *self.profile_labels):
             actor.SetVisibility(inset)
         if expanded and self._desktop_shell is not None:
@@ -189,6 +192,7 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._sky_status = "Waiting for Sun / Earth positions"
         self._now_mode = True
         self._shown_sources = {"Skyfield": True, "JPL": True}
+        self._horizon_bodies = {"Sun": True, "Earth": True}
         self._legend_expanded = True
         self._saved_interval = load_interval()
         self._sky_method = self._saved_interval[4] if self._saved_interval else "Skyfield"
@@ -198,6 +202,8 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._search_fill_actor = None
         self._search_fill_picker = None
         self._search_fill_rows = []
+        self._cluster_occupancy = None
+        self._observer_suppressed = False
         self._search_point_picker = None
         self._search_rows = []
         self._search_selected = None
@@ -1020,12 +1026,16 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._search_actor = self._search_outline_actor = self._search_point_picker = None
         self._search_fill_actor = self._search_fill_picker = None
         self._search_fill_rows = []
+        self._cluster_occupancy = None
         self._search_rows = list(results)
         if not results:
+            self.refresh_search_area_mask()
             return
         if mode == 'Clusters':
             self.show_search_cluster_fills(results)
+            self.refresh_search_area_mask()
             return
+        self.refresh_search_area_mask()
         if results[0].get('kind') == 'sector':
             return  # Candidate clusters are areas, not verified point markers.
         lat = np.radians([item['lat'] for item in results])
@@ -1082,7 +1092,8 @@ class MoonWindow(GlobeMixin, HudMixin):
             delta = (lon_centers - (lon0 + lon1) / 2 + 180) % 360 - 180
             cs = np.flatnonzero(np.abs(delta) < half_lon + 0.25 - 1e-10)
             owners[np.ix_(rs, cs)] = index
-        rr, cc = np.nonzero(owners >= 0)
+        self._cluster_occupancy = owners >= 0
+        rr, cc = np.nonzero(self._cluster_occupancy)
         if not len(rr):
             return
         a = rr * (cols + 1) + cc
@@ -1252,6 +1263,9 @@ class MoonWindow(GlobeMixin, HudMixin):
         return lat, lon
 
     def select_location(self, lat, lon, render=True, extend_selection=False):
+        self._observer_suppressed = False
+        if not self._terrain_view:
+            self.observer.SetVisibility(True)
         from vtk.util.numpy_support import numpy_to_vtk
 
         self._search_selected = None
@@ -1468,7 +1482,21 @@ class MoonWindow(GlobeMixin, HudMixin):
             if self._desktop_shell is not None:
                 self._desktop_shell.refresh_points()
             return
+        removed = [old for old in self._points if not any(same_point(old, current) for current in points)]
         self._points = points
+        if removed:
+            def was_removed(point):
+                return any(same_point(point, old) for old in removed)
+            self._selected_locations = [point for point in self._selected_locations if not was_removed(point)]
+            self.refresh_selection_marks()
+            if was_removed((self.lat, self.lon)):
+                self._observer_suppressed = True
+                self.observer.SetVisibility(False)
+            if self._search_actor is not None:
+                remaining = [row for row in self._search_rows if not was_removed((row['lat'], row['lon']))]
+                self.show_visibility_markers(remaining, mode='Points')
+            if self._search_selected is not None and was_removed((self._search_selected['lat'], self._search_selected['lon'])):
+                self._search_selected = None
         self._points_note = ""
         self.points_changed()
 
@@ -1606,13 +1634,19 @@ class MoonWindow(GlobeMixin, HudMixin):
         self.draw_search_area((lat0, lat1, lon0, lon1))
         if commit and self._desktop_shell is not None:
             panel = self._desktop_shell.search
-            panel._refinement_sectors = None
             for field, value in ((panel.lat_min, lat0), (panel.lat_max, lat1),
                                  (panel.lon_min, lon0), (panel.lon_max, lon1)):
                 field.setText(f'{value:.6f}'.rstrip('0').rstrip('.'))
             self._desktop_shell.finish_area_tool()
             self._desktop_shell.show_panel('search')
             panel.criteria_scroll.ensureWidgetVisible(panel.area_box)
+
+    def refresh_search_area_mask(self):
+        actor = getattr(self, '_area_fill_actor', None)
+        bounds = getattr(self, '_area_bounds', None)
+        if actor is not None and bounds is not None and actor.GetVisibility():
+            self._area_bounds = None
+            self.draw_search_area(bounds)
 
     def draw_search_area(self, bounds):
         """Draw the selected lat/lon area on the globe using the existing surface mesh."""
@@ -1650,6 +1684,10 @@ class MoonWindow(GlobeMixin, HudMixin):
         delta = (lon_centers - (lon0 + lon1) / 2 + 180) % 360 - 180
         cc = np.flatnonzero(np.abs(delta) < (lon1 - lon0) / 2 + .25 - 1e-10)
         grid_r, grid_c = np.meshgrid(rr, cc, indexing='ij')
+        occupancy = getattr(self, '_cluster_occupancy', None)
+        if occupancy is not None:
+            keep = ~occupancy[grid_r, grid_c]
+            grid_r, grid_c = grid_r[keep], grid_c[keep]
         base = grid_r.ravel() * (cols + 1) + grid_c.ravel()
         quads = np.column_stack((base, base + cols + 1, base + cols + 2, base + 1)).astype(np.int64)
         cells = self.vtk.vtkCellArray()
@@ -1673,15 +1711,6 @@ class MoonWindow(GlobeMixin, HudMixin):
 
     def pick(self, x, y, select_new=False, extend=False):
         width, height = self.window.GetSize()
-        close_pos = self._horizon_close.GetPosition()
-        close_size = [0.0, 0.0]
-        self._horizon_close.GetSize(self.renderer, close_size)
-        if (not self._graph_expanded and self._horizon_close.GetVisibility()
-                and close_pos[0]*width-6 <= x <= close_pos[0]*width+close_size[0]+6
-                and close_pos[1]*height-6 <= y <= close_pos[1]*height+close_size[1]+6):
-            self._overlay_settings['horizon_inset'] = False
-            self.window.Render()
-            return
         if self._horizon_map_button.GetVisibility():
             px, py = self._horizon_map_button.GetPosition()
             size = [0.0, 0.0]
@@ -1715,7 +1744,12 @@ class MoonWindow(GlobeMixin, HudMixin):
                        "stats_mode": self.toggle_stats_mode}
             for name, (left, bottom, right, top) in self._controls.items():
                 if left <= nx <= right and bottom <= ny <= top:
-                    if name.startswith("vis:"):  # "vis:<panel>:<point index>": point on/off in the combined graphs
+                    if name.startswith('notes:'):
+                        key = name.split(':', 1)[1]
+                        self._graph_notes_open[key] = not self._graph_notes_open[key]
+                        self.apply_layout()
+                        self.window.Render()
+                    elif name.startswith("vis:"):
                         self.toggle_point_visibility(int(name.rsplit(":", 1)[1]))
                     else:
                         actions[name]()
@@ -1740,12 +1774,14 @@ class MoonWindow(GlobeMixin, HudMixin):
         # Handle the window-manager close button (Escape no longer quits).
         exit_observer = self.interactor.AddObserver(
             "ExitEvent", lambda obj, event: obj.SetDone(True))
+        previous_sigint = signal.signal(signal.SIGINT, signal.SIG_DFL)
         try:
             if qt_app is not None:
                 qt_app.exec() if hasattr(qt_app, 'exec') else qt_app.exec_()
             else:
                 run_responsive_event_loop(self.interactor)
         finally:
+            signal.signal(signal.SIGINT, previous_sigint)
             self.interactor.RemoveObserver(exit_observer)
             self._sky_stop.set()
             if self._sky_timer is not None:

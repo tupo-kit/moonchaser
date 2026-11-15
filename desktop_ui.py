@@ -8,6 +8,8 @@ import threading
 import time
 from datetime import timedelta
 
+import numpy as np
+
 # QVTK's X11 render window needs a real X11 window id. Under native Wayland Qt
 # hands out a pointer-sized id, and VTK fails with "The result is out of range"
 # followed by an X BadWindow error. So on a Wayland session Qt must run through
@@ -33,6 +35,7 @@ vtkmodules.qt.PyQtImpl = QT_BINDING
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 
 import compare
+import hud
 import sky
 import terrain
 import visibility_search as search
@@ -65,6 +68,10 @@ QLabel#error { color: #ff8f85; }
 QPushButton, QToolButton { background: #222e40; border: 1px solid #34445a; border-radius: 6px; padding: 0 12px; min-height: 30px; color: #e6edf5; }
 QPushButton:hover, QToolButton:hover { background: #2b3a50; }
 QPushButton:pressed, QPushButton:checked, QToolButton:checked { background: #2e3c50; }
+QToolButton:checked { background: #446078; border-color: #79a6c1; }
+QFrame#timeline { background: #111a29; border: 1px solid #293951; border-radius: 7px; }
+QFrame#timeline QSlider::groove:horizontal { height: 6px; border: 1px solid #42526a; background: #273448; border-radius: 3px; }
+QFrame#timeline QSlider::handle:horizontal { background: #27bbd0; border: 2px solid #e6f8ff; width: 12px; margin: -5px 0; border-radius: 3px; }
 QPushButton:disabled { color: #5f6f83; background: #1c2635; border-color: #26334a; }
 QPushButton::menu-indicator { image: none; width: 0; }
 QPushButton#primary { background: #2bb5c5; border-color: #2bb5c5; color: #06222a; font-weight: 600; }
@@ -93,10 +100,12 @@ QFrame#card { background: #1a2433; border: 1px solid #2e3c50; border-radius: 8px
 QFrame#barTop { border-top: 1px solid #26334a; }
 QFrame#results { background: #1a2433; border-top: 1px solid #26334a; }
 QFrame#topBar { border-bottom: 1px solid #26334a; }
-QFrame#analysisHeader { background: #111a29; border: 1px solid #293951; border-radius: 7px; }
+QFrame#analysisHeader { background: #111a29; border: 1px solid #293951; border-top-left-radius: 7px; border-top-right-radius: 7px; border-bottom-left-radius: 0px; border-bottom-right-radius: 0px; }
 QLineEdit#pointSearch:focus { border-color: #d8ac4e; }
 QFrame#tables { background: #131b28; border-top: 1px solid #26334a; }
 QFrame#staleBox[stale="true"] { background: #3a2f14; border: 1px solid #7a6220; border-radius: 8px; }
+QFrame#staleBox[stale="empty"] { background: #222c39; border: 1px solid #465568; border-radius: 8px; }
+QFrame#staleBox[stale="empty"] QLabel#warning { color: #b0bfd0; }
 QLabel#warning { color: #f5e3a8; }
 QTableWidget { background: #1a2433; alternate-background-color: #1e2a3b; border: 0; outline: 0; }
 QTableWidget::item { padding: 0 10px; }
@@ -338,7 +347,21 @@ class Tree(QtWidgets.QTreeWidget):
     def get_children(self):
         return tuple(str(self.topLevelItem(i).data(0, Qt.UserRole)) for i in range(self.topLevelItemCount()))
     def delete(self, *ids):
-        if ids: self.clear()
+        if ids: self.clear_rows()
+    def clear_rows(self):
+        previous = self.blockSignals(True)
+        try:
+            self.clear()
+        finally:
+            self.blockSignals(previous)
+    def select_first(self, count):
+        if count <= 0:
+            self.clearSelection()
+            return
+        model = self.selectionModel()
+        first, last = self.model().index(0, 0), self.model().index(count - 1, self.columnCount() - 1)
+        selection = QtCore.QItemSelection(first, last)
+        model.select(selection, QtCore.QItemSelectionModel.ClearAndSelect | QtCore.QItemSelectionModel.Rows)
     def tag_configure(self, tag, **kw):
         if 'foreground' in kw:
             color = QtGui.QColor(kw['foreground'])
@@ -353,6 +376,8 @@ class Tree(QtWidgets.QTreeWidget):
         for i in range(1, len(self.keys)):
             if self.keys[i] != 'cell': item.setTextAlignment(i, Qt.AlignRight | Qt.AlignVCenter)
         self.addTopLevelItem(item)
+    def selection_count(self):
+        return sum(item.bottom() - item.top() + 1 for item in self.selectionModel().selection())
     def selection(self):
         # Item ids are display row indices, so avoid scanning the entire table.
         return tuple(sorted((str(item.data(0, Qt.UserRole)) for item in self.selectedItems()), key=int))
@@ -468,7 +493,7 @@ class SearchPanel(search.SearchDialog):
         self.results, self.selected, self.selected_points = [], None, []
         self.add_to_compare = self.show_matches = self.clear_markers = self.analyze = False
         self.marker_results, self.marker_mode = None, 'Points'
-        self._display_items, self.last_parameters, self._refinement_sectors = [], None, None
+        self._display_items, self.last_parameters = [], None
         self._sort = self._cluster_cache = None
         self.finished = self.was_cancelled = False
         self._pairing = False
@@ -736,8 +761,8 @@ class SearchPanel(search.SearchDialog):
         self.columns_button.setObjectName('ghost')
         self.columns_button.clicked.connect(self._show_columns)
         bar.addWidget(self.columns_button)
-        selected = lambda: bool(self.table.selection())
-        one = lambda: len(self.table.selection()) == 1
+        selected = lambda: self.table.selectionModel().hasSelection()
+        one = lambda: self.table.selection_count() == 1
         compare = Button('Analyze')
         compare.clicked.connect(self.analyze_selected)
         add = Button('Add to points')
@@ -753,15 +778,14 @@ class SearchPanel(search.SearchDialog):
         self.collapse_button.clicked.connect(lambda: self.set_results_collapsed(not self.results_collapsed))
         for widget in (compare, add, more, self.collapse_button): bar.addWidget(widget)
         self.analyze_button, self.add_button = Gate(compare, selected), Gate(add, selected)
-        self.view_button = self._menu_action('View selected', self.view_selected, selected)
+        self.view_button = self._menu_action('Show selected on globe', self.show_selected, selected)
         self.select_all_button = self._menu_action('Select all', self.select_all)
-        self.marks_button = self._menu_action('Show on globe', self.show_all)
-        self.sector_button = self._menu_action('Refine in Precise', self.refine_selected_sector, one)
+        self.marks_button = self._menu_action('Show all on globe', self.show_all)
         self.more_menu.addSeparator()
         self.export_button = self._menu_action('Save CSV', self.export)
         self.more_menu.addAction('Clear markers', self.clear)
         self.gates = [self.analyze_button, self.add_button, self.view_button, self.select_all_button,
-                      self.marks_button, self.sector_button, self.export_button]
+                      self.marks_button, self.export_button]
         root.addWidget(header)
         self._columns = tuple(spec[0] for spec in search.COLUMN_SPECS)
         self._heading_labels = {spec[0]: spec[1] for spec in search.COLUMN_SPECS}
@@ -821,7 +845,7 @@ class SearchPanel(search.SearchDialog):
         clustered = self.view_mode.get() == 'Clusters'
         total = len(self._clusters()) if clustered else len(self.results)
         noun = 'cluster' if clustered else 'point'
-        selected = len(self.table.selection())
+        selected = self.table.selection_count()
         self.count_label.setText(counted(total, noun) + (f' · {selected} selected' if selected else ''))
 
     def populate_results(self, label):
@@ -916,11 +940,6 @@ class SearchPanel(search.SearchDialog):
         if path:
             if not path.lower().endswith('.csv'): path += '.csv'
             self.export_to(path)
-
-    def refine_selected_sector(self):
-        super().refine_selected_sector()
-        if self._refinement_sectors is not None:
-            self.criteria_scroll.ensureWidgetVisible(self.area_box)
 
     def close(self):
         if self._closed: return
@@ -1055,7 +1074,7 @@ class TimePanel(QtWidgets.QWidget):
 
     def analyze_state(self):
         if not self._has_analysis_points():
-            return 'Select points to analyze', False
+            return ('Update analysis' if self.shell.has_analysis() else 'Select points to analyze'), False
         if self.running():
             return 'Analyzing…', False
         if self.stale_reasons():
@@ -1065,8 +1084,7 @@ class TimePanel(QtWidgets.QWidget):
 
     def _has_analysis_points(self):
         owner = self.owner
-        return bool(owner.analysis_points() or
-                    (owner._graph_expanded and owner._compare_points))
+        return bool(owner.analysis_points())
 
     def sync(self, *_):
         available = self._has_analysis_points()
@@ -1074,12 +1092,18 @@ class TimePanel(QtWidgets.QWidget):
             widget.setEnabled(available)
             widget.setToolTip('' if available else 'Add and select at least one point to use analysis options.')
         reasons = self.stale_reasons()
-        self.banner.setVisible(bool(reasons))
-        self.banner.setText('<b>Results are out of date.</b> ' + ' '.join(reasons))
-        self.box.setProperty('stale', bool(reasons))
-        self.box.style().unpolish(self.box)
-        self.box.style().polish(self.box)
-        margin = 12 if reasons else 0
+        empty = bool(not available and self.shell.has_analysis())
+        self.banner.setVisible(bool(reasons) or empty)
+        if empty:
+            self.banner.setText('Previous results are shown. No points are currently selected for a new analysis.')
+        else:
+            self.banner.setText('<b>Results are out of date.</b> ' + ' '.join(reasons))
+        box_state = 'empty' if empty else bool(reasons)
+        if self.box.property('stale') != box_state:
+            self.box.setProperty('stale', box_state)
+            self.box.style().unpolish(self.box)
+            self.box.style().polish(self.box)
+        margin = 12 if reasons or empty else 0
         self.box_layout.setContentsMargins(margin, margin, margin, margin)
         text, enabled = self.analyze_state()
         self.apply_button.setText(text)
@@ -1157,6 +1181,10 @@ class GraphPointRow(QtWidgets.QFrame):
         row.addWidget(self.horizon)
 
     def sync(self, drawn, current, ready):
+        state = (drawn, current, ready)
+        if getattr(self, "_last_sync_state", None) == state:
+            return
+        self._last_sync_state = state
         for button, value in ((self.drawn, drawn), (self.horizon, current)):
             button.blockSignals(True)
             button.setChecked(value)
@@ -1396,17 +1424,18 @@ class TopBar(QtWidgets.QFrame):
     def sync(self):
         shell = self.shell
         analysis = shell.has_analysis()
-        self.tools.setEnabled(not shell.owner._graph_expanded)
-        shell.layer_button.setEnabled(not shell.owner._graph_expanded)
+        self.tools.setVisible(not shell.owner._graph_expanded)
+        shell.coord_field.setVisible(not shell.owner._graph_expanded)
+        shell.layer_button.setVisible(not shell.owner._graph_expanded)
         self.summary.setText(shell.analysis_summary() if analysis and shell.owner._graph_expanded else '')
         self.export.setEnabled(shell.tables.shown)
         self.export.setToolTip('' if shell.tables.shown else 'Tables appear when two or more points are analyzed.')
 
 
 class AnalysisHeader(QtWidgets.QFrame):
-    """Fixed summary and controls above the scrolling analysis graphs."""
-    def __init__(self, shell):
-        super().__init__()
+    """Horizon graph header, positioned within the scrolling viewport."""
+    def __init__(self, shell, parent=None):
+        super().__init__(parent)
         self.shell = shell
         self.setObjectName('analysisHeader')
         root = QtWidgets.QVBoxLayout(self)
@@ -1423,13 +1452,21 @@ class AnalysisHeader(QtWidgets.QFrame):
         values.addStretch(1)
         root.addLayout(values)
         controls = QtWidgets.QHBoxLayout()
-        self.source = QtWidgets.QCheckBox('Skyfield')
-        self.source.toggled.connect(self._toggle_source)
-        controls.addWidget(self.source)
-        self.layer = QtWidgets.QComboBox()
-        for label, mode in (('Horizon: Color', 'Color'), ('Horizon: Terrain', 'Elevation'), ('Horizon: Slope', 'Slope')):
-            self.layer.addItem(label, mode)
-        self.layer.currentIndexChanged.connect(self._layer_changed)
+        self.body_checks = {}
+        for name in ('Sun', 'Earth'):
+            check = Check('Show ' + name)
+            check.toggled.connect(lambda checked, body=name: self._toggle_body(body, checked))
+            controls.addWidget(check)
+            self.body_checks[name] = check
+        self.layer = QtWidgets.QToolButton()
+        self.layer.setIcon(line_icon('layers'))
+        self.layer.setIconSize(QtCore.QSize(18, 18))
+        self.layer.setToolTip('Choose horizon layer')
+        self.layer.setAccessibleName('Choose horizon layer')
+        self.layer.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.layer_menu = QtWidgets.QMenu(self.layer)
+        self.layer_menu.aboutToShow.connect(self._populate_layers)
+        self.layer.setMenu(self.layer_menu)
         controls.addWidget(self.layer)
         controls.addStretch(1)
         self.timestamp = QtWidgets.QLabel('')
@@ -1444,20 +1481,30 @@ class AnalysisHeader(QtWidgets.QFrame):
         root.addLayout(controls)
         self.hide()
 
-    def _toggle_source(self, checked):
+    def _toggle_body(self, body, checked):
         owner = self.shell.owner
-        if owner is not None:
-            source = sky.SKY_METHODS[owner._sky_method][0]
-            if bool(owner._shown_sources[source]) != checked:
-                owner.toggle_source(source)
-
-    def _layer_changed(self, index):
-        owner = self.shell.owner
-        if owner is not None and index >= 0:
-            owner._horizon_wanted = self.layer.itemData(index)
-            owner._apply_loaded_maps()
-            owner._schedule_map_generation()
+        if owner is not None and owner._horizon_bodies[body] != checked:
+            owner._horizon_bodies[body] = checked
+            owner.update_profile(owner.horizon_angles)
             owner.window.Render()
+
+    def _populate_layers(self):
+        owner = self.shell.owner
+        self.layer_menu.clear()
+        if owner is None:
+            return
+        for mode, label in (('Color', 'Color'), ('Elevation', 'Terrain'), ('Slope', 'Slope')):
+            action = self.layer_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(owner._horizon_wanted == mode)
+            action.triggered.connect(lambda _checked=False, value=mode: self._set_layer(value))
+
+    def _set_layer(self, mode):
+        owner = self.shell.owner
+        owner._horizon_wanted = mode
+        owner._apply_loaded_maps()
+        owner._schedule_map_generation()
+        owner.window.Render()
 
     def sync(self):
         owner = self.shell.owner
@@ -1466,13 +1513,11 @@ class AnalysisHeader(QtWidgets.QFrame):
         if not visible:
             return
         source = sky.SKY_METHODS[owner._sky_method][0]
-        self.source.blockSignals(True)
-        self.source.setText(source)
-        self.source.setChecked(bool(owner._shown_sources[source]))
-        self.source.blockSignals(False)
-        self.layer.blockSignals(True)
-        self.layer.setCurrentIndex(max(0, self.layer.findData(owner._horizon_wanted)))
-        self.layer.blockSignals(False)
+        for body, check in self.body_checks.items():
+            check.blockSignals(True)
+            check.setChecked(owner._horizon_bodies[body])
+            check.blockSignals(False)
+        self.layer.setToolTip(f'Horizon layer: {owner._horizon_wanted}')
         index = min(owner._time_index, len(owner._epochs) - 1)
         self.timestamp.setText(f'{owner._epochs[index]:%Y-%m-%d %H:%M:%S} UTC  ({index + 1} / {len(owner._epochs)})')
         self.previous.setEnabled(index > 0)
@@ -1483,7 +1528,7 @@ class AnalysisHeader(QtWidgets.QFrame):
             if body is not None and len(body['el']) > index:
                 elevation = float(body['el'][index])
                 clearance = elevation - float(body['terrain'][index])
-                value = f'{elevation:+.1f}°' + ('  Below horizon' if clearance < 0 else '')
+                value = f'{elevation:+.1f}°'
             label.setText(f'<span style="color:{color}">■</span> {body_name}: <span style="color:{color}">{value}</span>')
         angles = owner.horizon_angles
         if angles is not None and len(angles):
@@ -1491,14 +1536,97 @@ class AnalysisHeader(QtWidgets.QFrame):
         self.scale.setText(f'Scale: {getattr(owner, "_profile_low", 0):+.1f}° to {getattr(owner, "_profile_high", 0):+.1f}°')
 
 
+class GraphHeader(QtWidgets.QFrame):
+    """A graph-specific header sharing the horizon header's Qt styling."""
+    TITLES = {'Sun': 'Sun height above terrain vs time (UTC)',
+              'Earth': 'Earth height above terrain vs time (UTC)',
+              'Lunar': 'Sun visible % per lunar day vs time (UTC)'}
+
+    def __init__(self, shell, key, parent):
+        super().__init__(parent)
+        self.shell, self.key = shell, key
+        self.setObjectName('analysisHeader')
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(14, 8, 14, 8)
+        root.setSpacing(6)
+        top = QtWidgets.QHBoxLayout()
+        top.setSpacing(9)
+        self.marker = QtWidgets.QLabel('■')
+        self.title = QtWidgets.QLabel(self.TITLES[key])
+        self.title.setObjectName('mono')
+        self.count = QtWidgets.QLabel('')
+        self.mean = QtWidgets.QLabel('')
+        self.mean.setStyleSheet('color: #32cbdf;')
+        for widget in (self.marker, self.title, self.count, self.mean):
+            top.addWidget(widget)
+        top.addStretch(1)
+        root.addLayout(top)
+        row = QtWidgets.QHBoxLayout()
+        self.current = QtWidgets.QLabel('')
+        self.current.setObjectName('mono')
+        row.addWidget(self.current)
+        row.addStretch(1)
+        root.addLayout(row)
+        self._mean_key = None
+        self.hide()
+
+    def sync(self):
+        owner = self.shell.owner
+        active = bool(owner and owner._graph_expanded and self.key in owner.panel_keys() and not self.shell._zen)
+        if not active:
+            self.hide()
+            return
+        index = owner.panel_keys().index(self.key) + 1
+        viewport = self.parentWidget()
+        width, height = viewport.width(), viewport.height()
+        y = round((1.0 + index * hud.PANEL_HEIGHT - owner._scroll - .96) * height)
+        x, card_width = round(.025 * width), round(.945 * width)
+        header_height = self.sizeHint().height()
+        self.setGeometry(x, y, max(1, card_width), header_height)
+        if y >= height or y + header_height <= 0:
+            self.hide()
+            return
+        self.show()
+        self.raise_()
+        point_count = owner.compare_n() if owner._compare_active else 1
+        self.count.setText(f'{point_count} point' + ('' if point_count == 1 else 's'))
+        point_index = owner._compare_index if owner._compare_active else 0
+        rgb = owner.compare_color(point_index)
+        color = '#%02x%02x%02x' % tuple(round(component * 255) for component in rgb)
+        if getattr(self, '_last_color', None) != color:
+            self._last_color = color
+            self.marker.setStyleSheet(f'color: {color};')
+            self.mean.setStyleSheet(f'color: {color};')
+        series = owner.selected_graph_series(self.key)
+        sample = min(owner._time_index, len(owner._epochs) - 1)
+        meta = f"UTC: {owner._epochs[sample]:%m-%d %H:%M}  |  Sample {sample + 1} / {len(owner._epochs)}"
+        if series is not None and len(series) > sample and np.isfinite(series[sample]):
+            unit = '%' if self.key == 'Lunar' else '°'
+            label = 'Visibility' if self.key == 'Lunar' else 'Height'
+            meta += f'  |  <span style="color:{color}">{label}: {series[sample]:.1f}{unit}</span>'
+        self.current.setText(meta)
+        token = (id(owner._compare), point_index, id(owner._panel_state), self.key)
+        if token != self._mean_key:
+            self._mean_key = token
+            if series is not None:
+                array = np.asarray(series, dtype=float)
+                finite = np.isfinite(array)
+                count = int(np.count_nonzero(finite))
+                total = float(np.sum(array, where=finite, initial=0))
+            else:
+                count, total = 0, 0.0
+            unit = '%' if self.key == 'Lunar' else '°'
+            self.mean.setText(f'{total/count:.1f}{unit} Mean' if count else '')
+
+
 class AnalysisTimeBar(QtWidgets.QFrame):
     """Qt-owned sample control, fixed outside the scrolling VTK graphs."""
     def __init__(self, shell):
         super().__init__()
         self.shell = shell
-        self.setObjectName('topBar')
+        self.setObjectName('timeline')
         layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(16, 4, 16, 4)
+        layout.setContentsMargins(14, 4, 14, 4)
         self.start = muted_label('')
         self.current = QtWidgets.QLabel('')
         self.current.setObjectName('mono')
@@ -1506,7 +1634,8 @@ class AnalysisTimeBar(QtWidgets.QFrame):
         self.slider = QtWidgets.QSlider(Qt.Horizontal)
         self.slider.setAccessibleName('Analysis time')
         self.slider.valueChanged.connect(self._changed)
-        for widget in (self.start, self.slider, self.current, self.end):
+        self.current.hide()
+        for widget in (self.start, self.slider, self.end):
             layout.addWidget(widget, 1 if widget is self.slider else 0)
         self.hide()
 
@@ -1527,7 +1656,7 @@ class AnalysisTimeBar(QtWidgets.QFrame):
         self.slider.setValue(index)
         self.slider.setEnabled(len(epochs) > 1)
         self.slider.blockSignals(False)
-        fmt = '%Y-%m-%d %H:%M UTC'
+        fmt = '%m-%d %H:%M'
         self.start.setText(epochs[0].strftime(fmt))
         self.current.setText(epochs[index].strftime(fmt))
         self.end.setText(epochs[-1].strftime(fmt))
@@ -1871,7 +2000,7 @@ class LocationCard(QtWidgets.QFrame):
 
     def update_state(self):
         owner = self.shell.owner
-        visible = not (owner._graph_expanded or owner._terrain_view or self.shell._zen)
+        visible = not (owner._graph_expanded or owner._terrain_view or self.shell._zen or getattr(owner, '_observer_suppressed', False))
         if visible:
             index = owner.point_index(owner.lat, owner.lon)
             full = len(owner._points) >= compare.MAX_POINTS
@@ -1966,19 +2095,24 @@ class MainShell(QtWidgets.QMainWindow):
         self.right = QtWidgets.QSplitter(Qt.Vertical)
         self.right.setChildrenCollapsible(False)
         self.right.setHandleWidth(3)
-        self.vtk_widget = GlobeWidget(self.right)
-        self.right.addWidget(self.vtk_widget)
+        self.graph_container = QtWidgets.QWidget(self.right)
+        graph_layout = QtWidgets.QVBoxLayout(self.graph_container)
+        graph_layout.setContentsMargins(0, 0, 0, 0)
+        graph_layout.setSpacing(0)
+        self.vtk_widget = GlobeWidget(self.graph_container)
+        self.timebar = AnalysisTimeBar(self)
+        graph_layout.addWidget(self.vtk_widget, 1)
+        graph_layout.addWidget(self.timebar)
+        self.right.addWidget(self.graph_container)
         self.right.setStretchFactor(0, 1)
         self.topbar = TopBar(self)
-        self.analysis_header = AnalysisHeader(self)
-        self.timebar = AnalysisTimeBar(self)
+        self.analysis_header = AnalysisHeader(self, self.vtk_widget)
+        self.graph_headers = {key: GraphHeader(self, key, self.vtk_widget) for key in ('Sun', 'Earth', 'Lunar')}
         column = QtWidgets.QWidget()
         stack = QtWidgets.QVBoxLayout(column)
         stack.setContentsMargins(0, 0, 0, 0)
         stack.setSpacing(0)
         stack.addWidget(self.topbar)
-        stack.addWidget(self.analysis_header)
-        stack.addWidget(self.timebar)
         stack.addWidget(self.right, 1)
         self.splitter.addWidget(self.sidebar)
         self.splitter.addWidget(column)
@@ -2007,9 +2141,6 @@ class MainShell(QtWidgets.QMainWindow):
         self.sidebar_toggle.setFixedWidth(40)
         self.sidebar_toggle.clicked.connect(self.toggle_sidebar)
         bar.addWidget(self.sidebar_toggle)
-        brand = QtWidgets.QLabel('Moonchaser')
-        brand.setObjectName('brand')
-        bar.addWidget(brand)
         self.coord_field = CoordinateField(header)
         self.coord_field.setObjectName('pointSearch')
         self.coord_field.setPlaceholderText('Find point by lat, lon')
@@ -2036,7 +2167,7 @@ class MainShell(QtWidgets.QMainWindow):
         self.layer_menu.aboutToShow.connect(lambda: self.topbar._populate_layers())
         self.layer_button.setMenu(self.layer_menu)
         bar.addWidget(self.layer_button)
-        self.view_button = QtWidgets.QPushButton('View')
+        self.view_button = QtWidgets.QPushButton('HUD (H)')
         self.view_menu = QtWidgets.QMenu(self)
         self.view_menu.aboutToShow.connect(self.populate_view_menu)
         self.view_button.setMenu(self.view_menu)
@@ -2185,8 +2316,7 @@ class MainShell(QtWidgets.QMainWindow):
         if self.owner is None or self.search is None:
             return
         visible = (self.current_panel == 'search' and not self.sidebar.isHidden() and not self._zen
-                   and not self.owner._graph_expanded and self.search._area_preview_enabled
-                   and self.search.show_area.isChecked())
+                   and not self.owner._graph_expanded and self.search.show_area.isChecked())
         if self.owner._area_drawing and visible:
             return
         bounds = self.search.area_bounds() if visible else None
@@ -2266,6 +2396,8 @@ class MainShell(QtWidgets.QMainWindow):
         self.interval_popup.show()
 
     def focus_coordinates(self):
+        if self.owner is not None and self.owner._graph_expanded:
+            return
         if self._zen:
             self.toggle_zen()
         self.coord_field.setFocus()
@@ -2311,8 +2443,19 @@ class MainShell(QtWidgets.QMainWindow):
         self.tables.sync()
         self.topbar.sync()
         self.analysis_header.sync()
+        self.position_analysis_header()
+        for header in self.graph_headers.values():
+            header.sync()
         self.timebar.sync()
         self.time.sync()
+
+    def position_analysis_header(self):
+        if self.owner is None:
+            return
+        width = max(1, self.vtk_widget.width())
+        height = self.analysis_header.sizeHint().height()
+        self.analysis_header.setGeometry(round(.025 * width), round((.04 - self.owner._scroll) * self.vtk_widget.height()), max(1, round(.945 * width)), height)
+        self.analysis_header.raise_()
 
     def has_analysis(self):
         owner = self.owner

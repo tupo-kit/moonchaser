@@ -25,7 +25,7 @@ from terrain import terrain_panorama_rgba, terrain_panorama_samples
 
 SKY_LEGEND = {"JPL": "JPL\nSun yellow | Earth blue", "Skyfield": "Skyfield\nSun orange | Earth green"}
 SKY_COLORS = {"Sun JPL": (1.0, 0.8, 0.12), "Earth JPL": (0.35, 0.65, 1.0), "Sun Skyfield": (1.0, 0.35, 0.1), "Earth Skyfield": (0.3, 1.0, 0.5)}
-PANEL_HEIGHT = 0.5  # each extra graph is half a window tall; the page scrolls under the window
+PANEL_HEIGHT = 1.0  # each graph has a full page with its own header
 EXTRA_PANELS = ("Sun", "Earth")
 COMPARE_PANELS = EXTRA_PANELS + ("Lunar",)   # a comparison adds the lunar-day visibility graph
 PAGE_HEIGHT = 1.0 + PANEL_HEIGHT * len(EXTRA_PANELS)
@@ -122,6 +122,8 @@ class HudMixin:
             [(0.61, 0.12), (0.97, 0.12), (0.97, 0.25), (0.61, 0.25), (0.61, 0.12)],
             *[[(x, 0.12), (x, 0.25)] for x in (0.70, 0.79, 0.88)]
         ], (0.4, 0.48, 0.58), 1)
+        self.horizon_card_frame = self.make_overlay_lines([], (0.17, 0.23, 0.33), 1)
+        self.horizon_card_frame.SetVisibility(False)
         self.profile_labels = []
         for x, text in zip(np.linspace(0.61, 0.97, 5), ("N 0", "E 90", "S 180", "W 270", "N 360")):
             label = self.make_text(float(x), 0.09, 12)
@@ -154,23 +156,53 @@ class HudMixin:
         self.next_button.SetInput("[ Next ]")
         self.close_button = self.make_text(0.91, 0.46, 16)
         self.close_button.SetInput("×")
+        self._graph_notes_open = {key: False for key in ('Horizon', *COMPARE_PANELS)}
+        self._horizon_notes = self.make_text(0.06, 0.01, 12)
+        self._horizon_notes.SetVisibility(False)
+        self._horizon_xaxis = self.make_text(0.97, 0.10, 12)
+        self._horizon_xaxis.GetTextProperty().SetJustificationToRight()
+        self._horizon_xaxis.SetInput('Azimuth (degrees)')
+        self._horizon_yaxis = self.make_text(0.06, 0.92, 12)
+        self._horizon_yaxis.SetInput('Elevation (degrees)')
         self.panels = {}
         for key in COMPARE_PANELS:
+            background, background_points = self.make_graph_background()
+            header_bg, header_points = self.make_graph_background()
+            header_bg.GetProperty().SetColor(0.067, 0.095, 0.15)
+            plot_bg, plot_points = self.make_graph_background()
+            plot_bg.GetProperty().SetColor(0.025, 0.039, 0.067)
+            fill = self.make_overlay_fill()
             title = self.make_text(0.08, 0.0, 14, top=True)
             title.GetTextProperty().SetBackgroundColor(0.067, 0.102, 0.16)
             title.GetTextProperty().SetBackgroundOpacity(0.96)
-            axes = self.make_overlay_lines([], (0.4, 0.48, 0.58), 1)
+            axes = self.make_overlay_lines([], (0.22, 0.28, 0.37), 1)
+            frame = self.make_overlay_lines([], (0.17, 0.23, 0.33), 1)
             xlabels, ylabels = [], []
             for _ in range(5):
                 label = self.make_text(0.0, 0.0, 12)
                 label.GetTextProperty().SetJustificationToCentered()
                 xlabels.append(label)
-            for _ in range(2):
+            xlabels[0].GetTextProperty().SetJustificationToLeft()
+            xlabels[-1].GetTextProperty().SetJustificationToRight()
+            for _ in range(5):
                 label = self.make_text(0.0, 0.0, 12)
                 label.GetTextProperty().SetJustificationToRight()
                 label.GetTextProperty().SetVerticalJustificationToCentered()
                 ylabels.append(label)
-            self.panels[key] = {"title": title, "axes": axes, "xlabels": xlabels, "ylabels": ylabels}
+            swatch = self.make_text(0.0, 0.0, 13)
+            swatch.SetInput('■')
+            swatch.GetTextProperty().SetColor(0.16, 0.80, 0.91)
+            notes = self.make_text(0.80, 0.0, 12)
+            notes.GetTextProperty().SetColor(0.32, 0.85, 0.95)
+            notes.GetTextProperty().SetBackgroundColor(0.10, 0.16, 0.24)
+            notes.GetTextProperty().SetBackgroundOpacity(0.95)
+            note_body = self.make_text(0.08, 0.0, 12)
+            meta = self.make_text(0.08, 0.0, 12)
+            xaxis = self.make_text(0.97, 0.0, 12)
+            xaxis.GetTextProperty().SetJustificationToRight()
+            yaxis = self.make_text(0.08, 0.0, 12)
+            self.panels[key] = {"title": title, "axes": axes, "frame": frame, "xlabels": xlabels, "ylabels": ylabels,
+                                "notes": notes, "note_body": note_body, "meta": meta, "background": background, "background_points": background_points, "header_bg": header_bg, "header_points": header_points, "plot_bg": plot_bg, "plot_points": plot_points, "fill": fill, "swatch": swatch, "xaxis": xaxis, "yaxis": yaxis}
         self.panel_terrain = {name: self.make_overlay_lines([], (0.0, 0.9, 1.0), 1) for name in SKY_COLORS}
         self.panel_lines = {name: self.make_overlay_lines([], color, 2) for name, color in SKY_COLORS.items()}
         self.panel_hlines = {name: self.make_overlay_lines([], dim_color(color, 0.8), 1) for name, color in SKY_COLORS.items()}
@@ -245,6 +277,59 @@ class HudMixin:
         coordinate.SetCoordinateSystemToNormalizedViewport()
         mapper.SetTransformCoordinate(coordinate)
         return mapper
+
+    def make_graph_background(self):
+        points = self.vtk.vtkPoints()
+        for _ in range(4):
+            points.InsertNextPoint(0, 0, 0)
+        cells = self.vtk.vtkCellArray()
+        cells.InsertNextCell(4)
+        for index in range(4):
+            cells.InsertCellPoint(index)
+        data = self.vtk.vtkPolyData()
+        data.SetPoints(points)
+        data.SetPolys(cells)
+        actor = self.vtk.vtkActor2D()
+        actor.SetMapper(self.overlay_mapper(data))
+        actor.GetProperty().SetColor(0.055, 0.080, 0.125)
+        actor.GetProperty().SetOpacity(0.97)
+        actor.SetVisibility(False)
+        self.renderer.AddViewProp(actor)
+        return actor, points
+
+    def make_overlay_fill(self):
+        actor = self.vtk.vtkActor2D()
+        actor.SetMapper(self.overlay_mapper(self.vtk.vtkPolyData()))
+        actor.GetProperty().SetColor(0.08, 0.42, 0.50)
+        actor.GetProperty().SetOpacity(0.25)
+        actor.SetVisibility(False)
+        self.renderer.AddViewProp(actor)
+        return actor
+
+    def update_graph_fill(self, key, state):
+        """Shade a single series; multiple series retain their individual lines."""
+        actor = self.panels[key]['fill']
+        data = self.vtk.vtkPolyData()
+        if state and len(state.get('values', {})) == 1:
+            series = next(iter(state['values'].values()))
+            xs = state['xs']
+            x0, x1, y0, y1 = self._panel_boxes[key]
+            valid = np.isfinite(series)
+            # Missing samples are not bridged by the fill.
+            ids = np.flatnonzero(valid)
+            if len(ids) >= 2 and np.all(np.diff(ids) == 1):
+                points = self.vtk.vtkPoints()
+                points.InsertNextPoint(float(xs[ids[0]]), y0, 0)
+                for index in ids:
+                    points.InsertNextPoint(float(xs[index]), float(y0 + (y1-y0)*series[index]/state['high']), 0)
+                points.InsertNextPoint(float(xs[ids[-1]]), y0, 0)
+                cells = self.vtk.vtkCellArray()
+                cells.InsertNextCell(points.GetNumberOfPoints())
+                for index in range(points.GetNumberOfPoints()):
+                    cells.InsertCellPoint(index)
+                data.SetPoints(points)
+                data.SetPolys(cells)
+        actor.GetMapper().SetInputData(data)
 
     def make_profile_background(self):
         points = self.vtk.vtkPoints()
@@ -386,7 +471,7 @@ class HudMixin:
             self._scroll = min(self._scroll, self.page_height() - 1.0)
         s = self._scroll if expanded else 0.0  # screen y = page y + s
         if expanded:
-            self._plot_box = (0.06, 0.97, 0.10 + s, (0.90 if self._desktop_shell is not None else 0.62) + s)
+            self._plot_box = (0.06, 0.94, (0.14 if self._desktop_shell is not None else 0.10) + s, (0.74 if self._desktop_shell is not None else 0.62) + s)
             background = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
             bx = 0.69
             self._controls = {"now": (0.85, 0.92 + s, 0.905, 0.96 + s),
@@ -421,6 +506,17 @@ class HudMixin:
         self._bg_points.Modified()
         self.profile_background.GetMapper().GetInput().Modified()
         self.profile_background.GetProperty().SetOpacity(0.985 if expanded else 0.92)
+        if expanded and self._desktop_shell is not None:
+            height = max(1, self.window.GetSize()[1])
+            widget = getattr(self._desktop_shell, 'analysis_header', None)
+            header_px = widget.sizeHint().height() if widget is not None else 80
+            sep = .96 + s - header_px / height
+            self.horizon_card_frame.GetMapper().SetInputData(self.overlay_lines_data([
+                [(.025,.04+s),(.97,.04+s),(.97,.96+s),(.025,.96+s),(.025,.04+s)],
+                [(.025,sep),(.97,sep)]]))
+            self.horizon_card_frame.SetVisibility(True)
+        else:
+            self.horizon_card_frame.SetVisibility(False)
         for actor in self.source_buttons.values():
             actor.SetPosition(0.43, 0.81 + s)
         self.legend_button.SetInput("Point details")
@@ -441,8 +537,10 @@ class HudMixin:
         verticals = [[(x0 + (x1 - x0) * f, y0), (x0 + (x1 - x0) * f, y1)] for f in (0.25, 0.5, 0.75)]
         self.profile_axes.GetMapper().SetInputData(self.overlay_lines_data(
             [[(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)], *verticals]))
-        for x, label in zip(np.linspace(x0, x1, 5), self.profile_labels):
-            label.SetPosition(float(x), y0 - 0.03)
+        self.profile_labels[0].GetTextProperty().SetJustificationToLeft()
+        self.profile_labels[-1].GetTextProperty().SetJustificationToRight()
+        for index, (x, label) in enumerate(zip(np.linspace(x0, x1, 5), self.profile_labels)):
+            label.SetPosition(float(x - (.018 if expanded and index == 4 else 0)), y0 - 0.03)
         for actor in (self.now_button, self.close_button, self.time_caption,
                       self.previous_button, self.next_button):
             actor.SetVisibility(expanded)
@@ -462,6 +560,13 @@ class HudMixin:
             self._controls.pop('point_prev', None)
             self._controls.pop('point_next', None)
         self.help.SetVisibility(not expanded)
+        self._horizon_xaxis.SetPosition(0.97, 0.105 + s)
+        self._horizon_yaxis.SetPosition(0.06, (0.76 if self._desktop_shell is not None else 0.92) + s)
+        self._horizon_xaxis.SetVisibility(expanded and self._desktop_shell is not None)
+        self._horizon_yaxis.SetVisibility(expanded and self._desktop_shell is not None)
+        self._horizon_notes.SetPosition(0.06, 0.015 + s)
+        self._horizon_notes.SetVisibility(False)
+        self._horizon_notes.SetInput('Azimuth: north 0°, east 90°, south 180°, west 270°.\nTerrain and body elevations are measured in degrees.')
         self.layout_panels(s)
         self._slider_box = (x0, x1, 0.04 + s) if expanded and self._desktop_shell is None else None
         # Scroll bar (drag the thumb, or click the track): thumb length = visible fraction of the page.
@@ -484,21 +589,94 @@ class HudMixin:
         self.renderer.AddViewProp(self.progress_text)
 
     def layout_panels(self, s):
-        """Place the extra graphs below the main one; page y = -PANEL_HEIGHT * k, screen y = page y + s."""
+        """Lay out full-page graphs with individual headers and notes."""
         for k, key in enumerate(self.panel_keys(), start=1):
             base = -PANEL_HEIGHT * k + s
-            x0, x1, y0, y1 = 0.08, 0.97, base + 0.10, base + 0.38
+            x0, x1, y0, y1 = 0.08, 0.94, base + 0.18, base + 0.75
             self._panel_boxes[key] = (x0, x1, y0, y1)
             panel = self.panels[key]
-            verticals = [[(x0 + (x1 - x0) * f, y0), (x0 + (x1 - x0) * f, y1)] for f in (0.25, 0.5, 0.75)]
-            panel["axes"].GetMapper().SetInputData(self.overlay_lines_data(
-                [[(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)], *verticals]))
-            panel["title"].SetPosition(x0, base + 0.47)
-            for x, label in zip(np.linspace(x0, x1, 5), panel["xlabels"]):
-                label.SetPosition(float(x), y0 - 0.035)
-            panel["ylabels"][0].SetPosition(x0 - 0.005, y0)
-            panel["ylabels"][1].SetPosition(x0 - 0.005, y1)
+            for index, (x, y) in enumerate(((0.025, base + .04), (.97, base + .04),
+                                             (.97, base + .96), (.025, base + .96))):
+                panel['background_points'].SetPoint(index, x, y, 0)
+            panel['background_points'].Modified()
+            for points, corners in ((panel['header_points'], ((.025,base+.80),(.97,base+.80),(.97,base+.96),(.025,base+.96))),
+                                    (panel['plot_points'], ((x0,y0),(x1,y0),(x1,y1),(x0,y1)))):
+                for index, (x, y) in enumerate(corners):
+                    points.SetPoint(index, x, y, 0)
+                points.Modified()
+            header = (getattr(self._desktop_shell, 'graph_headers', {}) or {}).get(key) if self._desktop_shell else None
+            header_height = header.sizeHint().height() if header is not None else 80
+            separator = base + .96 - header_height / max(1, self.window.GetSize()[1])
+            panel['frame'].GetMapper().SetInputData(self.overlay_lines_data([
+                [(.025,base+.04),(.97,base+.04),(.97,base+.96),(.025,base+.96),(.025,base+.04)],
+                [(.025,separator),(.97,separator)]]))
+            panel['swatch'].SetPosition(.045, base+.905)
+            verticals = [[(x0 + (x1 - x0) * f, y0), (x0 + (x1 - x0) * f, y1)] for f in (.25, .5, .75)]
+            horizontals = [[(x0, y0 + (y1-y0)*f), (x1, y0 + (y1-y0)*f)] for f in (.25, .5, .75)]
+            panel['axes'].GetMapper().SetInputData(self.overlay_lines_data(
+                [[(x0,y0),(x1,y0),(x1,y1),(x0,y1),(x0,y0)], *verticals, *horizontals]))
+            panel['title'].SetPosition(.07, base + .94)
+            panel['meta'].SetPosition(.05, base + .835)
+            panel['yaxis'].SetInput('Visibility (%)' if key == 'Lunar' else 'Height above horizon (degrees)')
+            panel['yaxis'].SetPosition(x0, base + .775)
+            panel['xaxis'].SetInput('Time (UTC)')
+            panel['xaxis'].SetPosition((x0+x1)/2, base + .095)
+            panel['xaxis'].GetTextProperty().SetJustificationToCentered()
+            note = ('Visible fraction for each complete lunar day; a shorter interval is one period.' if key == 'Lunar'
+                    else 'Body centre elevation minus terrain horizon. Values below the horizon are shown as zero.')
+            panel['notes'].SetPosition(.78, base + .835)
+            panel['note_body'].SetInput(textwrap.fill(note, width=76))
+            panel['note_body'].SetPosition(x0, base + .045)
+
+            for x, label in zip(np.linspace(x0, x1, 5), panel['xlabels']):
+                label.SetPosition(float(x), y0 - .035)
+            for fraction, label in zip(np.linspace(0, 1, 5), panel['ylabels']):
+                label.SetPosition(x0-.005, y0 + (y1-y0)*fraction)
         self.layout_compare(s)
+
+    def selected_graph_series(self, key):
+        """Series for the point selected in the analysis sidebar, including hidden lines."""
+        if self._compare_active:
+            index = self._compare_index
+            state = self._cmp_state.get(key)
+            if state and index in state.get('values', {}):
+                return np.asarray(state['values'][index], dtype=float)
+            comparison = self._compare
+            if comparison is None or not 0 <= index < len(comparison['data']):
+                return None
+            data = comparison['data'][index]
+            source = SKY_METHODS[self._sky_method][0]
+            body = (data or {}).get(f"{'Sun' if key == 'Lunar' else key} {source}")
+            if body is None:
+                return None
+            if key != 'Lunar':
+                return np.maximum(np.asarray(body['el']) - np.asarray(body['terrain']), 0.0)
+            seconds = np.array([(epoch - self._epochs[0]).total_seconds() for epoch in self._epochs])
+            values = np.full(len(seconds), np.nan)
+            if len(seconds) >= 2:
+                for first, last, percent in lunar_day_series(seconds, body['visible']):
+                    values[(seconds >= first) & (seconds <= last)] = percent
+            return values
+        state = self._panel_state.get(key)
+        if not state or not state.get('values'):
+            return None
+        return np.asarray(next(iter(state['values'].values())), dtype=float)
+
+    def update_graph_headers(self):
+        if not self._graph_expanded:
+            return
+        total = len(self._epochs)
+        if not total:
+            return
+        index = min(self._time_index, total - 1)
+        for key in self.panel_keys():
+            series = self.selected_graph_series(key)
+            text = f"UTC: {self._epochs[index]:%m-%d %H:%M}  |  Sample {index+1} / {total}"
+            if series is not None and len(series) > index and np.isfinite(series[index]):
+                unit = '%' if key == 'Lunar' else '°'
+                label = 'Visibility' if key == 'Lunar' else 'Height'
+                text += f"  |  {label}: {series[index]:.1f}{unit}"
+            self.panels[key]['meta'].SetInput(text)
 
     def compare_n(self):
         return len(self._compare_points) if self._compare_active and self._graph_expanded else 0
@@ -540,16 +718,8 @@ class HudMixin:
         """Position the point on/off buttons of the combined graphs and the comparison tables."""
         n = self.compare_n()
         self.ensure_compare_actors(n)
-        for (key, i), toggle in self._cmp_toggles.items():
-            active = i < n
-            toggle.SetVisibility(active)
-            if not active:
-                continue
-            base = -PANEL_HEIGHT * (COMPARE_PANELS.index(key) + 1) + s
-            x = 0.40 + (i % TOGGLES_PER_ROW) * 0.095
-            y = base + 0.45 - (i // TOGGLES_PER_ROW) * 0.03
-            toggle.SetPosition(x, y)
-            self._controls[f"vis:{key}:{i}"] = (x, y - 0.004, x + 0.092, y + 0.026)
+        for toggle in self._cmp_toggles.values():
+            toggle.SetVisibility(False)
         self.layout_table(s)
 
     def table_layout(self, n):
@@ -694,10 +864,43 @@ class HudMixin:
         value = float(np.clip(value, 0.0, self.page_height() - 1.0))
         if value == self._scroll:
             return
+        delta = value - self._scroll
         self._scroll = value
         self.apply_layout()
-        self.update_profile(self.horizon_angles)
+        self.shift_scrolled_geometry(delta)
         self.window.Render()
+
+    def shift_scrolled_geometry(self, delta):
+        """Translate existing graph geometry without recalculating the underlying data."""
+        from vtk.util.numpy_support import vtk_to_numpy
+        actors = [self.profile, self.panorama]
+        for group in (self.sky_hlines, self.sky_trails_below, self.sky_trails,
+                      self.sky_samples_below, self.sky_samples, self.panel_terrain,
+                      self.panel_lines, self.panel_hlines, self._cmp_lines):
+            actors.extend(group.values())
+        for group in (self.sky_markers, self.panel_markers, self._cmp_markers):
+            for rings in group.values():
+                actors.extend(rings)
+        actors.extend(panel['fill'] for panel in self.panels.values())
+        seen = set()
+        for actor in actors:
+            mapper = actor.GetMapper()
+            data = mapper.GetInput() if mapper else None
+            points = data.GetPoints() if data else None
+            if points is None or not points.GetNumberOfPoints():
+                continue
+            key = points.__this__
+            if key in seen:
+                continue
+            seen.add(key)
+            array = vtk_to_numpy(points.GetData())
+            array[:, 1] += delta
+            points.Modified()
+            data.Modified()
+        for group in (self.sky_labels, self.sky_values, self.panel_values):
+            for actor in group.values():
+                x, y = actor.GetPosition()
+                actor.SetPosition(x, y + delta)
 
     def scroll_key(self, key):
         if key == "home":
@@ -712,11 +915,19 @@ class HudMixin:
         """Sun and Earth elevation graphs."""
         expanded = self._graph_expanded
         for key, panel in self.panels.items():
-            for actor in (panel["title"], panel["axes"], *panel["xlabels"], *panel["ylabels"]):
+            for actor in (panel["title"], panel["axes"], panel["frame"], panel["notes"], panel["note_body"], panel["meta"], panel["background"], panel["header_bg"], panel["plot_bg"], panel["fill"], panel["swatch"], panel["xaxis"], panel["yaxis"], *panel["xlabels"], *panel["ylabels"]):
                 actor.SetVisibility(expanded and key in self.panel_keys())
+        for panel in self.panels.values():
+            panel['notes'].SetVisibility(False)
+        if self._desktop_shell is not None:
+            for panel in self.panels.values():
+                for actor in (panel['title'], panel['notes'], panel['meta'], panel['header_bg'], panel['swatch']):
+                    actor.SetVisibility(False)
         for actor in (*self.panel_terrain.values(), *self.panel_lines.values()):
             actor.GetMapper().SetInputData(self.overlay_lines_data([]))
         self._panel_state = {}
+        for key in COMPARE_PANELS:
+            self.update_graph_fill(key, None)
         if expanded and self._compare_active:
             self.update_compare_panels()
             return
@@ -736,7 +947,7 @@ class HudMixin:
                 actor.SetVisibility(False)
 
         def shown(name):
-            return data is not None and name in data and self._shown_sources[name.rsplit(" ", 1)[-1]]
+            return data is not None and name in data
 
         seconds = np.array([(epoch - epochs[0]).total_seconds() for epoch in epochs])
         span = float(seconds[-1])
@@ -761,13 +972,12 @@ class HudMixin:
                 self.panel_lines[name].GetMapper().SetInputData(
                     self.overlay_lines_data([np.column_stack((xs, ys))]))
             self._panel_state[key] = {"xs": xs, "high": high, "names": names, "values": values}
-            panel["title"].SetInput(f"{key} centre above terrain horizon vs time (UTC)\n"
-                                    "0 deg = terrain horizon; below horizon shown as 0\n"
-                                    f"Scale 0 to {high:.1f} deg")
+            self.update_graph_fill(key, self._panel_state[key])
+            panel["title"].SetInput(f"{key} height above terrain")
             for fraction, label in zip(np.linspace(0, 1, 5), panel["xlabels"]):
                 label.SetInput(f"{epochs[0] + timedelta(seconds=float(fraction) * span):%m-%d %H:%M}")
                 label.SetVisibility(True)
-            for label, value in zip(panel["ylabels"], (low, high)):
+            for label, value in zip(panel["ylabels"], np.linspace(low, high, 5)):
                 label.SetInput(f"{value:+.1f}")
                 label.SetVisibility(True)
         self.update_panel_markers()
@@ -796,16 +1006,14 @@ class HudMixin:
             title = f"{key} height above terrain | {n} points"
             name = f"{key} {source}"
             shown = []
-            if ready and span > 0 and self._shown_sources[source]:
+            if ready and span > 0:
                 shown = [i for i in range(n) if self._compare_visible[i] and compare["data"][i] is not None
                          and name in compare["data"][i]]
             if not shown:
                 if not ready or span <= 0:
                     detail = note
-                elif not self._shown_sources[source]:
-                    detail = "Source hidden (see the checkbox)"
                 else:
-                    detail = "Select a point using the coloured buttons"
+                    detail = "Select a point in the sidebar"
                 panel["title"].SetInput(title + "\n" + detail)
                 for actor in (*panel["xlabels"], *panel["ylabels"]):
                     actor.SetVisibility(False)
@@ -819,12 +1027,12 @@ class HudMixin:
                 self._cmp_lines[(key, i)].GetMapper().SetInputData(
                     self.overlay_lines_data([np.column_stack((xs, ys))]))
             self._cmp_state[key] = {"xs": xs, "high": high, "values": values}
-            panel["title"].SetInput(f"{title}\nBelow the horizon = 0 deg | time shown in UTC\n"
-                                    f"Height: 0 to {high:.1f} deg")
+            self.update_graph_fill(key, self._cmp_state[key])
+            panel["title"].SetInput(title)
             for fraction, label in zip(np.linspace(0, 1, 5), panel["xlabels"]):
                 label.SetInput(f"{epochs[0] + timedelta(seconds=float(fraction) * span):%m-%d %H:%M}")
                 label.SetVisibility(True)
-            for label, value in zip(panel["ylabels"], (0.0, high)):
+            for label, value in zip(panel["ylabels"], np.linspace(0.0, high, 5)):
                 label.SetInput(f"{value:+.1f}")
                 label.SetVisibility(True)
         self.update_lunar_panel(compare, ready and span > 0, note, seconds, span, source)
@@ -838,16 +1046,14 @@ class HudMixin:
         title = f"Sun visible % per lunar day vs time (UTC), {n} points"
         name = f"Sun {source}"
         shown = []
-        if ready and self._shown_sources[source]:
+        if ready:
             shown = [i for i in range(n) if self._compare_visible[i] and compare["data"][i] is not None
                      and name in compare["data"][i]]
         if not shown:
             if not ready:
                 detail = note
-            elif not self._shown_sources[source]:
-                detail = "Source hidden (see the checkbox)"
             else:
-                detail = "No point selected: use the buttons on the right"
+                detail = "Select a point in the sidebar"
             panel["title"].SetInput(title + "\n" + detail)
             for actor in (*panel["xlabels"], *panel["ylabels"]):
                 actor.SetVisibility(False)
@@ -864,12 +1070,12 @@ class HudMixin:
             values[i] = step
             self._cmp_lines[(key, i)].GetMapper().SetInputData(self.overlay_lines_data([np.array(outline)]))
         self._cmp_state[key] = {"xs": xs, "high": 100.0, "values": values}
-        panel["title"].SetInput(f"{title}\nOne value per complete lunar day ({SYNODIC_DAYS:.2f} d)\n"
-                                "Shorter interval: one value; scale 0 to 100 %")
+        self.update_graph_fill(key, self._cmp_state[key])
+        panel["title"].SetInput(title)
         for fraction, label in zip(np.linspace(0, 1, 5), panel["xlabels"]):
             label.SetInput(f"{epochs[0] + timedelta(seconds=float(fraction) * span):%m-%d %H:%M}")
             label.SetVisibility(True)
-        for label, value in zip(panel["ylabels"], (0.0, 100.0)):
+        for label, value in zip(panel["ylabels"], np.linspace(0.0, 100.0, 5)):
             label.SetInput(f"{value:.0f}%")
             label.SetVisibility(True)
 
@@ -897,7 +1103,7 @@ class HudMixin:
                 toggle = self._cmp_toggles[(key, i)]
                 toggle.SetInput(text)
                 toggle.GetTextProperty().SetColor(*(color if on else dim_color(color)))
-                toggle.SetVisibility(True)
+                toggle.SetVisibility(False)
 
     def make_value_label(self, color):
         """Degree readout drawn at the right edge of a graph, level with the selected sample."""
@@ -910,12 +1116,14 @@ class HudMixin:
         return label
 
     def shown_body(self, name):
-        if self._sky_data is None or not self._graph_expanded or not self._shown_sources[name.rsplit(" ", 1)[-1]]:
+        if (self._sky_data is None or not self._graph_expanded
+                or not self._horizon_bodies.get(name.split(" ", 1)[0], True)):
             return None
         return self._sky_data.get(name)
 
     def update_panel_markers(self):
         """Selected sample on the Sun/Earth graphs: a marker, a level line and its degrees at the edge."""
+        self.update_graph_headers()
         for name in SKY_COLORS:
             self.set_bullseye(self.panel_markers[name], [])
             self.panel_hlines[name].GetMapper().SetInputData(self.overlay_lines_data([]))
@@ -946,12 +1154,10 @@ class HudMixin:
             az, el = float(body["az"][index]), float(body["el"][index])
             px, py = x0 + (x1 - x0) * az / 360.0, float(self.profile_y(el))
             marker, level = [(px, py)], [[(x0, py), (x1, py)]]
-            text = name + (" (partial)" if body["state"][index] == "Partly visible" else "")
-            if el < float(body["terrain"][index]):
-                text += " (below horizon)"
+            text = name.split(" ", 1)[0]
             label.SetInput(text)
             label.SetPosition(min(px + 0.012, x1 - (0.17 if "(" in text else 0.09)),
-                              float(np.clip(py + (0.012 if name == "Sun" else -0.024), y0 + 0.01, y1 + 0.005)))
+                              float(np.clip(py + (0.012 if name.startswith("Sun ") else -0.024), y0 + 0.01, y1 + 0.005)))
             value.SetInput(f"{el:+.1f} deg")
             value.SetPosition(x1 - 0.004, float(np.clip(py + 0.004, y0, y1 - 0.025)))
         self.sky_hlines[name].GetMapper().SetInputData(self.overlay_lines_data(level))
@@ -1031,7 +1237,7 @@ class HudMixin:
         low, high = float(np.min(angles)), float(np.max(angles))
         if self._sky_data is not None:
             for name, body in self._sky_data.items():
-                if not self._shown_sources[name.rsplit(" ", 1)[-1]]:
+                if not self._horizon_bodies.get(name.split(" ", 1)[0], True):
                     continue
                 low = min(low, float(np.min(body["el"] - body["radius"])))
                 high = max(high, float(np.max(body["el"] + body["radius"])))

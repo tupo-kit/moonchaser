@@ -266,23 +266,6 @@ def grid_cells(lat_min, lat_max, lon_min, lon_max, spacing):
             for i in range(nlat) for j in range(nlon)]
 
 
-def subdivide_cluster(sectors, bounds, spacing):
-    """Refine only member sectors, clipped to the user's chosen bounds."""
-    lat0, lat1, lon0, lon1 = bounds
-    cells = []
-    for a, b, c, d in sectors:
-        clipped = (max(a, lat0), min(b, lat1), max(c, lon0), min(d, lon1))
-        if clipped[0] >= clipped[1] or clipped[2] >= clipped[3]:
-            continue
-        subcells = grid_cells(*clipped, spacing)
-        if len(cells) + len(subcells) > MAX_GRID_POINTS:
-            raise ValueError(f'Too many cells in this cluster; choose at most {MAX_GRID_POINTS:,}.')
-        cells.extend(subcells)
-    if not cells:
-        raise ValueError('The chosen range does not intersect the selected cluster.')
-    return cells
-
-
 def cell_sample_points(cell, side):
     """Center first, then an evenly spaced grid from near center outward."""
     lat0, lat1, lon0, lon1 = cell
@@ -1220,10 +1203,7 @@ class SearchDialog:
             lat_min, lat_max = self._pair(get('lat'))
             lon_min, lon_max = self._pair(get('lon'))
             use_terrain = bool(self.use_terrain.get())
-            if use_terrain and self._refinement_sectors is not None:
-                cells = subdivide_cluster(self._refinement_sectors, (lat_min, lat_max, lon_min, lon_max), spacing)
-            else:
-                cells = grid_cells(lat_min, lat_max, lon_min, lon_max, spacing)
+            cells = grid_cells(lat_min, lat_max, lon_min, lon_max, spacing)
             side_value = float(get('side'))
             if not np.isfinite(side_value) or not side_value.is_integer() or not 2 <= side_value <= 9:
                 raise ValueError('Samples per side must be an integer from 2 to 9.')
@@ -1285,7 +1265,6 @@ class SearchDialog:
         self._stop_fill()
         self.workers_setting = workers
         self.cancel.clear()
-        self._refinement_sectors = None
         self.results = []
         self.selected = None
         self.show_matches = False
@@ -1301,8 +1280,8 @@ class SearchDialog:
         if lunar_sd:
             self.column_vars['lunar_sd'].set(True)
         self._refresh_headings()
-        self.table.delete(*self.table.get_children())
-        for button in (self.view_button, self.select_all_button, self.add_button, self.analyze_button, self.marks_button, self.export_button, self.sector_button):
+        self.table.clear_rows()
+        for button in (self.view_button, self.select_all_button, self.add_button, self.analyze_button, self.marks_button, self.export_button):
             button.configure(state='disabled')
         self.start_button.configure(state='disabled')
         self.cancel_button.configure(state='normal')
@@ -1455,7 +1434,7 @@ class SearchDialog:
         self._refresh_headings()
         previous = {id(self._display_items[int(i)][0]) for i in self.table.selection()
                     if int(i) < len(self._display_items)}
-        self.table.delete(*self.table.get_children())
+        self.table.clear_rows()
         clusters = self._clusters()
         cluster_for_row = {id(row): index for index, cluster in enumerate(clusters) for row in cluster}
         clustered = self.view_mode.get() == 'Clusters'
@@ -1497,14 +1476,14 @@ class SearchDialog:
         noun = 'clusters' if clustered else ('candidate sectors' if sector_cluster else 'points')
         if len(groups) == 1:
             noun = noun[:-1]
-        explanation = ' Candidate clusters; optimistic estimates may miss high sites and differ by sector. Select a cluster to search.' if sector_cluster else ''
+        explanation = ' Candidate clusters use optimistic estimates and may differ from terrain results.' if sector_cluster else ''
         self.status.configure(text=f"{label}: {len(groups):,} {noun}, {len(self.results):,} matching cells.{suffix}{explanation}")
         if self.results:
             for button in (self.select_all_button, self.marks_button, self.export_button):
                 button.configure(state='normal')
-            for button in (self.view_button, self.add_button, self.analyze_button):
+            self.view_button.configure(state='normal')
+            for button in (self.add_button, self.analyze_button):
                 button.configure(state='disabled' if sector_cluster else 'normal')
-            self.sector_button.configure(state='normal' if sector_cluster else 'disabled')
 
     def is_sector_results(self):
         return bool(self.last_parameters and len(self.last_parameters) > 16 and not self.last_parameters[16])
@@ -1550,7 +1529,7 @@ class SearchDialog:
 
     def view_selected(self, event=None):
         if self.is_sector_results():
-            self.refine_selected_sector()
+            self.show_selected()
             return
         selected = self.table.selection()
         if selected:
@@ -1562,26 +1541,28 @@ class SearchDialog:
             self.apply_to_viewer('Shown on the globe.')
 
     def select_all(self, event=None):
-        # Results may contain millions of entries. Pick the first displayed rows
-        # instead of selecting every Qt item (and emitting a signal per item).
+        # One Qt selection range avoids a signal and repaint for every row.
         total = len(self._display_items)
-        if self.is_sector_results():
-            limit = 1  # refining requires exactly one cluster
-            description = 'cluster'
-        else:
-            limit = MAX_POINTS
-            description = 'rows'
+        limit = 20000
         count = min(total, limit)
-        self.table.selection_set([str(index) for index in range(count)])
-        text = f'Selected the first {count:,} of {total:,} displayed {description}.'
-        if self.is_sector_results():
-            text += ' Select one cluster to search.'
-        elif self.view_mode.get() == 'Clusters':
-            text += f' Each cluster may contain multiple points; analysis holds at most {MAX_POINTS}.'
+        self.table.select_first(count)
+        if count < total:
+            self.status.configure(text=f'Selected first {count:,} of {total:,} rows; use the table to choose other rows. Analysis supports {MAX_POINTS} points.')
         else:
-            text += f' Analysis holds at most {MAX_POINTS} points.'
-        self.status.configure(text=text)
+            self.status.configure(text=f'Selected all {count:,} rows. Analysis supports {MAX_POINTS} points.')
         return 'break'
+
+    def show_selected(self):
+        selected = self.table.selection()
+        if not selected:
+            self.status.configure(text='Select one or more rows first.')
+            return
+        members = [row for item in selected for row in self._display_items[int(item)]]
+        self.selected = None
+        self.marker_mode = 'Clusters' if self.is_sector_results() else self.view_mode.get()
+        self.marker_results = self._marker_rows(members)
+        self.show_matches = True
+        self.apply_to_viewer(f'Showing {len(selected):,} selected rows on the globe.')
 
     def add_selected(self, analyze=False):
         if self.is_sector_results():
@@ -1642,33 +1623,6 @@ class SearchDialog:
         self.show_matches = True
         self.apply_to_viewer(f'Analyzing {len(rows):,} selected point(s).')
 
-    def refine_selected_sector(self):
-        if not self.is_sector_results():
-            self.status.configure(text='Run an optimistic sector search first.')
-            return
-        if self.worker is not None and self.worker.is_alive():
-            self.status.configure(text='Wait for the search to finish or cancel it first.')
-            return
-        selected = self.table.selection()
-        if len(selected) != 1:
-            self.status.configure(text='Select exactly one cluster.')
-            return
-        members = self._display_items[int(selected[0])]
-        self._refinement_sectors = [(row['cell_lat_min'], row['cell_lat_max'], row['cell_lon_min'], row['cell_lon_max'])
-                                    for row in members]
-        lat0 = min(cell[0] for cell in self._refinement_sectors)
-        lat1 = max(cell[1] for cell in self._refinement_sectors)
-        lon0 = min(cell[2] for cell in self._refinement_sectors)
-        lon1 = max(cell[3] for cell in self._refinement_sectors)
-        spacing = max(0.1, min(min(cell[1] - cell[0], cell[3] - cell[2]) for cell in self._refinement_sectors) / 5.0)
-        for name, value in (('spacing', f'{spacing:.6g}'), ('lat', f'{lat0:g}, {lat1:g}'), ('lon', f'{lon0:g}, {lon1:g}')):
-            self._set(name, value)
-        self.use_terrain.set(True)
-        if self.workspace_tabs is not None:
-            self.workspace_tabs.select(self.workspace_settings)
-        self.settings_tabs.select(self.area_tab)
-        self.status.configure(text=f'{len(members):,} cluster sectors selected. Adjust parameters, then start the terrain search; only these sectors will be checked.')
-
     def select_sector_on_globe(self, row):
         """Select the cluster represented by a picked globe cell."""
         sector = self.is_sector_results()
@@ -1682,10 +1636,7 @@ class SearchDialog:
                 item = str(index)
                 self.table.selection_set(item)
                 self.table.see(item)
-                if sector:
-                    self.refine_selected_sector()
-                else:
-                    self.status.configure(text='Cluster selected. Use the result controls to inspect or add points.')
+                self.status.configure(text='Cluster selected. Use the result controls to inspect it on the globe.')
                 return
         self.status.configure(text='Cluster is outside the displayed rows; use the table or narrow the search.')
 
