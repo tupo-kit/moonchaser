@@ -306,7 +306,7 @@ class GlobeMixin:
             self._grid_step = step
         self.grid_minor.SetVisibility(True)
         self.grid_major.SetVisibility(True)
-        self.grid_caption.SetInput(f"Grid: every {step:g} deg   (L: hide)")
+        self.grid_caption.SetInput(f"Grid {step:g} deg  |  L: toggle")
 
     def refresh_point_marks(self):
         """Rebuild the marks of the comparison set (self._points) on the Moon."""
@@ -364,9 +364,7 @@ class GlobeMixin:
                     placed = True
             mark["label"].SetVisibility(placed)
         count = len(self._points)
-        text = (f"Comparison points: {count}/{MAX_POINTS}   (Shift+click / A: add, P: manage"
-                + (", T: compare)" if count >= 2 else ")")) if count else \
-            "Comparison points: none   (Shift+click / A: add, P: manage / load)"
+        text = f"Points {count}/{MAX_POINTS}  |  Shift-click: add  |  P: manage"
         if self._points_note:
             text += "\n" + self._points_note
         self.points_caption.SetInput(text)
@@ -639,8 +637,7 @@ class GlobeMixin:
             camera.SetViewAngle(75)
             self.place_terrain_camera()
             self.help.SetInput("Terrain view: left-drag to look   |   Wheel: field of view\n"
-                               "V: return to globe   |   G: coordinates   |   T: time interval\n"
-                               "E: eye height")
+                               "V: globe   |   G: coordinates   |   H: display & shortcuts")
         else:
             self._terrain_actor.SetVisibility(False)
             self._terrain_view = False

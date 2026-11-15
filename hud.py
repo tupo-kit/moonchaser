@@ -89,13 +89,8 @@ def dash_polyline(points, dash, gap, scale=(1.0, 1.0)):
 
 
 class HudMixin:
-    GLOBE_HELP = ("Left-drag: orbit   |   Middle/Shift-drag: pan\n"
-                  "Ctrl-drag: orbit cursor point   |   Wheel: zoom   |   Click: select\n"
-                  "G: coordinates   |   T: time interval (2+ points: compare)   |   V: terrain view\n"
-                  "R: reset   |   F: fullscreen   |   E: eye height\n"
-                  "Cyan: local horizon   |   Orange: observer   |   Relief: 3x\n"
-                  "L: lat/lon grid (auto detail)   |   Red N / blue S: poles\n"
-                  "Shift+click / A: add comparison point   |   P: manage, save, load points")
+    GLOBE_HELP = ("Drag to orbit  |  Wheel to zoom  |  Click to select\n"
+                  "S: search   T: analyze   M: map   H: display & shortcuts")
 
     def _init_hud(self):
         """Create every HUD actor (stats, help, horizon inset, graphs, slider, scroll bar) and lay them out."""
@@ -203,7 +198,10 @@ class HudMixin:
         prop.SetFontSize(size)
         prop.SetColor(0.92, 0.96, 1.0)
         prop.SetBackgroundColor(0.025, 0.035, 0.055)
-        prop.SetBackgroundOpacity(0.85)
+        prop.SetBackgroundOpacity(0.08)
+        # VTK's math-text renderer cannot draw text shadows and warns on
+        # every affected label. Keep all HUD labels compatible with it.
+        prop.ShadowOff()
         if top:
             prop.SetVerticalJustificationToTop()
         self.renderer.AddViewProp(actor)
@@ -231,7 +229,8 @@ class HudMixin:
         data.SetPolys(cells)
         actor = self.vtk.vtkActor2D()
         actor.SetMapper(self.overlay_mapper(data))
-        actor.GetProperty().SetColor(0.025, 0.035, 0.055)
+        actor.GetProperty().SetColor(0.11, 0.13, 0.15)
+        actor.GetProperty().SetOpacity(0.82)
         self.renderer.AddViewProp(actor)
         return actor
 

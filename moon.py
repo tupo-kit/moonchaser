@@ -84,21 +84,23 @@ class CoordinateDialog:
         self.window = tk.Toplevel(parent)
         self.window.title("Go to coordinates")
         self.window.resizable(False, False)
-        frame = ttk.Frame(self.window, padding=14)
+        frame = ttk.Frame(self.window, padding=18)
         frame.grid(sticky="nsew")
-        ttk.Label(frame, text="Latitude, longitude (signed or 0 to 360)").grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Label(frame, text="Go to location", font=('TkDefaultFont', 15, 'bold')).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(frame, text="Enter latitude, longitude. Longitude can be signed or 0 to 360.").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(0, 8))
         self.text = tk.Text(frame, width=44, height=2, wrap="word", font="TkFixedFont",
                             undo=True, autoseparators=True, maxundo=100,
                             exportselection=False, padx=7, pady=7)
-        self.text.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.text.grid(row=2, column=0, columnspan=2, sticky="ew")
         self.text.insert("1.0", initial_text)
         self.text.edit_reset()
         self.error = ttk.Label(frame, foreground="#c02020", wraplength=430)
-        self.error.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        self.error.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 4))
         ttk.Button(frame, text="Cancel", command=self.window.destroy).grid(
-            row=3, column=0, sticky="e", padx=(0, 8))
-        ttk.Button(frame, text="Go", command=self.submit).grid(row=3, column=1, sticky="e")
+            row=4, column=0, sticky="e", padx=(0, 8))
+        ttk.Button(frame, text="Go to location", command=self.submit).grid(row=4, column=1, sticky="e")
         self.text.bind("<Return>", self.submit)
         self.text.bind("<KP_Enter>", self.submit)
         self.window.bind("<Escape>", lambda event: self.window.destroy())
@@ -210,13 +212,17 @@ class TimeIntervalDialog:
         self.window = tk.Toplevel(parent)
         self.window.title(title or "Sun / Earth time interval (UTC)")
         self.window.resizable(False, False)
-        frame = ttk.Frame(self.window, padding=14)
+        frame = ttk.Frame(self.window, padding=18)
         frame.grid()
+        ttk.Label(frame, text="Time interval", font=('TkDefaultFont', 15, 'bold')).grid(
+            row=0, column=0, columnspan=3, sticky='w', pady=(0, 3))
+        ttk.Label(frame, text="Choose the UTC interval and sampling step for analysis.").grid(
+            row=1, column=0, columnspan=3, sticky='w', pady=(0, 8))
         self.fields = []
         values = (start.strftime("%Y-%m-%d %H:%M:%S"),
                   stop.strftime("%Y-%m-%d %H:%M:%S"), str(step))
         for row, (label, value) in enumerate(zip(
-                ("Start UTC", "End UTC", "Step"), values)):
+                ("Start UTC", "End UTC", "Step"), values), start=2):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=4)
             entry = ttk.Entry(frame, width=28)
             entry.insert(0, value)
@@ -226,15 +232,15 @@ class TimeIntervalDialog:
             self.fields.append(entry)
         self.unit = ttk.Combobox(frame, values=("seconds", "minutes", "hours", "days"), state="readonly", width=10)
         self.unit.set(unit)
-        self.unit.grid(row=2, column=2, padx=(8, 0))
-        ttk.Label(frame, text="Model").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=4)
+        self.unit.grid(row=4, column=2, padx=(8, 0))
+        ttk.Label(frame, text="Model").grid(row=5, column=0, sticky="w", padx=(0, 12), pady=4)
         self.method = ttk.Combobox(frame, values=tuple(SKY_METHODS), state="readonly", width=26)
         self.method.set(method if method in SKY_METHODS else "Skyfield")
-        self.method.grid(row=3, column=1, sticky="ew", pady=4)
+        self.method.grid(row=5, column=1, sticky="ew", pady=4)
         ttk.Label(frame, text=f"UTC dates: YYYY-MM-DD HH:MM:SS. Up to {MAX_TIME_SAMPLES} samples.").grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=6)
+            row=6, column=0, columnspan=3, sticky="w", pady=6)
         self.error = ttk.Label(frame, foreground="#c02020", wraplength=430)
-        self.error.grid(row=5, column=0, columnspan=2, sticky="w")
+        self.error.grid(row=7, column=0, columnspan=3, sticky="w")
 
         self.apply_button = ttk.Button(frame, text="Apply interval")
 
@@ -248,9 +254,9 @@ class TimeIntervalDialog:
                 self.window.destroy()
             return "break"
 
-        ttk.Button(frame, text="Cancel", command=self.window.destroy).grid(row=6, column=0, pady=(10, 0))
+        ttk.Button(frame, text="Cancel", command=self.window.destroy).grid(row=8, column=0, pady=(10, 0))
         self.apply_button.configure(command=apply)
-        self.apply_button.grid(row=6, column=1, sticky="e", pady=(10, 0))
+        self.apply_button.grid(row=8, column=1, sticky="e", pady=(10, 0))
         self.window.bind("<Return>", apply)
         self.window.bind("<Escape>", lambda event: self.window.destroy())
         self.window.update_idletasks()
@@ -332,32 +338,40 @@ class PointsDialog:
         self.window = tk.Toplevel(parent)
         self.window.title("Comparison points")
         self.window.resizable(False, False)
-        frame = ttk.Frame(self.window, padding=14)
+        frame = ttk.Frame(self.window, padding=18)
         frame.grid(sticky="nsew")
-        ttk.Label(frame, text=f"Points to compare (2 to {MAX_POINTS}):  latitude, longitude").grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ttk.Label(frame, text="Comparison points", font=('TkDefaultFont', 15, 'bold')).grid(
+            row=0, column=0, columnspan=3, sticky='w', pady=(0, 3))
+        self.count_label = ttk.Label(frame)
+        self.count_label.grid(row=1, column=0, columnspan=3, sticky='w', pady=(0, 8))
         self.listbox = tk.Listbox(frame, width=34, height=12, selectmode="extended",
                                   exportselection=False, font="TkFixedFont")
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.listbox.yview)
         self.listbox.configure(yscrollcommand=scrollbar.set)
-        self.listbox.grid(row=1, column=0, rowspan=6, sticky="nsew")
-        scrollbar.grid(row=1, column=1, rowspan=6, sticky="ns")
-        buttons = (("Add current location", self.add_current), ("Remove selected", self.remove_selected),
-                   ("Clear all", self.clear), ("Load (replace)...", lambda: self.load(False)),
-                   ("Load (add)...", lambda: self.load(True)), ("Save...", self.save))
-        for row, (label, command) in enumerate(buttons, start=1):
-            ttk.Button(frame, text=label, command=lambda c=command: self.guard(c)).grid(
-                row=row, column=2, sticky="ew", padx=(10, 0), pady=2)
+        self.listbox.grid(row=2, column=0, sticky="nsew")
+        scrollbar.grid(row=2, column=1, sticky="ns")
+        side = ttk.Frame(frame)
+        side.grid(row=2, column=2, sticky='n', padx=(12, 0))
+        edit = ttk.LabelFrame(side, text='Points', padding=6)
+        edit.pack(fill='x')
+        files = ttk.LabelFrame(side, text='Files', padding=6)
+        files.pack(fill='x', pady=(8, 0))
+        for parent_box, buttons in ((edit, (("Add current", self.add_current),
+                                           ("Remove selected", self.remove_selected), ("Clear all", self.clear))),
+                                    (files, (("Load and replace...", lambda: self.load(False)),
+                                             ("Load and add...", lambda: self.load(True)), ("Save...", self.save)))):
+            for label, command in buttons:
+                ttk.Button(parent_box, text=label, command=lambda c=command: self.guard(c)).pack(fill='x', pady=2)
         ttk.Label(frame, text="Add by coordinates, e.g. -43.31, -11.36").grid(
-            row=7, column=0, columnspan=3, sticky="w", pady=(10, 2))
+            row=3, column=0, columnspan=3, sticky="w", pady=(10, 2))
         self.entry = ttk.Entry(frame, width=30)
-        self.entry.grid(row=8, column=0, columnspan=2, sticky="ew")
+        self.entry.grid(row=4, column=0, columnspan=2, sticky="ew")
         ttk.Button(frame, text="Add", command=lambda: self.guard(self.add_typed)).grid(
-            row=8, column=2, sticky="ew", padx=(10, 0))
+            row=4, column=2, sticky="ew", padx=(10, 0))
         self.error = ttk.Label(frame, foreground="#c02020", wraplength=430)
-        self.error.grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 4))
+        self.error.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 4))
         bottom = ttk.Frame(frame)
-        bottom.grid(row=10, column=0, columnspan=3, sticky="e", pady=(6, 0))
+        bottom.grid(row=6, column=0, columnspan=3, sticky="e", pady=(6, 0))
         ttk.Button(bottom, text="Cancel", command=self.window.destroy).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(bottom, text="Apply", command=self.apply).grid(row=0, column=1)
         self.entry.bind("<Return>", lambda event: (self.guard(self.add_typed), "break")[-1])
@@ -370,6 +384,7 @@ class PointsDialog:
         self.entry.focus_force()
 
     def refresh(self):
+        self.count_label.configure(text=f'{len(self.points)} of {MAX_POINTS} points  |  Shift or Ctrl to select several')
         self.listbox.delete(0, "end")
         for number, (lat, lon) in enumerate(self.points, start=1):
             self.listbox.insert("end", f"P{number:<2} {lat:+10.5f}, {lon:+11.5f}")
@@ -456,7 +471,7 @@ class MoonWindow(GlobeMixin, HudMixin):
             return
         settings = self._overlay_settings
         expanded = self._graph_expanded
-        self._overlay_button.SetVisibility(not expanded)
+        self._overlay_button.SetVisibility(not expanded and self._desktop_shell is None)
         self.help.SetVisibility(not expanded and settings['help'])
         self.grid_caption.SetVisibility(self.grid_caption.GetVisibility() and settings['grid_caption'])
         self.points_caption.SetVisibility(self.points_caption.GetVisibility() and settings['points_caption'])
@@ -498,10 +513,12 @@ class MoonWindow(GlobeMixin, HudMixin):
                 actor.GetSize(self.renderer, size)
                 bottom += size[1] + 6
 
-    def __init__(self, offscreen=False, enable_ephemeris=True, ephemeris_fetcher=None):
+    def __init__(self, offscreen=False, enable_ephemeris=True, ephemeris_fetcher=None,
+                 render_window=None, interactor=None, desktop_shell=None):
         import vtk
 
         self.vtk = vtk
+        self._desktop_shell = desktop_shell
         self.lat, self.lon = -43.31, -11.36
         self.orbit_pivot = np.zeros(3)
         self._terrain_view = False
@@ -544,7 +561,6 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._point_cache = point_data.CACHE  # shared with the search window: stored sky data is never recomputed
         self._visibility_dialog = None
         self._tk_pump_active = False
-        self.GLOBE_HELP = self.GLOBE_HELP + "\nS: search visibility   |   I: analyze selected search point\nM: change map   |   K: hide/show map legend"
         self._points = []              # [(lat, lon), ...] chosen with Shift+click / A / P
         self._compare_active = False   # True: the graph window compares _compare_points
         self._compare_points = []      # snapshot of _points used by the running comparison
@@ -562,14 +578,17 @@ class MoonWindow(GlobeMixin, HudMixin):
         self.renderer = vtk.vtkRenderer()
         self.renderer.SetBackground(0.025, 0.035, 0.055)
         self.renderer.UseFXAAOn()
-        self.window = vtk.vtkRenderWindow()
+        self.window = render_window if render_window is not None else vtk.vtkRenderWindow()
         self.window.SetWindowName("Moon Horizon - Desktop Viewer")
-        self.window.SetSize(1280, 900)
-        self.window.SetMultiSamples(8)
+        if render_window is None:
+            self.window.SetSize(1280, 900)
+        # Some X11/GLX drivers cannot create a multisampled context. FXAA on
+        # the renderer still smooths edges without requiring an MSAA visual.
+        self.window.SetMultiSamples(0)
         self.window.AddRenderer(self.renderer)
         if offscreen:
             self.window.SetOffScreenRendering(True)
-        self.interactor = vtk.vtkRenderWindowInteractor()
+        self.interactor = interactor if interactor is not None else vtk.vtkRenderWindowInteractor()
         self.interactor.SetRenderWindow(self.window)
         self.coordinate_editing = False
         self._coordinate_root = None
@@ -858,6 +877,9 @@ class MoonWindow(GlobeMixin, HudMixin):
         """Non-modal, individually switchable globe overlays."""
         if self.coordinate_editing:
             return
+        if self._desktop_shell is not None:
+            self._desktop_shell.show_panel('layers')
+            return
         import tkinter as tk
         from tkinter import ttk
         if self._overlay_dialog is not None:
@@ -871,7 +893,14 @@ class MoonWindow(GlobeMixin, HudMixin):
             dialog.title('Display options')
             frame = ttk.Frame(dialog, padding=14)
             frame.pack(fill='both', expand=True)
-            ttk.Label(frame, text='Show on globe:').pack(anchor='w', pady=(0, 6))
+            ttk.Label(frame, text='Display', font=('TkDefaultFont', 15, 'bold')).pack(anchor='w', pady=(0, 8))
+            tabs = ttk.Notebook(frame)
+            tabs.pack(fill='both', expand=True)
+            layers = ttk.Frame(tabs, padding=10)
+            shortcuts = ttk.Frame(tabs, padding=10)
+            tabs.add(layers, text='Visible layers')
+            tabs.add(shortcuts, text='Shortcuts')
+            ttk.Label(layers, text='Choose what appears on the globe.').pack(anchor='w', pady=(0, 6))
             labels = (('help', 'Keyboard and mouse help'), ('horizon_inset', 'Horizon graph'),
                       ('horizon_outline', 'Horizon outline on globe'), ('point_details', 'Point details'),
                       ('grid_caption', 'Grid information'), ('points_caption', 'Comparison points information'),
@@ -882,8 +911,20 @@ class MoonWindow(GlobeMixin, HudMixin):
                 def changed(name=key, var=variable):
                     self._overlay_settings[name] = bool(var.get())
                     self.window.Render()
-                ttk.Checkbutton(frame, text=title, variable=variable, command=changed).pack(anchor='w', pady=2)
-            ttk.Label(frame, text='Use H or Display to reopen these options.').pack(anchor='w', pady=(8, 4))
+                ttk.Checkbutton(layers, text=title, variable=variable, command=changed).pack(anchor='w', pady=2)
+            shortcut_text = ("NAVIGATION\n"
+                             "Drag  Orbit       Middle / Shift-drag  Pan\n"
+                             "Ctrl-drag  Orbit cursor point       Wheel  Zoom\n"
+                             "G  Coordinates       V  Terrain view       R  Reset       F  Fullscreen\n\n"
+                             "SEARCH AND ANALYSIS\n"
+                             "S  Search       T  Time interval       I  Analyze selected result\n"
+                             "Shift-click / A  Add point       P  Manage points\n"
+                             "Comma / period  Change comparison point\n\n"
+                             "DISPLAY\n"
+                             "M  Change map       K  Map legend       L  Grid\n"
+                             "E  Eye height       H  Display options       Esc  Close")
+            ttk.Label(shortcuts, text=shortcut_text, justify='left', wraplength=500).pack(anchor='w')
+            ttk.Label(frame, text='Press H or use Display to reopen.').pack(anchor='w', pady=(8, 4))
             ttk.Button(frame, text='Close', command=self.close_overlay_settings).pack(anchor='e')
             dialog.protocol('WM_DELETE_WINDOW', self.close_overlay_settings)
             dialog.bind('<Escape>', lambda event: self.close_overlay_settings())
@@ -1212,6 +1253,9 @@ class MoonWindow(GlobeMixin, HudMixin):
 
     def begin_visibility_search(self):
         if self.coordinate_editing:
+            return
+        if self._desktop_shell is not None:
+            self._desktop_shell.show_panel('search')
             return
         try:
             import tkinter as tk
@@ -1550,6 +1594,9 @@ class MoonWindow(GlobeMixin, HudMixin):
     def begin_time_entry(self):
         if self.coordinate_editing:
             return
+        if self._desktop_shell is not None:
+            self._desktop_shell.show_panel('time')
+            return
         try:
             import tkinter as tk
         except ImportError:
@@ -1695,16 +1742,14 @@ class MoonWindow(GlobeMixin, HudMixin):
             lat, lon, self._panorama_texture_rgb, bearings=max(360, self.window.GetSize()[0]))
         self._panorama_range = None
 
-    def build_stats_base(self, lat, lon, angles, distances, heading="MOON HORIZON"):
+    def build_stats_base(self, lat, lon, angles, distances, heading="SELECTED LOCATION"):
         elevation = float(sample_dem_bilinear(lat, lon))
         return (
             f"{heading}\n"
             f"Latitude {lat:+.3f} deg    Longitude {lon:+.3f} deg\n"
             f"Elevation {elevation:+,.0f} m    Slope {compute_slope_deg(lat, lon):.1f} deg\n"
-            f"Horizon distance {np.min(distances):.1f} to {np.max(distances):.1f} km\n"
-            f"Horizon angle {np.min(angles):+.2f} to {np.max(angles):+.2f} deg\n"
-            f"360 bearings; {terrain.EYE_HEIGHT_M:g} m eye height (E: change); terrain search to 250 km\n"
-            f"Texture: {self.texture_dimensions[0]} x {self.texture_dimensions[1]}")
+            f"Horizon {np.min(angles):+.2f} to {np.max(angles):+.2f} deg\n"
+            f"Distance {np.min(distances):.1f} to {np.max(distances):.1f} km  |  Eye {terrain.EYE_HEIGHT_M:g} m (E)")
 
     # ------------------------------------------------------------------ point comparison
 
@@ -1868,7 +1913,7 @@ class MoonWindow(GlobeMixin, HudMixin):
             if px * width - size[0] - 5 <= x <= px * width + 5 and py * height - 5 <= y <= py * height + size[1] + 5:
                 self.cycle_horizon_map_mode()
                 return
-        if not self._graph_expanded and 0.73 <= x / width <= 0.87 and 0.94 <= y / height <= 1.0:
+        if self._desktop_shell is None and not self._graph_expanded and 0.73 <= x / width <= 0.87 and 0.94 <= y / height <= 1.0:
             self.begin_overlay_settings()
             return
         if (not self._graph_expanded and self._map_mode in ('Elevation', 'Slope')
@@ -1906,17 +1951,30 @@ class MoonWindow(GlobeMixin, HudMixin):
                 lon = np.degrees(np.arctan2(py, px))
                 self.select_location(float(lat), float(lon))
 
-    def run(self):
-        self.interactor.Initialize()
-        self._sky_pump_observer = self.interactor.AddObserver("TimerEvent", self.poll_sky)
-        self._sky_timer = self.interactor.CreateRepeatingTimer(100)
-        self.poll_sky()
-        self.window.Render()
+    def run(self, qt_app=None):
         # Handle the window-manager close button (Escape no longer quits).
         exit_observer = self.interactor.AddObserver(
             "ExitEvent", lambda obj, event: obj.SetDone(True))
+
+        def start_rendering():
+            self.interactor.Initialize()
+            self._sky_pump_observer = self.interactor.AddObserver("TimerEvent", self.poll_sky)
+            self._sky_timer = self.interactor.CreateRepeatingTimer(100)
+            self.poll_sky()
+            self.window.Render()
+
         try:
-            run_responsive_event_loop(self.interactor)
+            if qt_app is not None:
+                # Let Qt create and map the native widget before VTK attempts
+                # its first OpenGL render in Initialize().
+                from desktop_ui import QtCore
+                if self._desktop_shell is not None:
+                    self._desktop_shell.show()
+                QtCore.QTimer.singleShot(0, start_rendering)
+                qt_app.exec() if hasattr(qt_app, 'exec') else qt_app.exec_()
+            else:
+                start_rendering()
+                run_responsive_event_loop(self.interactor)
         finally:
             self.interactor.RemoveObserver(exit_observer)
             self._sky_stop.set()
@@ -1945,11 +2003,17 @@ def main():
     parser.add_argument("--texture", help="Optional path to a Moon color texture")
     arguments = parser.parse_args()
     try:
+        from desktop_ui import MainShell, create_application
+        app = create_application()
         load_data(arguments.texture)
-        MoonWindow().run()
+        shell = MainShell()
+        render_window = shell.vtk_widget.GetRenderWindow()
+        window = MoonWindow(render_window=render_window, interactor=render_window.GetInteractor(), desktop_shell=shell)
+        shell.bind_owner(window)
+        window.run(qt_app=app)
     except ImportError as error:
         print(f"Missing desktop dependency: {error}\n"
-              "Install with: python -m pip install numpy Pillow vtk", file=sys.stderr)
+              "Install with: python -m pip install numpy Pillow vtk skyfield PySide6", file=sys.stderr)
         return 1
     except Exception as error:
         print(f"Moon Horizon could not start: {error}", file=sys.stderr)
