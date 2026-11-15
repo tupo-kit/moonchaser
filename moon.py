@@ -916,15 +916,16 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._analysis_single_point = None
         self._analysis_points_override = None
         self._compare = None
+        self._compare_visible = [visible and point not in self._point_off
+                                 for point, visible in zip(self._compare_points, self._compare_visible)]
         current = (self.lat, self.lon)
-        self._compare_points = []
-        self._compare_index = next((i for i, point in enumerate(self.analysis_points()) if same_point(point, current)), 0)
+        self._compare_index = next((i for i, point in enumerate(self._points) if same_point(point, current)), 0)
         self.apply_layout()
         self._now_mode = False
         self._epochs = epochs
         self._time_index = 0
         self._interval_step_minutes = float(step) * TIME_UNITS[unit]
-        self.record_analysis(self.analysis_points(), start, stop, self._interval_step_minutes, method, len(epochs))
+        self.record_analysis(list(self._points), start, stop, self._interval_step_minutes, method, len(epochs))
         self.request_sky_update()
 
     def record_analysis(self, points, start, stop, step_minutes, method, samples):
@@ -1370,13 +1371,15 @@ class MoonWindow(GlobeMixin, HudMixin):
     # ------------------------------------------------------------------ point comparison
 
     def sync_compare_points(self):
-        """Take over the current point set for a comparison (all points shown, index kept in range)."""
+        """Analyze the full saved list while retaining visibility by point."""
         single = getattr(self, '_analysis_single_point', None)
         override = self._analysis_points_override
-        points = list(override) if override is not None else ([single] if single is not None else self.analysis_points() or [(self.lat, self.lon)])
+        points = list(override) if override is not None else ([single] if single is not None else list(self._points) or [(self.lat, self.lon)])
         if points != self._compare_points:
+            previous = list(zip(self._compare_points, self._compare_visible))
+            self._compare_visible = [next((visible for old, visible in previous if same_point(old, point)),
+                                          point not in self._point_off) for point in points]
             self._compare_points = points
-            self._compare_visible = [True] * len(points)
             self._compare_index = min(self._compare_index, len(points) - 1)
             self.apply_layout()
 

@@ -1063,7 +1063,7 @@ class TimePanel(QtWidgets.QWidget):
         if used is None or not self.shell.has_analysis():
             return []
         reasons = []
-        if self.owner._analysis_points_override is None and self.owner.analysis_points() != used['points']:
+        if self.owner._analysis_points_override is None and list(self.owner._points) != used['points']:
             reasons.append('Points changed.')
         if self.shell.interval != (used['start'], used['stop']):
             reasons.append('Interval changed.')
@@ -1084,7 +1084,7 @@ class TimePanel(QtWidgets.QWidget):
             return 'Analyzing…', False
         if self.stale_reasons():
             return 'Update analysis', True
-        count = len(self.owner.analysis_points())
+        count = len(self.owner._points)
         return (f'Analyze {counted(count, "point")}' if count else 'Analyze selected points'), True
 
     def _has_analysis_points(self):
@@ -2080,7 +2080,7 @@ class MainShell(QtWidgets.QMainWindow):
         self._shown_location = None
         self._zen = False
         self._zen_sidebar = False
-        self._sidebar_width = 360
+        self._sidebar_width = 420
         root = QtWidgets.QWidget()
         self.setCentralWidget(root)
         outer = QtWidgets.QVBoxLayout(root)
@@ -2126,7 +2126,7 @@ class MainShell(QtWidgets.QMainWindow):
         self.vtk_widget.installEventFilter(self)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
-        self.splitter.setSizes([self._sidebar_width, 1080])
+        self.splitter.setSizes([self._sidebar_width, 1020])
         outer.addWidget(self.splitter, 1)
         self.interval_popup = self._build_interval_popup()
         shortcut_type = getattr(QtGui, 'QShortcut', None) or QtWidgets.QShortcut

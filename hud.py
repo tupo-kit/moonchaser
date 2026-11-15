@@ -307,26 +307,30 @@ class HudMixin:
         return actor
 
     def update_graph_fill(self, key, state):
-        """Shade a single series; multiple series retain their individual lines."""
+        """Shade one series using triangles, avoiding costly polygon triangulation."""
+        from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
         actor = self.panels[key]['fill']
         data = self.vtk.vtkPolyData()
         if state and len(state.get('values', {})) == 1:
-            series = next(iter(state['values'].values()))
-            xs = state['xs']
-            x0, x1, y0, y1 = self._panel_boxes[key]
-            valid = np.isfinite(series)
-            # Missing samples are not bridged by the fill.
-            ids = np.flatnonzero(valid)
-            if len(ids) >= 2 and np.all(np.diff(ids) == 1):
+            series = np.asarray(next(iter(state['values'].values())), dtype=float)
+            xs = np.asarray(state['xs'], dtype=float)
+            _x0, _x1, y0, y1 = self._panel_boxes[key]
+            valid = np.isfinite(series) & np.isfinite(xs)
+            starts = np.flatnonzero(valid[:-1] & valid[1:])
+            if len(starts):
+                coords = np.empty((len(xs) * 2, 3), dtype=np.float64)
+                coords[:, 0] = np.repeat(xs, 2)
+                coords[0::2, 1] = y0
+                coords[1::2, 1] = y0 + (y1 - y0) * np.where(valid, series, 0.0) / state['high']
+                coords[:, 2] = 0.0
+                i = starts * 2
+                triangles = np.column_stack((i, i + 1, i + 2, i + 1, i + 3, i + 2)).ravel()
                 points = self.vtk.vtkPoints()
-                points.InsertNextPoint(float(xs[ids[0]]), y0, 0)
-                for index in ids:
-                    points.InsertNextPoint(float(xs[index]), float(y0 + (y1-y0)*series[index]/state['high']), 0)
-                points.InsertNextPoint(float(xs[ids[-1]]), y0, 0)
+                points.SetData(numpy_to_vtk(coords, deep=True))
                 cells = self.vtk.vtkCellArray()
-                cells.InsertNextCell(points.GetNumberOfPoints())
-                for index in range(points.GetNumberOfPoints()):
-                    cells.InsertCellPoint(index)
+                offsets = np.arange(0, len(triangles) + 1, 3, dtype=np.int64)
+                cells.SetData(numpy_to_vtkIdTypeArray(offsets, deep=True),
+                              numpy_to_vtkIdTypeArray(triangles.astype(np.int64), deep=True))
                 data.SetPoints(points)
                 data.SetPolys(cells)
         actor.GetMapper().SetInputData(data)
@@ -862,6 +866,9 @@ class HudMixin:
         if not self._graph_expanded:
             return
         value = float(np.clip(value, 0.0, self.page_height() - 1.0))
+        # Qt headers use integer pixel positions; snap VTK coordinates to the same pixel grid.
+        height = max(1, self.window.GetSize()[1])
+        value = min(self.page_height() - 1.0, round(value * height) / height)
         if value == self._scroll:
             return
         delta = value - self._scroll
