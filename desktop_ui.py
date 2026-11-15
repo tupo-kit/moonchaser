@@ -7,11 +7,20 @@ import time
 from datetime import timedelta
 from types import SimpleNamespace
 
-# QVTK's X11 render window needs an X11 widget handle. Under a Wayland
-# desktop, use XWayland when available unless the user chose a Qt platform.
-if (sys.platform.startswith('linux') and os.environ.get('WAYLAND_DISPLAY')
-        and os.environ.get('DISPLAY')):
-    os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')
+# QVTK's X11 render window needs a real X11 window id. Under native Wayland Qt
+# hands out a pointer-sized id, and VTK fails with "The result is out of range"
+# followed by an X BadWindow error. So on a Wayland session Qt must run through
+# XWayland (the "xcb" platform). This deliberately OVERRIDES an inherited
+# QT_QPA_PLATFORM=wayland, which many desktop sessions export. To opt out, set
+# MOON_KEEP_QT_PLATFORM=1.
+if sys.platform.startswith('linux') and not os.environ.get('MOON_KEEP_QT_PLATFORM'):
+    _wayland = (bool(os.environ.get('WAYLAND_DISPLAY'))
+                or os.environ.get('XDG_SESSION_TYPE', '').lower() == 'wayland')
+    if _wayland and os.environ.get('DISPLAY'):
+        os.environ['QT_QPA_PLATFORM'] = 'xcb'
+    elif _wayland:
+        print('Moon Horizon: Wayland session without XWayland (DISPLAY is not set). '
+              'The VTK window needs XWayland; install/enable it.', file=sys.stderr)
 
 import vtk
 
