@@ -462,7 +462,7 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
             range_result(lat_ranges, lon_ranges, len(eligible), total_cells)
         cells = eligible
     initial_filtered = total_cells - len(cells)
-    results, checked = [], {}
+    results, checked, matched = [], {}, set()
     completed = filtered = initial_filtered
     for cell in cells:
         if cancel is not None and cancel.is_set():
@@ -476,6 +476,8 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
             for point in points:
                 if cancel is not None and cancel.is_set():
                     break
+                if point in matched:
+                    continue
                 if point not in checked:
                     elevation = float(terrain.sample_dem_bilinear(*point))
                     stored = cache.get_sky(point[0], point[1], epochs, cache_source) if cache is not None else None
@@ -519,6 +521,7 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
                 if (value is not None and min_sun <= value[0] <= max_sun
                         and min_earth <= value[1] <= max_earth):
                     lunar = value[4]
+                    matched.add(point)
                     results.append({"lat": point[0], "lon": point[1], "sun_percent": value[0],
                                     "earth_percent": value[1], "slope_deg": value[2], "max_slope_deg": value[3],
                                     "sun_lunar_mean": lunar[0] if lunar else None,
@@ -690,13 +693,15 @@ def warm_up(workers=0):
     _get_pool(workers or default_workers())
 
 
-def _evaluate_cell(cell, p):
+def _evaluate_cell(cell, p, excluded=()):
     """One terrain-checked cell: (row or None, screened out, (point, horizon, classified) or None)."""
     epochs, min_sun, min_earth = p['epochs'], p['min_sun'], p['min_earth']
     max_sun, max_earth = p['max_sun'], p['max_earth']
     points = cell_sample_points(cell, p['side'])
     center = points[0]
     for point in points:
+        if point in excluded:
+            continue
         elevation = float(terrain.sample_dem_bilinear(*point))
         pos = sky.get_positions_nocache(point[1], point[0], (elevation + terrain.EYE_HEIGHT_M) / 1000.0, epochs)
         floor = optimistic_horizon_floor(elevation, p['min_terrain'])
@@ -732,7 +737,14 @@ def _evaluate_cell(cell, p):
 
 def _run_cells(cells, p):
     terrain.EYE_HEIGHT_M = p['eye']
-    return [_evaluate_cell(cell, p) for cell in cells]
+    matched = set()
+    outputs = []
+    for cell in cells:
+        result = _evaluate_cell(cell, p, matched)
+        outputs.append(result)
+        if result[0] is not None:
+            matched.add((result[0]['lat'], result[0]['lon']))
+    return outputs
 
 
 def _run_blocks(items, p):
@@ -862,13 +874,19 @@ def search_cells_parallel(cells, epochs, min_sun, min_earth, side, screen_horizo
             cells = eligible
         filtered = completed = total_cells - len(cells)
         results = []
+        matched = set()
 
         def on_cells(part, outputs):
             nonlocal filtered, completed
             for cell, (row, screened, item) in zip(part, outputs):
+                while row is not None and (row['lat'], row['lon']) in matched:
+                    if cancel is not None and cancel.is_set():
+                        return
+                    row, screened, item = pool.submit(_evaluate_cell, cell, p, matched).result()
                 completed += 1
                 filtered += bool(screened)
                 if row is not None:
+                    matched.add((row['lat'], row['lon']))
                     row['slope_deg'] = terrain.compute_slope_deg(row['lat'], row['lon'])   # same source as the table
                     results.append(row)
                     if cache is not None and item is not None:
@@ -988,9 +1006,9 @@ COLUMN_SPECS = (
     ('lon', 'Longitude', 'Position', 90, 'lon', _num('+.3f'), 'longitude_deg'),
     ('sun', 'Sun visible %', 'Visible % of the interval', 110, 'sun_percent', _num('.1f'), 'sun_visible_percent'),
     ('earth', 'Earth visible %', 'Visible % of the interval', 115, 'earth_percent', _num('.1f'), 'earth_visible_percent'),
-    ('lunar_mean', 'Sun avg %/lunar day', 'Sun per lunar day', 135, 'sun_lunar_mean', _num('.2f'),
+    ('lunar_mean', 'Avg Sun visible % per lunar day', 'Sun per lunar day', 230, 'sun_lunar_mean', _num('.2f'),
      'sun_avg_percent_per_lunar_day'),
-    ('lunar_sd', 'Sun SD %', 'Sun per lunar day', 80, 'sun_lunar_std', _num('.2f'), 'sun_percent_per_lunar_day_sd'),
+    ('lunar_sd', 'Sun standard deviation %', 'Sun per lunar day', 210, 'sun_lunar_std', _num('.2f'), 'sun_percent_per_lunar_day_sd'),
     ('elevation', 'Elevation m', 'Terrain', 95, 'elevation_m', _num('+,.0f'), 'elevation_m'),
     ('slope', 'Slope deg', 'Terrain', 80, 'slope_deg', _num('.2f'), 'slope_deg'),
     ('max_slope', 'Max slope deg', 'Terrain', 100, 'max_slope_deg', _num('.2f'), 'max_sampled_slope_deg'),
@@ -1007,16 +1025,16 @@ COLUMN_SPECS = (
     ('earth_period', 'Avg Earth period', 'Centre above the horizon', 125, 'earth_mean_period_s',
      _period('earth_period_partial'), 'earth_mean_visible_period_s'),
     ('sun_az', 'Sun AZ avg deg', 'Directions (samples above the horizon)', 110, 'sun_az_mean', _num('.2f'), 'sun_az_avg_deg'),
-    ('sun_az_sd', 'Sun AZ SD deg', 'Directions (samples above the horizon)', 110, 'sun_az_sd', _num('.2f'), 'sun_az_sd_deg'),
+    ('sun_az_sd', 'Sun AZ standard deviation deg', 'Directions (samples above the horizon)', 110, 'sun_az_sd', _num('.2f'), 'sun_az_sd_deg'),
     ('sun_el', 'Sun EL avg deg', 'Directions (samples above the horizon)', 110, 'sun_el_mean', _num('+.2f'), 'sun_el_avg_deg'),
-    ('sun_el_sd', 'Sun EL SD deg', 'Directions (samples above the horizon)', 110, 'sun_el_sd', _num('.2f'), 'sun_el_sd_deg'),
+    ('sun_el_sd', 'Sun EL standard deviation deg', 'Directions (samples above the horizon)', 110, 'sun_el_sd', _num('.2f'), 'sun_el_sd_deg'),
     ('earth_az', 'Earth AZ avg deg', 'Directions (samples above the horizon)', 115, 'earth_az_mean', _num('.2f'),
      'earth_az_avg_deg'),
-    ('earth_az_sd', 'Earth AZ SD deg', 'Directions (samples above the horizon)', 115, 'earth_az_sd', _num('.2f'),
+    ('earth_az_sd', 'Earth AZ standard deviation deg', 'Directions (samples above the horizon)', 115, 'earth_az_sd', _num('.2f'),
      'earth_az_sd_deg'),
     ('earth_el', 'Earth EL avg deg', 'Directions (samples above the horizon)', 115, 'earth_el_mean', _num('+.2f'),
      'earth_el_avg_deg'),
-    ('earth_el_sd', 'Earth EL SD deg', 'Directions (samples above the horizon)', 115, 'earth_el_sd', _num('.2f'),
+    ('earth_el_sd', 'Earth EL standard deviation deg', 'Directions (samples above the horizon)', 115, 'earth_el_sd', _num('.2f'),
      'earth_el_sd_deg'),
     ('cells', 'Cells', 'Position', 60, None, None, None),
     ('cell', 'Cell bounds (lat / lon)', 'Position', 250, None, None, None),
@@ -1105,7 +1123,7 @@ class SearchDialog:
                     'is computed for each complete lunar day when selected or when a limit is entered. '
                     'Standard deviation requires the average. Blank limit = no limit.')
             if days < LUNAR_DAY_DAYS:
-                note += ' Shorter than one lunar day: the whole interval counts as one day (SD 0).'
+                note += ' Shorter than one lunar day: the whole interval counts as one day (standard deviation 0).'
         else:
             note = f'Available when the interval is longer than {LONG_INTERVAL_DAYS:.0f} days (now {days:,.1f} days).'
         self.lunar_note.configure(text=note)
@@ -1197,7 +1215,11 @@ class SearchDialog:
         try:
             get = lambda name: self.f[name].get()
             start, stop = sky.parse_utc(get('start')), sky.parse_utc(get('end'))
-            step_hours, spacing = float(get('step')), float(get('spacing'))
+            unit = get('step_unit') if 'step_unit' in self.f else 'hours'
+            if unit not in sky.TIME_UNITS:
+                raise ValueError('Choose a valid time-step unit.')
+            step_hours = float(get('step')) * sky.TIME_UNITS[unit] / 60.0
+            spacing = float(get('spacing'))
             min_sun, max_sun = float(get('min_sun')), float(get('max_sun'))
             min_earth, max_earth = float(get('min_earth')), float(get('max_earth'))
             lat_min, lat_max = self._pair(get('lat'))
@@ -1511,6 +1533,8 @@ class SearchDialog:
                   'side': side, 'horizon': horizon,
                   'max_slope': parameters[14] if len(parameters) > 14 and parameters[14] is not None else '',
                   'slope_radius': parameters[15] if len(parameters) > 15 else 1}
+        if 'step_unit' in self.f:
+            self.f['step_unit'].set('hours')
         for name, value in values.items():
             self._set(name, value)
         saved = parameters[21] if len(parameters) > 21 and parameters[21] else (None,) * 4
@@ -1591,8 +1615,8 @@ class SearchDialog:
         self.marker_mode = self.view_mode.get()
         self.marker_results = self._marker_rows()
         self.show_matches = True
-        self.apply_to_viewer(f'Added {len(rows):,} point(s) to the comparison set; analysis opened.' if analyze
-                             else f'Added {len(rows):,} point(s) to the comparison set.')
+        self.apply_to_viewer(f'Added {len(rows):,} point(s) to the analysis list; analysis opened.' if analyze
+                             else f'Added {len(rows):,} point(s) to the analysis list.')
 
     def analyze_selected(self):
         if self.is_sector_results():

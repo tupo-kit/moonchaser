@@ -226,10 +226,10 @@ class Segmented(QtWidgets.QFrame):
 
 class TerrainSwitch(Segmented):
     def __init__(self):
-        super().__init__(('Quick scan', 'Precise'))
-        super().set('Precise')
-    def get(self): return self.value == 'Precise'
-    def set(self, value): super().set('Precise' if value else 'Quick scan')
+        super().__init__(('Quick search', 'Precise search'))
+        super().set('Precise search')
+    def get(self): return self.value == 'Precise search'
+    def set(self, value): super().set('Precise search' if value else 'Quick search')
 
 
 class Gate:
@@ -536,7 +536,7 @@ class SearchPanel(search.SearchDialog):
         mode = QtWidgets.QVBoxLayout()
         mode.setSpacing(8)
         mode.addWidget(self.use_terrain)
-        note = QtWidgets.QLabel('Precise uses the terrain horizon and returns points. Quick scan ignores terrain and returns candidate clusters.')
+        note = QtWidgets.QLabel('Precise search uses the terrain horizon and returns points. Quick search ignores terrain and returns candidate clusters.')
         note.setObjectName('muted')
         note.setWordWrap(True)
         mode.addWidget(note)
@@ -557,11 +557,16 @@ class SearchPanel(search.SearchDialog):
         self._pair_row(area, 1, 'Longitude', self.lon_min, self.lon_max)
         self._link_pair('lat', self.lat_min, self.lat_max)
         self._link_pair('lon', self.lon_min, self.lon_max)
-        for row, (key, label, value) in enumerate((('spacing', 'Grid, deg', '10'), ('step', 'Step, hours', '2')), 2):
+        for row, (key, label, value) in enumerate((('spacing', 'Grid, deg', '10'), ('step', 'Time step', '2')), 2):
             entry = Entry(value)
             self.f[key] = entry
             area.addWidget(self._muted(label), row, 0)
             area.addWidget(entry, row, 1)
+        self.step_unit = Combo()
+        self.step_unit.addItems(['seconds', 'minutes', 'hours', 'days'])
+        self.step_unit.setCurrentText('hours')
+        self.f['step_unit'] = self.step_unit
+        area.addWidget(self.step_unit, 3, 3)
         self.area_box = group('Area', area)
         area_layout = self.area_box.layout()
         area_title = area_layout.takeAt(0).widget()
@@ -661,13 +666,13 @@ class SearchPanel(search.SearchDialog):
         f.addRow(note)
         inner.addWidget(group('Screening', f))
         f = form_layout()
-        self.lunar_avg_check = self.lunar_avg = Check('Calculate and show average Sun % per lunar day')
+        self.lunar_avg_check = self.lunar_avg = Check('Calculate and show avg Sun visible % per lunar day')
         self.lunar_sd_check = self.lunar_sd = Check('Calculate and show standard deviation')
         self.lunar_sd_check.setToolTip('Enable the average first. Available for terrain searches longer than two days.')
         f.addRow(self.lunar_avg_check)
         f.addRow(self.lunar_sd_check)
         for key, label in [('lunar_min_avg', 'Minimum average %'), ('lunar_max_avg', 'Maximum average %'),
-                           ('lunar_min_sd', 'Minimum SD %'), ('lunar_max_sd', 'Maximum SD %')]: field(f, key, label, '')
+                           ('lunar_min_sd', 'Minimum standard deviation %'), ('lunar_max_sd', 'Maximum standard deviation %')]: field(f, key, label, '')
         self.lunar_note = Label()
         self.lunar_note.setObjectName('muted')
         self.lunar_note.setWordWrap(True)
@@ -765,7 +770,7 @@ class SearchPanel(search.SearchDialog):
         one = lambda: self.table.selection_count() == 1
         compare = Button('Analyze')
         compare.clicked.connect(self.analyze_selected)
-        add = Button('Add to points')
+        add = Button('Add to analysis list')
         add.setObjectName('primary')
         add.clicked.connect(self.add_selected)
         more = QtWidgets.QPushButton('⋯')
@@ -1817,7 +1822,7 @@ class PointsPanel(QtWidgets.QWidget):
         hint.setObjectName('muted')
         hint.setContentsMargins(12, 0, 12, 6)
         root.addWidget(hint)
-        self.empty = QtWidgets.QLabel('Use the Add tool to choose locations, then press Add to points, or add results from a search.')
+        self.empty = QtWidgets.QLabel('Use the Add tool to choose locations, then press Add to analysis list, or add results from a search.')
         self.empty.setObjectName('muted')
         self.empty.setWordWrap(True)
         self.empty.setContentsMargins(12, 10, 12, 10)
@@ -1850,7 +1855,7 @@ class PointsPanel(QtWidgets.QWidget):
         self.load_button = QtWidgets.QPushButton('Load…')
         menu = QtWidgets.QMenu(self.load_button)
         menu.addAction('Replace current points').triggered.connect(lambda: self.load(False))
-        menu.addAction('Add to current points').triggered.connect(lambda: self.load(True))
+        menu.addAction('Add to analysis list').triggered.connect(lambda: self.load(True))
         self.load_button.setMenu(menu)
         controls.addWidget(self.load_button)
         self.save_button = QtWidgets.QPushButton('Save…')
@@ -2021,7 +2026,7 @@ class LocationCard(QtWidgets.QFrame):
         elevation, slope, low, high = owner._selected_stats
         if index is None:
             self.title.setText('Selected location')
-            self.button.setText('Add to points')
+            self.button.setText('Add to analysis list')
             self.button.setObjectName('primary')
             self.button.setEnabled(not full)
             self.button.setToolTip(f'A set holds at most {compare.MAX_POINTS} points.' if full else '')
@@ -2034,11 +2039,11 @@ class LocationCard(QtWidgets.QFrame):
             self.button.setToolTip('')
         self.title.setStyleSheet('font-weight: 600;' + (f' color: {point_color(index)};' if index is not None else ''))
         if unsaved:
-            self.button.setText('Add to points' if len(unsaved) == 1 else f'Add {len(unsaved)} to points')
+            self.button.setText('Add to analysis list' if len(unsaved) == 1 else f'Add {len(unsaved)} to analysis list')
             self.button.setObjectName('primary')
             available = len(owner._points) + len(unsaved) <= compare.MAX_POINTS
             self.button.setEnabled(available)
-            self.button.setToolTip('Add the selected locations to the saved analysis points.' if available
+            self.button.setToolTip('Add the selected locations to the analysis list.' if available
                                    else f'The saved list holds at most {compare.MAX_POINTS} points.')
         self.selected_count.setText(f'Selected: {len(selected)} · Saved: {len(owner._points)}/{compare.MAX_POINTS}')
         self.tag.setVisible(index is None)
