@@ -1,11 +1,13 @@
 ![Quick video demo](https://www.youtube.com/watch?v=lfuMoZgSdBU)
 
 To launch this program
-``` bash
-pip install -r requirements.txt
-python moon.py
+```bash
+uv run moon.py
 ```
-
+If you don't have python 3.15:
+```bash
+uv python install 3.15
+```
 This program has 3 main parts:
 
 1. A globe of the Moon.You have 3 different types of globes available: a color globe that shows the Moon as you would see it with your eyes, a topographical globe, and a slope globe that allows you to see where the terrain is uneven.
