@@ -345,6 +345,7 @@ class SearchPanel(search.SearchDialog):
         self.screen_mode = Combo(); self.screen_mode.addItems(['Pessimistic center','All cells'])
         self.range_mode = Combo(); self.range_mode.addItems(['On','Off'])
         labeled(f,'Cell screening',self.screen_mode); labeled(f,'Optimistic range',self.range_mode)
+        field(f,'workers','Worker processes (0 = auto, 1 = off)','0')
         note = QtWidgets.QLabel('Screening is approximate and can miss suitable cells.'); note.setObjectName('muted'); note.setWordWrap(True); f.addRow(note)
         stack.addWidget(group('Screening', f))
         f = QtWidgets.QFormLayout()

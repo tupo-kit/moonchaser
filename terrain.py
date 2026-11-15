@@ -10,6 +10,7 @@ never reassigned (sample_dem_bilinear, MOON_RADIUS_M, ...) are safe to import by
 The same applies to EYE_HEIGHT_M: change it only through set_eye_height() and always read it as
 `terrain.EYE_HEIGHT_M`, so that every calculation uses the current observer eye height.
 """
+import atexit
 from contextlib import contextmanager
 import os
 import urllib.request
@@ -133,6 +134,50 @@ def load_data(texture_path=None):
     R_MAX_M = MOON_RADIUS_M + float(np.max(dem_km)) * 1000.0
 
 
+# ---- shared DEM: worker processes of the visibility search read the same memory instead of each loading 1 GB
+_dem_shm = None   # SharedMemory owned by this process (parent: created; worker: attached)
+_dem_view = None  # the ndarray over it
+
+
+def share_dem():
+    """Move dem_km into shared memory (once; no extra RAM afterwards). Returns (name, shape, R_MAX_M) for workers."""
+    global dem_km, _dem_shm, _dem_view
+    if dem_km is None:
+        raise RuntimeError("The Moon elevation map has not been loaded.")
+    if _dem_shm is None or _dem_view is not dem_km:   # first call, or load_data() ran again
+        from multiprocessing import shared_memory
+        _release_dem()
+        shm = shared_memory.SharedMemory(create=True, size=int(dem_km.nbytes))
+        view = np.ndarray(dem_km.shape, dtype=dem_km.dtype, buffer=shm.buf)
+        view[:] = dem_km
+        _dem_shm, _dem_view, dem_km = shm, view, view   # the private copy is freed once nothing else uses it
+        atexit.register(_release_dem)
+    return _dem_shm.name, dem_km.shape, R_MAX_M
+
+
+def attach_dem(name, shape, r_max_m):
+    """Worker side of share_dem(): use the parent's DEM without copying it."""
+    global dem_km, H, W, R_MAX_M, _dem_shm, _dem_view
+    from multiprocessing import shared_memory
+    shm = shared_memory.SharedMemory(name=name)
+    # Spawned workers share the parent's resource tracker, so nothing else is needed; the parent unlinks at exit.
+    _dem_shm = shm
+    _dem_view = dem_km = np.ndarray(tuple(shape), dtype=np.float32, buffer=shm.buf)
+    H, W = dem_km.shape
+    R_MAX_M = float(r_max_m)
+
+
+def _release_dem():
+    global _dem_shm, _dem_view
+    shm, _dem_shm, _dem_view = _dem_shm, None, None
+    if shm is not None:
+        try:
+            shm.close()
+            shm.unlink()
+        except Exception:
+            pass
+
+
 def sample_dem_bilinear(lat_deg, lon_deg):
     lat_arr = np.asarray(lat_deg, dtype=np.float64)
     lon_arr = np.asarray(lon_deg, dtype=np.float64)
@@ -228,6 +273,9 @@ def graticule_lines(step_deg, center_lat=0.0, center_lon=0.0, radius_deg=180.0):
     return minor, major
 
 
+HORIZON_BLOCK = 128  # distances per numpy call in compute_horizon_360 (128 x 360 points, a few MB)
+
+
 def compute_horizon_360(lat_deg, lon_deg, eye_height_m=None, max_dist_km=250.0, step_km=0.5):
     """Terrain horizon for one observer, at every integer azimuth (north=0).
 
@@ -258,18 +306,26 @@ def compute_horizon_360(lat_deg, lon_deg, eye_height_m=None, max_dist_km=250.0, 
     distances = np.unique(np.concatenate((
         np.arange(0.05, min(step_km, max_dist_km), 0.05),
         np.arange(step_km, max_dist_km, step_km), [max_dist_km])))
-    for distance in distances:
-        theta = distance * 1000.0 / MOON_RADIUS_M
-        targets = np.cos(theta) * up + np.sin(theta) * directions
-        r_lats = np.degrees(np.arctan2(targets[:, 2], np.hypot(targets[:, 0], targets[:, 1])))
-        r_lons = np.degrees(np.arctan2(targets[:, 1], targets[:, 0]))
+    thetas = distances * 1000.0 / MOON_RADIUS_M
+    columns = np.arange(360)
+    # Whole blocks of distances per numpy call (about 500 calls of 360 points became a handful of larger ones).
+    # The highest angle of a block is taken with argmax, which keeps the first (nearest) maximum, exactly like the
+    # former strict "angles > max_angles" update per distance.
+    for first in range(0, len(distances), HORIZON_BLOCK):
+        theta = thetas[first:first + HORIZON_BLOCK][:, None]                       # (n, 1)
+        targets = np.cos(theta)[..., None] * up + np.sin(theta)[..., None] * directions[None, :, :]   # (n, 360, 3)
+        r_lats = np.degrees(np.arctan2(targets[..., 2], np.hypot(targets[..., 0], targets[..., 1])))
+        r_lons = np.degrees(np.arctan2(targets[..., 1], targets[..., 0]))
         r_tgt = MOON_RADIUS_M + sample_dem_bilinear(r_lats, r_lons)
         angles = np.arctan2(r_tgt * np.cos(theta) - r_obs, r_tgt * np.sin(theta))
-        improved = angles > max_angles
-        max_angles[improved] = angles[improved]
-        h_dists[improved] = distance
-        h_lats[improved] = r_lats[improved]
-        h_lons[improved] = r_lons[improved]
+        best = np.argmax(angles, axis=0)
+        best_angles = angles[best, columns]
+        improved = best_angles > max_angles
+        pick = best[improved]
+        max_angles[improved] = best_angles[improved]
+        h_dists[improved] = distances[first + pick]
+        h_lats[improved] = r_lats[pick, columns[improved]]
+        h_lons[improved] = r_lons[pick, columns[improved]]
     return np.degrees(max_angles), h_dists, h_lats, h_lons
 
 

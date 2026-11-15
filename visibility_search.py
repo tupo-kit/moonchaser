@@ -11,12 +11,20 @@ page opens without recomputing it. The optional columns of the results table (ab
 elevation statistics, lunar-day statistics, maximum slope) use exactly the statistics of compare.py; they never
 influence the search itself and are calculated afterwards, in the background, from the stored data.
 """
+import atexit
 import csv
 import colorsys
+import multiprocessing
+import os
 import queue
+import sys
 import threading
 import time
+from contextlib import contextmanager
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures.process import BrokenProcessPool
 from datetime import timedelta
+from functools import partial
 
 import numpy as np
 import point_data
@@ -414,8 +422,11 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
                  screen_horizon=2.0, screen_mode="Pessimistic center", cancel=None, progress=None,
                  use_ranges=True, range_progress=None, range_result=None, max_slope=None, slope_radius_km=1.0,
                  horizon_result=None, max_sun=100.0, max_earth=100.0, lunar_stats=False, lunar_filter=None,
-                 cache=None, cache_source=point_data.DEFAULT_SOURCE):
+                 cache=None, cache_source=point_data.DEFAULT_SOURCE, workers=None):
     """Return at most one terrain-checked match per cell.
+
+    workers: None or 1 = this thread only; 0 = one worker process per core (minus two); n > 1 = n processes.
+    The processes always use Skyfield directly (the `fetch` argument is not used by them).
 
     With a cache (point_data.PointDataCache) a point stored by an earlier search or by the comparison is not
     fetched, horizon-scanned or classified again, and every matching point is stored for later use.
@@ -452,6 +463,11 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
     min_terrain = float(np.min(terrain.dem_km)) * 1000.0
     if not np.isfinite(min_terrain):
         raise ValueError("The elevation map contains invalid values.")
+    if workers is not None and workers != 1:
+        return search_cells_parallel(cells, epochs, min_sun, min_earth, samples_per_side, screen_horizon, screen_mode,
+                                     cancel, progress, use_ranges, range_progress, range_result, max_slope,
+                                     slope_radius_km, horizon_result, max_sun, max_earth, lunar_stats, lunar_filter,
+                                     cache, cache_source, workers)
     start = time.monotonic()
     total_cells = len(cells)
     precomputed = {}
@@ -552,7 +568,8 @@ def search_cells(cells, epochs, min_sun, min_earth, fetch, samples_per_side=3,
                                            p['sun_percent'] + p['earth_percent']), reverse=True)
 
 
-def search_optimistic_sectors(cells, epochs, min_sun, min_earth, fetch, cancel=None, progress=None, horizon_result=None):
+def search_optimistic_sectors(cells, epochs, min_sun, min_earth, fetch, cancel=None, progress=None, horizon_result=None,
+                              workers=None):
     """Keep cells with optimistic visibility estimates, without terrain horizon rays.
 
     Each body is allowed the cell's full angular margin and full disk visibility;
@@ -572,6 +589,8 @@ def search_optimistic_sectors(cells, epochs, min_sun, min_earth, fetch, cancel=N
     floor = optimistic_horizon_floor(median_height, min_height)
     if horizon_result:
         horizon_result(min_height, median_height, floor)
+    if workers is not None and workers != 1:   # 0 = automatic, n > 1 = n processes (Skyfield is used directly)
+        return _sectors_parallel(cells, epochs, min_sun, min_earth, floor, cancel, progress, workers)
     results, filtered, start, completed = [], 0, time.monotonic(), 0
     total = len(cells)
     for index, cell in enumerate(cells):
@@ -609,9 +628,343 @@ def search_optimistic_sectors(cells, epochs, min_sun, min_earth, fetch, cancel=N
                                           p['sun_percent'] + p['earth_percent']), reverse=True)
 
 
+# ======================================================================================================
+# Multi-process evaluation. The serial search runs one point after another in one thread (one core, and the GIL
+# stops threads from helping). Here worker processes each evaluate whole cells; they read the DEM from one shared
+# memory block (terrain.share_dem), so RAM grows by the per-process Python / Skyfield data only, not 1 GB each.
+# ======================================================================================================
+_POOL = None
+_POOL_KEY = None
+_POOL_LOCK = threading.Lock()
+
+
+@contextmanager
+def _main_hidden():
+    """A spawned worker normally re-imports the program's main script (here moon.py: VTK, Qt, PIL ...). Workers only
+    need terrain / sky / this module, so hide the main script from multiprocessing while they are being started."""
+    main = sys.modules.get('__main__')
+    saved = {name: getattr(main, name) for name in ('__file__', '__spec__') if main is not None and hasattr(main, name)}
+    try:
+        for name in saved:
+            if name == '__spec__':
+                main.__spec__ = None
+            else:
+                delattr(main, name)
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(main, name, value)
+
+
+def default_workers():
+    return max(1, (os.cpu_count() or 2) - 2)   # two logical cores stay free for the GUI and the system
+
+
+def _init_worker(shm_name, shape, r_max_m):
+    terrain.attach_dem(shm_name, shape, r_max_m)
+    terrain.slope_deg_at = terrain._compute_slope_deg_at   # no map_modes (VTK side) in a worker; same formula
+    sky.preload()
+
+
+def _get_pool(workers):
+    """One persistent pool: workers start (and attach the DEM / ephemeris) once, not once per search."""
+    global _POOL, _POOL_KEY
+    sky.preload()   # validate / download the kernels once here, never in all workers at the same time
+    name, shape, r_max_m = terrain.share_dem()
+    with _POOL_LOCK:
+        if _POOL is not None and _POOL_KEY == (workers, name):
+            return _POOL
+        if _POOL is not None:
+            _POOL.shutdown(wait=False, cancel_futures=True)
+        # 'spawn': never fork a process that owns Qt / VTK / Tk threads.
+        _POOL = ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context('spawn'),
+                                    initializer=_init_worker, initargs=(name, shape, r_max_m))
+        _POOL_KEY = (workers, name)
+        # Start every worker now, while the main script is hidden (they are busy initialising, so each submit
+        # starts a new process). A worker started later would still work, only slower to start.
+        with _main_hidden():
+            for index in range(workers):
+                _POOL.submit(_ping, index)
+        return _POOL
+
+
+def shutdown_pool():
+    global _POOL, _POOL_KEY
+    with _POOL_LOCK:
+        pool, _POOL, _POOL_KEY = _POOL, None, None
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+atexit.register(shutdown_pool)
+
+
+def _ping(_):
+    return os.getpid()
+
+
+def warm_up(workers=0):
+    """Optional: start the workers in the background (for example when the search window opens)."""
+    _get_pool(workers or default_workers())
+
+
+def _evaluate_cell(cell, p):
+    """One terrain-checked cell: (row or None, screened out, (point, horizon, classified) or None)."""
+    epochs, min_sun, min_earth = p['epochs'], p['min_sun'], p['min_earth']
+    max_sun, max_earth = p['max_sun'], p['max_earth']
+    points = cell_sample_points(cell, p['side'])
+    center = points[0]
+    for point in points:
+        elevation = float(terrain.sample_dem_bilinear(*point))
+        pos = sky.get_positions_nocache(point[1], point[0], (elevation + terrain.EYE_HEIGHT_M) / 1000.0, epochs)
+        floor = optimistic_horizon_floor(elevation, p['min_terrain'])
+        # The cheap optimistic bound also guards the centre (the serial code skipped it there). That is safe: if even
+        # the optimistic estimate fails, the real terrain cannot pass, and the horizon scan is saved.
+        if can_meet_thresholds_without_horizon(epochs, pos, floor, min_sun, min_earth):
+            horizon_full = terrain.compute_horizon_360(*point)
+            classified = sky.classify_sky(pos, horizon_full[0])
+            sun = visibility_percent(epochs, classified['Sun']['visible'])
+            earth = visibility_percent(epochs, classified['Earth']['visible'])
+            if min_sun <= sun <= max_sun and min_earth <= earth <= max_earth:
+                area_slope = (terrain.max_slope_in_radius(*point, p['slope_radius_km'])
+                              if p['max_slope'] is not None else None)
+                lunar = (lunar_day_stats(epochs, classified['Sun']['visible'])
+                         if p['lunar_stats'] or p['lunar_filter'] is not None else None)
+                if ((lunar is None or p['lunar_filter'] is None or lunar_passes(lunar, p['lunar_filter']))
+                        and (area_slope is None or area_slope <= p['max_slope'])):
+                    row = {'lat': point[0], 'lon': point[1], 'sun_percent': sun, 'earth_percent': earth,
+                           'slope_deg': None, 'max_slope_deg': area_slope,   # slope_deg is filled in by the caller
+                           'sun_lunar_mean': lunar[0] if lunar else None,
+                           'sun_lunar_std': lunar[1] if lunar else None,
+                           'lunar_days': lunar[2] if lunar else None,
+                           'cell_lat_min': cell[0], 'cell_lat_max': cell[1],
+                           'cell_lon_min': cell[2], 'cell_lon_max': cell[3]}
+                    return row, False, (point, horizon_full, classified)
+        if point == center and p['mode'] == 'Pessimistic center':
+            approx = sky.classify_sky(pos, np.full(360, p['screen_horizon']))
+            if (visibility_percent(epochs, approx['Sun']['visible']) < min_sun or
+                    visibility_percent(epochs, approx['Earth']['visible']) < min_earth):
+                return None, True, None   # the other samples are not tried
+    return None, False, None
+
+
+def _run_cells(cells, p):
+    terrain.EYE_HEIGHT_M = p['eye']
+    return [_evaluate_cell(cell, p) for cell in cells]
+
+
+def _run_blocks(items, p):
+    """Optimistic range screen of 4x4 blocks; items are (bounds, cells). One bool per block."""
+    terrain.EYE_HEIGHT_M = p['eye']
+    epochs, out = p['epochs'], []
+    for bounds, _cells in items:
+        center = cell_sample_points(bounds, 3)[0]
+        height = float(terrain.sample_dem_bilinear(*center))
+        pos = sky.get_positions_nocache(center[1], center[0], (height + terrain.EYE_HEIGHT_M) / 1000.0, epochs)
+        margin = min(180.0, (bounds[1] - bounds[0] + bounds[3] - bounds[2]) / 2.0 + 2.0)
+        ok = True
+        for body, threshold in (('Sun', p['min_sun']), ('Earth', p['min_earth'])):
+            el = np.asarray(pos[body]['el'], dtype=float)
+            radius = np.asarray(pos[body]['radius'], dtype=float)
+            if (el.shape != (len(epochs),) or radius.shape != (len(epochs),) or not np.isfinite(el).all()
+                    or not np.isfinite(radius).all() or np.any(radius < 0)):
+                raise ValueError(f'Invalid {body} ephemeris in optimistic range screen.')
+            if visibility_percent(epochs, el + radius + margin >= p['floor']) + 1e-9 < threshold:
+                ok = False
+        out.append(ok)
+    return out
+
+
+def _run_sky(points, p):
+    """Terrain horizon + classified Sun / Earth sky of several points (for the optional columns)."""
+    terrain.EYE_HEIGHT_M = p['eye']
+    out = []
+    for lat, lon in points:
+        elevation = float(terrain.sample_dem_bilinear(lat, lon))
+        pos = sky.get_positions_nocache(lon, lat, (elevation + terrain.EYE_HEIGHT_M) / 1000.0, p['epochs'])
+        horizon = terrain.compute_horizon_360(lat, lon)
+        out.append((horizon, sky.classify_sky(pos, horizon[0])))
+    return out
+
+
+def _stream(pool, function, items, chunk, window, cancel, handler):
+    """Submit chunks with a bounded number in flight (so Cancel reacts quickly); handler(part, result) per chunk."""
+    starts = iter(range(0, len(items), chunk))
+    pending = {}
+
+    def fill():
+        while len(pending) < window:
+            first = next(starts, None)
+            if first is None:
+                return
+            part = items[first:first + chunk]
+            pending[pool.submit(function, part)] = part
+    fill()
+    try:
+        while pending:
+            if cancel is not None and cancel.is_set():
+                break
+            done, _ = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+            for future in done:
+                handler(pending.pop(future), future.result())   # a worker's exception is raised here
+            fill()
+    finally:
+        for future in pending:
+            future.cancel()
+
+
+def prefetch_sky(points, epochs, cache, source, cancel, workers=0):
+    """Calculate (in worker processes) and store the sky data of points that the cache does not have yet."""
+    todo = [pt for pt in points if cache.get_sky(pt[0], pt[1], epochs, source) is None]
+    if not todo:
+        return
+    workers = workers or default_workers()
+    p = {'epochs': epochs, 'eye': terrain.EYE_HEIGHT_M}
+
+    def store(part, outputs):
+        for (lat, lon), (horizon, classified) in zip(part, outputs):
+            cache.put_horizon(lat, lon, horizon)
+            cache.put_sky(lat, lon, epochs, source, classified)
+    try:
+        _stream(_get_pool(workers), partial(_run_sky, p=p), todo, max(1, min(16, len(todo) // (workers * 4) or 1)),
+                workers * 3, cancel, store)
+    except BrokenProcessPool:
+        shutdown_pool()   # the caller falls back to the serial calculation, point by point
+
+
+def search_cells_parallel(cells, epochs, min_sun, min_earth, side, screen_horizon, screen_mode, cancel, progress,
+                          use_ranges, range_progress, range_result, max_slope, slope_radius_km, horizon_result,
+                          max_sun, max_earth, lunar_stats, lunar_filter, cache, cache_source, workers=0):
+    """The same result as the serial search_cells, evaluated by a pool of processes."""
+    workers = workers or default_workers()
+    heights = global_elevation_stats(cancel)
+    if heights is None:
+        return []
+    min_height, median_height = heights
+    floor = optimistic_horizon_floor(median_height, min_height)
+    if horizon_result:
+        horizon_result(min_height, median_height, floor)
+    p = dict(epochs=epochs, min_sun=min_sun, min_earth=min_earth, max_sun=max_sun, max_earth=max_earth,
+             side=side, screen_horizon=screen_horizon, mode=screen_mode, max_slope=max_slope,
+             slope_radius_km=slope_radius_km, lunar_stats=lunar_stats, lunar_filter=lunar_filter,
+             min_terrain=float(np.min(terrain.dem_km)) * 1000.0, floor=floor, eye=terrain.EYE_HEIGHT_M)
+    pool = _get_pool(workers)
+    window = workers * 3
+    start = time.monotonic()
+    total_cells = len(cells)
+    try:
+        if use_ranges:
+            lat_index = {x: i for i, x in enumerate(sorted({c[0] for c in cells}))}
+            lon_index = {x: i for i, x in enumerate(sorted({c[2] for c in cells}))}
+            blocks = {}
+            for cell in cells:
+                blocks.setdefault((lat_index[cell[0]] // 4, lon_index[cell[2]] // 4), []).append(cell)
+            items = [((min(c[0] for c in b), max(c[1] for c in b), min(c[2] for c in b), max(c[3] for c in b)), b)
+                     for b in blocks.values()]
+            eligible, state = [], {'done': 0}
+
+            def on_blocks(part, flags):
+                for (_bounds, block), ok in zip(part, flags):
+                    state['done'] += len(block)
+                    if ok:
+                        eligible.extend(block)
+                if range_progress:
+                    range_progress(state['done'], total_cells, len(eligible), None)
+            _stream(pool, partial(_run_blocks, p=p), items, max(1, min(16, len(items) // (workers * 4) or 1)),
+                    window, cancel, on_blocks)
+            if cancel is not None and cancel.is_set():
+                return []
+            if range_result:
+                range_result(interval_union((c[0], c[1]) for c in eligible),
+                             interval_union((c[2], c[3]) for c in eligible), len(eligible), total_cells)
+            cells = eligible
+        filtered = completed = total_cells - len(cells)
+        results = []
+
+        def on_cells(part, outputs):
+            nonlocal filtered, completed
+            for cell, (row, screened, item) in zip(part, outputs):
+                completed += 1
+                filtered += bool(screened)
+                if row is not None:
+                    row['slope_deg'] = terrain.compute_slope_deg(row['lat'], row['lon'])   # same source as the table
+                    results.append(row)
+                    if cache is not None and item is not None:
+                        point, horizon_full, classified = item
+                        cache.put_horizon(point[0], point[1], horizon_full)
+                        cache.put_sky(point[0], point[1], epochs, cache_source, classified)
+            if progress:
+                progress(completed, total_cells, len(results), time.monotonic() - start,
+                         part[-1][0], part[-1][2], filtered)
+        _stream(pool, partial(_run_cells, p=p), cells, max(1, min(32, len(cells) // (workers * 8) or 1)),
+                window, cancel, on_cells)
+    except BrokenProcessPool:
+        shutdown_pool()   # the next search starts a fresh pool
+        raise RuntimeError('A search worker process died (out of memory?). Use fewer worker processes.')
+    if progress:
+        progress(completed, total_cells, len(results), time.monotonic() - start, None, None, filtered)
+    return sorted(results, key=lambda r: (min(r['sun_percent'] - min_sun, r['earth_percent'] - min_earth),
+                                          r['sun_percent'] + r['earth_percent']), reverse=True)
+
+
+def _run_sectors(cells, p):
+    """Optimistic Sun / Earth bounds of several sectors: per cell None or (sun %, earth %)."""
+    terrain.EYE_HEIGHT_M = p['eye']
+    epochs, out = p['epochs'], []
+    for cell in cells:
+        center = cell_sample_points(cell, 2)[0]
+        elevation = float(terrain.sample_dem_bilinear(*center))
+        pos = sky.get_positions_nocache(center[1], center[0], (elevation + terrain.EYE_HEIGHT_M) / 1000.0, epochs)
+        margin = min(180.0, (cell[1] - cell[0] + cell[3] - cell[2]) / 2.0 + 2.0)
+        bounds = []
+        for body in ('Sun', 'Earth'):
+            el = np.asarray(pos[body]['el'], dtype=float)
+            radius = np.asarray(pos[body]['radius'], dtype=float)
+            if (el.shape != (len(epochs),) or radius.shape != (len(epochs),) or not np.isfinite(el).all()
+                    or not np.isfinite(radius).all() or np.any(radius < 0)):
+                raise ValueError(f'Invalid {body} ephemeris.')
+            bounds.append(visibility_percent(epochs, el + radius + margin >= p['floor']))
+        ok = bounds[0] + 1e-9 >= p['min_sun'] and bounds[1] + 1e-9 >= p['min_earth']
+        out.append((bounds[0], bounds[1], center) if ok else None)
+    return out
+
+
+def _sectors_parallel(cells, epochs, min_sun, min_earth, floor, cancel, progress, workers):
+    workers = workers or default_workers()
+    p = dict(epochs=epochs, min_sun=min_sun, min_earth=min_earth, floor=floor, eye=terrain.EYE_HEIGHT_M)
+    pool = _get_pool(workers)
+    start = time.monotonic()
+    total = len(cells)
+    results, state = [], {'done': 0, 'filtered': 0}
+
+    def on_cells(part, outputs):
+        for cell, value in zip(part, outputs):
+            state['done'] += 1
+            if value is None:
+                state['filtered'] += 1
+                continue
+            sun, earth, center = value
+            results.append({'kind': 'sector', 'lat': center[0], 'lon': center[1], 'sun_percent': sun,
+                            'earth_percent': earth, 'cell_lat_min': cell[0], 'cell_lat_max': cell[1],
+                            'cell_lon_min': cell[2], 'cell_lon_max': cell[3]})
+        if progress:
+            progress(state['done'], total, len(results), time.monotonic() - start,
+                     part[-1][0], part[-1][2], state['filtered'])
+    try:
+        _stream(pool, partial(_run_sectors, p=p), cells, max(1, min(64, len(cells) // (workers * 8) or 1)),
+                workers * 3, cancel, on_cells)
+    except BrokenProcessPool:
+        shutdown_pool()
+        raise RuntimeError('A search worker process died (out of memory?). Use fewer worker processes.')
+    if progress:
+        progress(state['done'], total, len(results), time.monotonic() - start, None, None, state['filtered'])
+    return sorted(results, key=lambda r: (min(r['sun_percent'] - min_sun, r['earth_percent'] - min_earth),
+                                          r['sun_percent'] + r['earth_percent']), reverse=True)
+
+
 def _search_worker(messages, cancel, cells, epochs, sun, earth, fetch, side, horizon, mode, use_ranges,
                    max_slope=None, slope_radius_km=1.0, use_terrain=True, max_sun=100.0, max_earth=100.0,
-                   lunar_stats=False, lunar_filter=None, cache=None):
+                   lunar_stats=False, lunar_filter=None, cache=None, workers=None):
     def progress(done, total, matches, elapsed, lat, lon, filtered):
         messages.put(('progress', (done, total, matches, elapsed, lat, lon, filtered)))
     try:
@@ -626,9 +979,10 @@ def _search_worker(messages, cancel, cells, epochs, sun, earth, fetch, side, hor
         if use_terrain:
             results = search_cells(cells, epochs, sun, earth, fetch, side, horizon, mode, cancel, progress,
                                    use_ranges, range_progress, range_result, max_slope, slope_radius_km, horizon_result,
-                                   max_sun, max_earth, lunar_stats, lunar_filter, cache)
+                                   max_sun, max_earth, lunar_stats, lunar_filter, cache,
+                                   point_data.DEFAULT_SOURCE, workers)
         else:
-            results = search_optimistic_sectors(cells, epochs, sun, earth, fetch, cancel, progress, horizon_result)
+            results = search_optimistic_sectors(cells, epochs, sun, earth, fetch, cancel, progress, horizon_result, workers)
         messages.put(('done', (results, cancel.is_set())))
     except Exception as error:
         messages.put(('error', str(error)))
@@ -699,10 +1053,15 @@ SECTOR_HIDDEN = STATS_KEYS | {'elevation', 'max_slope', 'slope'}
 FILL_REFRESH_SECONDS = 1.5
 
 
-def _fill_worker(messages, cancel, generation, rows, epochs, fetch, cache, need_stats, need_slope, radius):
+def _fill_worker(messages, cancel, generation, rows, epochs, fetch, cache, need_stats, need_slope, radius, workers=1):
     """Optional columns: statistics from the shared sky data (or calculated and stored), and maximum slopes."""
     total = len(rows)
     try:
+        if need_stats and cache is not None and workers != 1:
+            # Missing sky data is calculated by the worker processes first; the loop below then only reads it.
+            messages.put(('fill_progress', (generation, 0, total)))
+            prefetch_sky([(r['lat'], r['lon']) for r in rows if not r.get('_stats')], epochs, cache,
+                          point_data.DEFAULT_SOURCE, cancel, workers)
         for done, row in enumerate(rows, start=1):
             if cancel.is_set():
                 break
@@ -723,12 +1082,15 @@ def _fill_worker(messages, cancel, generation, rows, epochs, fetch, cache, need_
 
 class SearchDialog:
     """Tk-only UI; all horizon and ephemeris work stays in a worker thread."""
+    workers_setting = 0   # worker processes: 0 = automatic, 1 = this thread only (class default: SearchPanel in
+                          # desktop_ui does not call __init__)
     def __init__(self, parent, fetch, previous=None, on_close=None, existing_points=None, on_apply=None,
                  cache=None):
         import tkinter as tk
         from tkinter import ttk
         self.tk, self.ttk, self.fetch = tk, ttk, fetch
         self.cache = cache  # point_data.PointDataCache shared with the comparison (None: no sharing)
+        self.workers_setting = 0       # worker processes: 0 = automatic, 1 = this thread only
         self._fill_cancel = threading.Event()
         self._fill_generation = 0
         self._fill_running = False
@@ -876,6 +1238,7 @@ class SearchDialog:
         self.range_mode = ttk.Combobox(other_box, values=('On', 'Off'), state='readonly', width=14)
         self.range_mode.set('On')
         self.range_mode.grid(row=3, column=1, sticky='ew', pady=2)
+        field(other_box, 'workers', 'Worker processes (0 = auto, 1 = off)', '0', 4)
         for name in ('start', 'end'):
             self.f[name].bind('<KeyRelease>', lambda event: self._update_lunar_state())
             self.f[name].bind('<FocusOut>', lambda event: self._update_lunar_state())
@@ -1127,7 +1490,7 @@ class SearchDialog:
         self.fill_label.configure(text=f'Calculating optional columns for {len(rows):,} points (from the shared data where stored)...')
         threading.Thread(target=_fill_worker, daemon=True,
                          args=(self.messages, self._fill_cancel, self._fill_generation, rows, epochs, self.fetch,
-                               self.cache, need_stats, need_slope, radius)).start()
+                               self.cache, need_stats, need_slope, radius, self.workers_setting)).start()
 
     def _stop_fill(self):
         self._fill_cancel.set()
@@ -1180,6 +1543,10 @@ class SearchDialog:
             epochs = sky.time_samples(start, stop, step_hours * 60)
             if len(epochs) < 2:
                 raise ValueError('End time must be later than start time.')
+            workers_value = float((get('workers') if 'workers' in self.f else '0') or 0)
+            if not np.isfinite(workers_value) or not workers_value.is_integer() or not 0 <= workers_value <= 128:
+                raise ValueError('Worker processes must be an integer from 0 (automatic) to 128.')
+            workers = int(workers_value)
             limits = np.array([min_sun, max_sun, min_earth, max_earth])
             if not np.isfinite(limits).all() or np.any(limits < 0) or np.any(limits > 100):
                 raise ValueError('Visibility limits must be between 0 and 100 percent.')
@@ -1212,6 +1579,7 @@ class SearchDialog:
             self.status.configure(text=str(error))
             return
         self._stop_fill()
+        self.workers_setting = workers
         self.cancel.clear()
         self._refinement_sectors = None
         self.results = []
@@ -1247,7 +1615,7 @@ class SearchDialog:
         self.worker = threading.Thread(target=_search_worker,
             args=(self.messages, self.cancel, cells, epochs, min_sun, min_earth, self.fetch, side, horizon, mode,
                   range_mode == 'On', max_slope, radius, use_terrain, max_sun, max_earth, lunar_avg, lunar_filter,
-                  self.cache),
+                  self.cache, workers),
             daemon=True)
         self.worker.start()
 
