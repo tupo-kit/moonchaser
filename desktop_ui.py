@@ -30,40 +30,52 @@ vtkmodules.qt.PyQtImpl = QT_BINDING
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 
 import sky
+import terrain
 import visibility_search as search
 
 Qt = QtCore.Qt
 
 STYLE = '''
-QMainWindow, QWidget { background: #252a30; color: #e7eaec; font-size: 13px; }
-QFrame#header { background: #171b1f; border-bottom: 1px solid #495057; }
-QFrame#sidebar { background: #2c3239; border-right: 1px solid #525b63; }
+QMainWindow, QWidget { background: #172030; color: #e6edf7; font-size: 13px; }
+QFrame#header { background: #111a28; border-bottom: 1px solid #495057; }
+QFrame#sidebar { background: #1d2b3d; border-right: 1px solid #525b63; }
 QLabel#brand { font-size: 16px; font-weight: 700; letter-spacing: 1px; color: #f3f4f5; }
 QLabel#sectionTitle { font-size: 18px; font-weight: 650; color: #ffffff; }
 QLabel#muted { color: #b4bec5; }
-QPushButton, QToolButton { background: #39424a; border: 1px solid #56636d; border-radius: 4px; padding: 7px 10px; color: #f0f3f5; }
-QPushButton:hover, QToolButton:hover { background: #4b5964; }
-QPushButton:pressed, QToolButton:checked { background: #275967; border-color: #63b8c8; }
+QPushButton, QToolButton { background: #2b3b51; border: 1px solid #455b76; border-radius: 4px; padding: 7px 10px; color: #f0f3f5; }
+QPushButton:hover, QToolButton:hover { background: #394e68; }
+QPushButton:pressed, QToolButton:checked { background: #17677a; border-color: #49c5d6; }
 QPushButton:disabled { color: #8a959d; background: #2d343a; border-color: #404b52; }
-QPushButton#primary { background: #167b8b; border-color: #37a8b9; font-weight: 650; }
+QPushButton#primary { background: #087c8d; border-color: #35c2d4; font-weight: 650; }
 QPushButton#primary:hover { background: #2192a2; }
-QLineEdit, QComboBox, QTreeWidget { background: #1e2328; color: #f4f6f7; border: 1px solid #59656e; border-radius: 3px; padding: 5px; selection-background-color: #286d7b; }
+QLineEdit, QComboBox, QTreeWidget { background: #111b2b; color: #f4f6f7; border: 1px solid #486078; border-radius: 3px; padding: 5px; selection-background-color: #17677a; }
 QComboBox::drop-down { border: 0; width: 22px; }
-QTreeWidget { padding: 0; alternate-background-color: #282f35; }
-QHeaderView::section { background: #39424a; color: #e7edf0; border: 0; border-right: 1px solid #58626a; padding: 6px; }
+QTreeWidget { padding: 0; alternate-background-color: #253448; }
+QHeaderView::section { background: #2b3b51; color: #e7edf0; border: 0; border-right: 1px solid #58626a; padding: 6px; }
 QGroupBox { border: 1px solid #56616a; border-radius: 4px; margin-top: 12px; padding: 12px 8px 8px; font-weight: 600; }
 QGroupBox::title { subcontrol-origin: margin; left: 9px; padding: 0 4px; color: #dbe5e8; }
-QTabWidget::pane { border: 1px solid #4d5962; background: #2c3239; }
+QTabWidget::pane { border: 1px solid #4d5962; background: #1d2b3d; }
 QTabBar::tab { background: #252b30; color: #b8c4ca; padding: 8px 12px; border: 1px solid #4d5962; }
 QTabBar::tab:selected { background: #35454e; color: white; border-bottom: 2px solid #56bdca; }
 QScrollArea { border: 0; }
 QProgressBar { border: 1px solid #57636a; border-radius: 3px; text-align: center; background: #1d2328; min-height: 12px; }
 QProgressBar::chunk { background: #45a6b5; }
 QCheckBox { spacing: 6px; }
-QSplitter::handle { background: #46515a; width: 3px; }
+QCheckBox::indicator { width: 17px; height: 17px; border: 2px solid #94aac4; border-radius: 3px; background: #101a2b; }
+QCheckBox::indicator:checked { background: #35d0df; border: 2px solid #b4f8ff; }
+QCheckBox::indicator:hover { border: 2px solid #f5ffff; }
+QCheckBox:disabled { color: #718096; }
+QCheckBox::indicator:disabled { background: #273341; border: 2px solid #536171; }
+QCheckBox::indicator:checked:disabled { background: #4c6870; border: 2px solid #6a8086; }
+QSplitter::handle { background: #40536b; width: 3px; }
+QMenu { background: #1d2b3d; color: #e6edf7; border: 1px solid #455b76; padding: 5px; }
+QMenu::item { padding: 6px 24px 6px 12px; }
+QMenu::item:selected { background: #394e68; }
+QPushButton#closeButton { border: 1px solid transparent; background: transparent; padding: 4px 8px; }
+QPushButton#closeButton:hover { background: #40556f; border-color: #6d829e; }
+QPushButton#reopenButton { font-size: 14px; padding: 2px; background: #24374c; border: 1px solid #7990a8; border-radius: 4px; }
+QPushButton#reopenButton:hover { background: #3b6078; border-color: #e4f9ff; }
 '''
-
-
 class Entry(QtWidgets.QLineEdit):
     def get(self): return self.text()
     def delete(self, *_): self.clear()
@@ -95,6 +107,29 @@ class Check(QtWidgets.QCheckBox):
     def set(self, value): self.setChecked(bool(value))
     def configure(self, **kw):
         if 'state' in kw: self.setEnabled(kw['state'] != 'disabled')
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.isChecked():
+            return
+        option = QtWidgets.QStyleOptionButton()
+        self.initStyleOption(option)
+        rect = self.style().subElementRect(QtWidgets.QStyle.SE_CheckBoxIndicator, option, self)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        color = QtGui.QColor('#062a35' if self.isEnabled() else '#a6b8c0')
+        pen = QtGui.QPen(color)
+        pen.setWidthF(2.5)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+        painter.drawPolyline(QtGui.QPolygonF([
+            QtCore.QPointF(x + w * .22, y + h * .52),
+            QtCore.QPointF(x + w * .43, y + h * .72),
+            QtCore.QPointF(x + w * .79, y + h * .29),
+        ]))
+        painter.end()
 
 
 class Combo(QtWidgets.QComboBox):
@@ -304,8 +339,9 @@ class SearchPanel(search.SearchDialog):
         note = QtWidgets.QLabel('Screening is approximate and can miss suitable cells.'); note.setObjectName('muted'); note.setWordWrap(True); f.addRow(note)
         stack.addWidget(group('Screening', f))
         f = QtWidgets.QFormLayout()
-        self.lunar_avg_check = self.lunar_avg = Check('Show average Sun % per lunar day')
-        self.lunar_sd_check = self.lunar_sd = Check('Show standard deviation')
+        self.lunar_avg_check = self.lunar_avg = Check('Calculate and show average Sun % per lunar day')
+        self.lunar_sd_check = self.lunar_sd = Check('Calculate and show standard deviation')
+        self.lunar_sd_check.setToolTip('Enable the average first. Available for terrain searches longer than two days.')
         f.addRow(self.lunar_avg_check); f.addRow(self.lunar_sd_check)
         for key,label in [('lunar_min_avg','Minimum average %'),('lunar_max_avg','Maximum average %'),
                           ('lunar_min_sd','Minimum SD %'),('lunar_max_sd','Maximum SD %')]: field(f,key,label,'')
@@ -315,6 +351,7 @@ class SearchPanel(search.SearchDialog):
         for name in ('start','end'): self.f[name].textChanged.connect(self._update_lunar_state)
         self.lunar_avg_check.clicked.connect(self._update_lunar_state)
         self.lunar_sd_check.clicked.connect(self._update_lunar_state)
+        self.use_terrain.clicked.connect(self._update_lunar_state)
         buttons = QtWidgets.QHBoxLayout()
         self.start_button = Button('Start search'); self.start_button.setObjectName('primary'); self.start_button.clicked.connect(self.start)
         self.cancel_button = Button('Cancel'); self.cancel_button.setEnabled(False); self.cancel_button.clicked.connect(self.cancel.set)
@@ -339,9 +376,14 @@ class SearchPanel(search.SearchDialog):
         self._heading_labels={spec[0]:spec[1] for spec in search.COLUMN_SPECS}
         self.column_vars={}
         column_panel=QtWidgets.QWidget(); colgrid=QtWidgets.QGridLayout(column_panel); colgrid.setContentsMargins(2,2,2,2)
-        for i,spec in enumerate(search.COLUMN_SPECS):
-            checkbox=Check(spec[1]); checkbox.set(spec[0] in search.DEFAULT_COLUMNS); checkbox.clicked.connect(self._columns_changed)
-            self.column_vars[spec[0]]=checkbox; colgrid.addWidget(checkbox,i//2,i%2)
+        visible_keys=search.PERCENT_COLUMNS
+        default_keys=search.DEFAULT_COLUMNS
+        visible_index=0
+        for spec in search.COLUMN_SPECS:
+            checkbox=Check(spec[1]); checkbox.set(spec[0] in default_keys); checkbox.clicked.connect(self._columns_changed)
+            self.column_vars[spec[0]]=checkbox
+            if spec[0] in visible_keys:
+                colgrid.addWidget(checkbox,visible_index//2,visible_index%2);visible_index+=1
         colscroll=QtWidgets.QScrollArea();colscroll.setWidgetResizable(True);colscroll.setWidget(column_panel);colscroll.setMaximumHeight(190);colscroll.hide()
         columns.toggled.connect(colscroll.setVisible); root.addWidget(colscroll)
         self.table=Tree(self._columns)
@@ -423,7 +465,7 @@ class LayersPanel(QtWidgets.QWidget):
                 ('point_details','Point details'),('grid_caption','Grid information'),('points_caption','Comparison points information'),
                 ('map_status','Map information'),('map_legend','Map legend'))
         for key,label in labels:
-            box=QtWidgets.QCheckBox(label);box.setChecked(owner._overlay_settings[key])
+            box=Check(label);box.setChecked(owner._overlay_settings[key])
             box.toggled.connect(lambda value,k=key:(owner._overlay_settings.__setitem__(k,value),owner.window.Render()))
             layout.addWidget(box)
         root.addWidget(group('Visible layers',layout))
@@ -437,34 +479,139 @@ class MainShell(QtWidgets.QMainWindow):
         super().__init__();self.setWindowTitle('Moon Horizon');self.resize(1440,900)
         self.owner=None;self.current_panel=None
         root=QtWidgets.QWidget();self.setCentralWidget(root);outer=QtWidgets.QVBoxLayout(root);outer.setContentsMargins(0,0,0,0);outer.setSpacing(0)
-        header=QtWidgets.QFrame();header.setObjectName('header');bar=QtWidgets.QHBoxLayout(header);bar.setContentsMargins(14,8,14,8)
-        brand=QtWidgets.QLabel('MOON HORIZON');brand.setObjectName('brand');bar.addWidget(brand);bar.addSpacing(20)
+        header=QtWidgets.QFrame();self.header=header;header.setObjectName('header');bar=QtWidgets.QHBoxLayout(header);bar.setContentsMargins(14,8,14,8)
         self.nav_buttons={}
-        for label,key in [('Search','search'),('Time','time'),('Display','layers')]:
+        for label,key in [('Search','search'),('Time analysis','time')]:
             button=QtWidgets.QPushButton(label);button.setCheckable(True)
             button.clicked.connect(lambda _checked=False,k=key:self.toggle_panel(k));bar.addWidget(button);self.nav_buttons[key]=button
-        bar.addStretch(1);hint=QtWidgets.QLabel('Drag to orbit   |   Wheel to zoom   |   Click to select');hint.setObjectName('muted');bar.addWidget(hint)
+        self.observer_button=QtWidgets.QPushButton('Observer height…');self.observer_button.setToolTip('Global height above the terrain');self.observer_button.clicked.connect(self.edit_eye_height);bar.addWidget(self.observer_button)
+        self.map_button=QtWidgets.QPushButton('Layers');self.map_menu=QtWidgets.QMenu(self);self.map_button.setMenu(self.map_menu);bar.addWidget(self.map_button)
+        self.reopen_buttons={};self._closed_panels=set()
+        bar.addStretch(1)
+        self.controls_button=QtWidgets.QPushButton('Controls');self.controls_menu=QtWidgets.QMenu(self);self.controls_button.setMenu(self.controls_menu);bar.addWidget(self.controls_button)
+        self.zen_button=QtWidgets.QPushButton('◌');self.zen_button.setToolTip('Zen mode');self.zen_button.setAccessibleName('Zen mode');self.zen_button.clicked.connect(self.toggle_zen);bar.addWidget(self.zen_button)
         outer.addWidget(header)
+        self.zen_hint=QtWidgets.QPushButton('Exit zen mode  ·  Esc');self.zen_hint.clicked.connect(self.toggle_zen);self.zen_hint.hide();outer.addWidget(self.zen_hint,0,Qt.AlignRight);self._zen=False
         self.splitter=QtWidgets.QSplitter(Qt.Horizontal);self.sidebar=QtWidgets.QFrame();self.sidebar.setObjectName('sidebar');self.sidebar.setMinimumWidth(340);self.sidebar.setMaximumWidth(760)
-        self.stack=QtWidgets.QStackedWidget();side=QtWidgets.QVBoxLayout(self.sidebar);side.setContentsMargins(0,0,0,0);side.addWidget(self.stack)
+        self.stack=QtWidgets.QStackedWidget();side=QtWidgets.QVBoxLayout(self.sidebar);side.setContentsMargins(0,0,0,0)
+        close_row=QtWidgets.QHBoxLayout();close_row.addStretch(1);close=QtWidgets.QPushButton('×');close.setObjectName('closeButton');close.setToolTip('Close panel');close.setAccessibleName('Close panel');close.clicked.connect(self.close_panel);close_row.addWidget(close);side.addLayout(close_row);side.addWidget(self.stack)
         self.vtk_widget=QVTKRenderWindowInteractor(self.splitter)
+        for key,label,side in [('search','Reopen search','left'),('time','Reopen time settings','left'),('horizon','Reopen horizon graph','right'),('legend','Reopen map legend','right'),('analysis','Reopen time analysis','right')]:
+            button=QtWidgets.QPushButton('▶' if side=='left' else '◀',self.vtk_widget)
+            button.setObjectName('reopenButton');button.setFixedSize(27,30);button.setToolTip(label);button.setAccessibleName(label);button.hide();self.reopen_buttons[key]=button
+        self.reopen_buttons['search'].clicked.connect(lambda:self.show_panel('search'))
+        self.reopen_buttons['time'].clicked.connect(lambda:self.show_panel('time'))
+        self.reopen_buttons['horizon'].clicked.connect(lambda:self.set_overlay('horizon_inset',True))
+        self.reopen_buttons['legend'].clicked.connect(lambda:self.set_overlay('map_legend',True))
+        self.reopen_buttons['analysis'].clicked.connect(self.reopen_analysis)
+        self.vtk_widget.installEventFilter(self)
         self.splitter.addWidget(self.sidebar);self.splitter.addWidget(self.vtk_widget);self.splitter.setStretchFactor(0,0);self.splitter.setStretchFactor(1,1)
         outer.addWidget(self.splitter,1);self.sidebar.hide()
+        shortcut_type=getattr(QtGui,'QShortcut',None) or QtWidgets.QShortcut
+        self.zen_shortcut=shortcut_type(QtGui.QKeySequence('Escape'),self);self.zen_shortcut.activated.connect(self.exit_zen)
     def bind_owner(self,owner):
         self.owner=owner
-        self.search=SearchPanel(self,owner);self.time=TimePanel(owner);self.layers=LayersPanel(owner)
-        self.pages={'search':self.search.widget,'time':self.time,'layers':self.layers}
+        self.search=SearchPanel(self,owner);self.time=TimePanel(owner)
+        self.pages={'search':self.search.widget,'time':self.time}
         for page in self.pages.values():self.stack.addWidget(page)
         owner._visibility_dialog=self.search
+        self.map_menu.aboutToShow.connect(self.populate_maps);self.controls_menu.aboutToShow.connect(self.populate_controls);self.update_map_button();self.update_observer_button();self.sync_reopen_buttons()
+    def update_observer_button(self):
+        self.observer_button.setText(f'Observer · {terrain.EYE_HEIGHT_M:g} m')
+    def sync_reopen_buttons(self):
+        if self.owner is None:return
+        owner=self.owner; expanded=owner._graph_expanded
+        states={key:not expanded and key in self._closed_panels and self.current_panel != key for key in ('search','time')}
+        states['horizon']=not expanded and not owner._overlay_settings['horizon_inset']
+        states['legend']=not expanded and owner._map_mode in ('Elevation','Slope') and not owner._overlay_settings['map_legend']
+        states['analysis']=not expanded and owner._analysis_can_reopen
+        for key,show in states.items():
+            show=show and not self._zen
+            button=self.reopen_buttons[key];was_hidden=button.isHidden();button.setVisible(show)
+            if show and was_hidden:button.raise_()
+        self.position_reopen_buttons()
+    def position_reopen_buttons(self):
+        width=max(1,self.vtk_widget.width());height=max(1,self.vtk_widget.height())
+        positions={'search':(0,56),'time':(0,92),'analysis':(width-27,36),'legend':(width-27,int(height*.43)),'horizon':(width-27,int(height*.72))}
+        for key,button in self.reopen_buttons.items():
+            x,y=positions[key];button.move(max(0,x),max(0,min(height-30,y)))
+    def eventFilter(self,obj,event):
+        if obj is self.vtk_widget and event.type()==QtCore.QEvent.Resize:self.position_reopen_buttons()
+        return super().eventFilter(obj,event)
+    def reopen_analysis(self):
+        if self.owner._analysis_snapshot is not None:self.owner.reopen_analysis()
+        else:self.show_panel('time')
+    def edit_eye_height(self):
+        if self.owner is None:return
+        worker=getattr(self.search,'worker',None)
+        if (worker is not None and worker.is_alive()) or getattr(self.search,'_fill_running',False):
+            QtWidgets.QMessageBox.information(self,'Observer height','Wait for the current search to finish before changing the observer height.')
+            return
+        old=terrain.EYE_HEIGHT_M
+        value,accepted=QtWidgets.QInputDialog.getDouble(self,'Observer height','Global height above the terrain (m):',float(old),float(terrain.MIN_EYE_HEIGHT_M),float(terrain.MAX_EYE_HEIGHT_M),2)
+        if not accepted or value==old:return
+        self.owner.set_eye_height(value)
+        self.update_observer_button()
+        if self.search.results:self.search.status.configure(text='Observer height changed. Existing search results use the previous height; run the search again.')
+        self.owner.window.Render()
+    def sync_zen_availability(self):
+        if self.owner is None:return
+        self.zen_button.setEnabled(not self.owner._graph_expanded and not self.sidebar.isVisible())
+    def update_map_button(self):
+        self.map_button.setText('Layers · '+self.owner._map_wanted)
+    def populate_maps(self):
+        self.map_menu.clear()
+        for mode in ('Color','Elevation','Slope'):
+            action=self.map_menu.addAction(mode);action.setCheckable(True);action.setChecked(self.owner._map_wanted==mode)
+            action.triggered.connect(lambda _checked=False,m=mode:self.select_map(m))
+    def select_map(self,mode):
+        owner=self.owner
+        if owner.coordinate_editing or owner._graph_expanded:return
+        owner._map_wanted=owner._horizon_wanted=mode;owner._apply_loaded_maps();owner._schedule_map_generation();self.update_map_button();owner.window.Render()
+    def set_overlay(self,key,value):
+        self.owner._overlay_settings[key]=value
+        if key=='map_legend' and value:self.owner._map_legend_open=True
+        self.sync_reopen_buttons();self.owner.window.Render()
+    def populate_controls(self):
+        menu=self.controls_menu;menu.clear();owner=self.owner
+        def command(label,callback):
+            action=menu.addAction(label);action.triggered.connect(lambda _checked=False:callback())
+        def option(label,value,callback):
+            action=menu.addAction(label);action.setCheckable(True);action.setChecked(bool(value));action.toggled.connect(callback)
+        for label,callback in [('Coordinates…  G',owner.begin_coordinate_entry),('Manage points…  P',owner.begin_points_entry),('Add selected point  A',owner.add_current_point),('Analyze searched point  I',owner.analyze_selected_search_point),('Terrain view  V',owner.toggle_terrain_view),('Reset view  R',self.reset_view),('Fullscreen  F',owner.toggle_fullscreen)]:command(label,callback)
+        menu.addSeparator();option('Coordinate grid  L',owner._grid_enabled,self.set_grid)
+        for key,label in [('horizon_inset','Horizon graph'),('horizon_outline','Horizon outline'),('map_legend','Map legend'),('grid_caption','Grid information'),('points_caption','Selected points information')]:
+            option(label,owner._overlay_settings[key],lambda value,k=key:self.set_overlay(k,value))
+    def set_grid(self,value):
+        self.owner._grid_enabled=value;self.owner.window.Render()
+    def reset_view(self):
+        if self.owner._terrain_view:self.owner.toggle_terrain_view(render=False)
+        self.owner.reset_camera();self.owner.window.Render()
+    def close_panel(self):
+        if self.current_panel:self._closed_panels.add(self.current_panel)
+        self.sidebar.hide();self.current_panel=None
+        for button in self.nav_buttons.values():button.setChecked(False)
+        self.sync_zen_availability();self.sync_reopen_buttons()
+    def toggle_zen(self):
+        if not self._zen and (self.owner._graph_expanded or self.sidebar.isVisible()):return
+        self._zen=not self._zen;self.header.setVisible(not self._zen);self.zen_hint.setVisible(self._zen)
+        if self._zen:self._zen_panel=self.current_panel;self.sidebar.hide()
+        elif getattr(self,'_zen_panel',None):self.show_panel(self._zen_panel)
+        self.owner.set_zen(self._zen);self.vtk_widget.setFocus()
+    def exit_zen(self):
+        if self._zen:self.toggle_zen()
     def show_panel(self,name):
+        if name not in self.pages:return
+        if self._zen:self.toggle_zen()
+        self._closed_panels.discard(name)
         self.stack.setCurrentWidget(self.pages[name]);self.sidebar.show();self.current_panel=name
         for key,button in self.nav_buttons.items():button.setChecked(key==name)
         sizes=self.splitter.sizes()
         if not sizes or sizes[0]<200:self.splitter.setSizes([420,max(600,self.width()-420)])
+        self.sync_zen_availability();self.sync_reopen_buttons()
     def toggle_panel(self,name):
         if self.sidebar.isVisible() and self.current_panel==name:
-            self.sidebar.hide();self.current_panel=None
-            for button in self.nav_buttons.values():button.setChecked(False)
+            self.close_panel()
         else:self.show_panel(name)
     def closeEvent(self,event):
         if self.owner is not None:
@@ -477,5 +624,6 @@ class MainShell(QtWidgets.QMainWindow):
 
 def create_application():
     app=QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    font=QtGui.QFont('Courier New');font.setStyleHint(QtGui.QFont.Monospace);font.setPointSize(10);app.setFont(font)
     app.setStyleSheet(STYLE)
     return app

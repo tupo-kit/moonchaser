@@ -469,20 +469,25 @@ class MoonWindow(GlobeMixin, HudMixin):
         super().on_render_start(obj, event)
         if not hasattr(self, '_map_label'):
             return
+        self.rescale_text()
+        if self._desktop_shell is not None:
+            self._desktop_shell.sync_zen_availability()
+            self._desktop_shell.sync_reopen_buttons()
         settings = self._overlay_settings
         expanded = self._graph_expanded
         self._overlay_button.SetVisibility(not expanded and self._desktop_shell is None)
-        self.help.SetVisibility(not expanded and settings['help'])
+        self.help.SetVisibility(not expanded and settings['help'] and self._desktop_shell is None)
         self.grid_caption.SetVisibility(self.grid_caption.GetVisibility() and settings['grid_caption'])
         self.points_caption.SetVisibility(self.points_caption.GetVisibility() and settings['points_caption'])
-        self._map_label.SetVisibility(not expanded and settings['map_status'])
+        self._map_label.SetVisibility(not expanded and settings['map_status'] and self._desktop_shell is None)
         self.horizon.SetVisibility(not self._terrain_view and settings['horizon_outline'])
-        self.legend_button.SetVisibility(expanded or settings['point_details'])
-        self.stats.SetVisibility(self._legend_expanded and (expanded or settings['point_details']))
+        self.legend_button.SetVisibility(False)
+        self.stats.SetVisibility(expanded)
         inset = expanded or settings['horizon_inset']
         x0, x1, y0, y1 = self._plot_box
         self._horizon_map_button.SetPosition(x1, y1 + (0.07 if expanded else 0.018))
         self._horizon_map_button.SetVisibility(inset)
+        self._horizon_close.SetVisibility(inset and not expanded)
         for actor in (self.profile_background, self.profile_title, self.profile, self.profile_axes, *self.profile_labels):
             actor.SetVisibility(inset)
         self.panorama.SetVisibility(inset and self._panorama_samples is not None)
@@ -499,6 +504,7 @@ class MoonWindow(GlobeMixin, HudMixin):
                     actor.SetVisibility(False)
         self.update_map_legend()
         if self._graph_expanded:
+            self._hide_zen_overlays()
             return
         height = max(self.window.GetSize()[1], 1)
         bottom = self.help.GetPosition()[1] * height
@@ -512,6 +518,25 @@ class MoonWindow(GlobeMixin, HudMixin):
                 size = [0.0, 0.0]
                 actor.GetSize(self.renderer, size)
                 bottom += size[1] + 6
+        self._hide_zen_overlays()
+
+    def _hide_zen_overlays(self):
+        if not getattr(self, '_zen', False):
+            return
+        props = self.renderer.GetViewProps(); props.InitTraversal()
+        for _ in range(props.GetNumberOfItems()):
+            actor = props.GetNextProp()
+            if actor is not None and actor.IsA('vtkActor2D'):
+                self._zen_actors.setdefault(id(actor), (actor, actor.GetVisibility()))
+                actor.SetVisibility(False)
+
+    def set_zen(self, enabled):
+        self._zen = bool(enabled)
+        if not enabled:
+            for actor, visible in self._zen_actors.values():
+                actor.SetVisibility(visible)
+            self._zen_actors.clear()
+        self.window.Render()
 
     def __init__(self, offscreen=False, enable_ephemeris=True, ephemeris_fetcher=None,
                  render_window=None, interactor=None, desktop_shell=None):
@@ -519,6 +544,8 @@ class MoonWindow(GlobeMixin, HudMixin):
 
         self.vtk = vtk
         self._desktop_shell = desktop_shell
+        self._zen = False
+        self._zen_actors = {}
         self.lat, self.lon = -43.31, -11.36
         self.orbit_pivot = np.zeros(3)
         self._terrain_view = False
@@ -569,6 +596,9 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._compare = None           # results: points, horizons, data, errors, epochs, source, stats
         self._stats_above_only = True  # azimuth / elevation statistics over samples above the horizon only
         self._graph_expanded = False  # False: horizon only. True: fullscreen horizon + Sun/Earth graph.
+        self._analysis_snapshot = None
+        self._analysis_can_reopen = False
+        self._hovered_close = None
         self._scroll = 0.0  # window heights the expanded page is scrolled down
         self._panel_boxes = {}
         self._epochs = [utc_now()]
@@ -603,6 +633,8 @@ class MoonWindow(GlobeMixin, HudMixin):
         # Build the 3D globe first, then the 2D HUD on top (draw order matches the original single-file build).
         self._init_globe()
         self._init_hud()
+        self._horizon_close = self.make_text(0.965, 0.315, 17)
+        self._horizon_close.SetInput('×')
         self._panorama_texture_rgb = self._color_rgb  # share the original-resolution color pixels
         self._map_results = queue.Queue()
         self._map_mode = self._map_wanted = 'Color'
@@ -628,6 +660,10 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._map_colorbar.SetLabelFormat('%.1f')
         self._map_colorbar.GetLabelTextProperty().SetColor(1, 1, 1)
         self._map_colorbar.GetTitleTextProperty().SetColor(1, 1, 1)
+        self._map_colorbar.GetLabelTextProperty().SetFontFamilyToCourier()
+        self._map_colorbar.GetTitleTextProperty().SetFontFamilyToCourier()
+        self._map_colorbar.GetLabelTextProperty().ShadowOff()
+        self._map_colorbar.GetTitleTextProperty().ShadowOff()
         self._map_colorbar.SetVisibility(False)
         self.renderer.AddViewProp(self._map_colorbar)
 
@@ -684,7 +720,10 @@ class MoonWindow(GlobeMixin, HudMixin):
                     if self._moon_drag_mode == "pan" else None)
 
             def mouse_move(self, obj, event):
-                if self._moon_drag_press is None or owner.coordinate_editing:
+                if self._moon_drag_press is None:
+                    owner.update_close_hover(*self.GetInteractor().GetEventPosition())
+                    return
+                if owner.coordinate_editing:
                     return
                 current = self.GetInteractor().GetEventPosition()
                 if self._moon_drag_mode in ("scrollbar", "slider"):
@@ -823,6 +862,8 @@ class MoonWindow(GlobeMixin, HudMixin):
         self.window.Render()
 
     def _apply_loaded_maps(self):
+        if self._desktop_shell is not None and self._desktop_shell.owner is self:
+            self._desktop_shell.update_map_button()
         if self._map_wanted in self._loaded_maps and self._map_wanted != self._map_mode:
             rgb, image, legend = self._loaded_maps[self._map_wanted]
             self._map_rgb, self._map_image = rgb, image
@@ -864,7 +905,7 @@ class MoonWindow(GlobeMixin, HudMixin):
                    and self._overlay_settings['map_legend'])
         self._map_colorbar.SetVisibility(visible and self._map_legend_open)
         self._map_legend_button.SetVisibility(visible)
-        self._map_legend_button.SetInput('[-] Legend' if self._map_legend_open else '[+] Legend')
+        self._map_legend_button.SetInput('×  Legend' if self._map_legend_open else '+  Legend')
 
     def toggle_map_legend(self):
         if self._map_mode not in ('Elevation', 'Slope') or self._graph_expanded:
@@ -878,7 +919,7 @@ class MoonWindow(GlobeMixin, HudMixin):
         if self.coordinate_editing:
             return
         if self._desktop_shell is not None:
-            self._desktop_shell.show_panel('layers')
+            self._desktop_shell.controls_button.showMenu()
             return
         import tkinter as tk
         from tkinter import ttk
@@ -1044,6 +1085,14 @@ class MoonWindow(GlobeMixin, HudMixin):
 
     def close_graph(self):
         was_compare = self._compare_active
+        self._analysis_can_reopen = True
+        if self._compare_active and self._compare is not None:
+            self._analysis_snapshot = {
+                'compare': self._compare, 'points': list(self._compare_points),
+                'visible': list(self._compare_visible), 'index': self._compare_index,
+                'epochs': list(self._epochs), 'time_index': self._time_index,
+                'method': self._sky_method, 'step': self._interval_step_minutes,
+            }
         self._graph_expanded = False
         self.update_map_legend()
         self._scroll = 0.0
@@ -1062,6 +1111,31 @@ class MoonWindow(GlobeMixin, HudMixin):
         self.apply_layout()
         self.update_profile(self.horizon_angles)
         self.update_stats()
+        if self._desktop_shell is not None:
+            self._desktop_shell.sync_reopen_buttons()
+        self.window.Render()
+
+    def reopen_analysis(self):
+        snapshot = self._analysis_snapshot
+        if snapshot is None or self._graph_expanded:
+            return
+        self._graph_expanded = True
+        self._compare_active = True
+        self._compare = snapshot['compare']
+        self._compare_points = list(snapshot['points'])
+        self._compare_visible = list(snapshot['visible'])
+        self._compare_index = snapshot['index']
+        self._epochs = list(snapshot['epochs'])
+        self._time_index = min(snapshot['time_index'], len(self._epochs)-1)
+        self._sky_method = snapshot['method']
+        self._interval_step_minutes = snapshot['step']
+        self._now_mode = False
+        self._scroll = 0.0
+        self.compare_activate(self._compare_index, refresh=False)
+        self.apply_layout(); self.update_profile(self.horizon_angles)
+        self.update_stats(); self.update_table()
+        if self._desktop_shell is not None:
+            self._desktop_shell.sync_reopen_buttons()
         self.window.Render()
 
     def request_sky_update(self):
@@ -1227,6 +1301,8 @@ class MoonWindow(GlobeMixin, HudMixin):
         if method not in SKY_METHODS:
             raise ValueError("Choose Skyfield or JPL Horizons.")
         epochs = time_samples(start, stop, float(step) * TIME_UNITS[unit])
+        self._analysis_snapshot = None
+        self._analysis_can_reopen = False
         self._sky_method = method
         self._saved_interval = (parse_utc(start), parse_utc(stop), float(step), unit, method)
         save_interval(start, stop, step, unit, method)
@@ -1325,6 +1401,8 @@ class MoonWindow(GlobeMixin, HudMixin):
         """Analyze the searched point or selected point set over the search interval."""
         if self._search_selected is None or self._search_parameters is None:
             return
+        self._analysis_snapshot = None
+        self._analysis_can_reopen = False
         if self._terrain_view:
             self.toggle_terrain_view(render=False)
         start, stop, step_hours = self._search_parameters[:3]
@@ -1585,6 +1663,9 @@ class MoonWindow(GlobeMixin, HudMixin):
             import tkinter as tk
             self._coordinate_root = tk.Tk(className="MoonHorizon")
             self._coordinate_root.withdraw()
+            import tkinter.font as tkfont
+            for name in ('TkDefaultFont', 'TkTextFont', 'TkFixedFont', 'TkMenuFont', 'TkHeadingFont'):
+                tkfont.nametofont(name, root=self._coordinate_root).configure(family='Courier')
             # Keep the native clipboard owner alive after a dialog is closed.
             self._coordinate_pump_observer = self.interactor.AddObserver(
                 "TimerEvent", self.pump_coordinate_clipboard)
@@ -1627,6 +1708,9 @@ class MoonWindow(GlobeMixin, HudMixin):
             self.window.Render()
 
     def begin_eye_height_entry(self):
+        if self._desktop_shell is not None:
+            self._desktop_shell.edit_eye_height()
+            return
         if self.coordinate_editing:
             return
         try:
@@ -1657,6 +1741,8 @@ class MoonWindow(GlobeMixin, HudMixin):
         new = terrain.set_eye_height(value)  # ValueError: shown by the dialog
         if abs(new - old) < 1e-12:
             return
+        self._analysis_snapshot = None
+        self._analysis_can_reopen = False
         if self._compare_active and self._graph_expanded:
             self.request_sky_update()  # the worker recomputes every point's horizon and Sun / Earth data
         else:
@@ -1749,7 +1835,7 @@ class MoonWindow(GlobeMixin, HudMixin):
             f"Latitude {lat:+.3f} deg    Longitude {lon:+.3f} deg\n"
             f"Elevation {elevation:+,.0f} m    Slope {compute_slope_deg(lat, lon):.1f} deg\n"
             f"Horizon {np.min(angles):+.2f} to {np.max(angles):+.2f} deg\n"
-            f"Distance {np.min(distances):.1f} to {np.max(distances):.1f} km  |  Eye {terrain.EYE_HEIGHT_M:g} m (E)")
+            f"Horizon distance {np.min(distances):.1f} to {np.max(distances):.1f} km")
 
     # ------------------------------------------------------------------ point comparison
 
@@ -1902,9 +1988,37 @@ class MoonWindow(GlobeMixin, HudMixin):
         if self._compare_active and self._graph_expanded and self._compare is not None and count > 1:
             self.compare_activate((self._compare_index + delta) % count)
 
+    def update_close_hover(self, x, y):
+        width, height = self.window.GetSize()
+        hit = None
+        for actor in (self._horizon_close, self._map_legend_button, self.close_button):
+            if not actor.GetVisibility():
+                continue
+            position = actor.GetPosition(); size = [0.0, 0.0]
+            actor.GetSize(self.renderer, size)
+            if position[0]*width-6 <= x <= position[0]*width+size[0]+6 and position[1]*height-6 <= y <= position[1]*height+size[1]+6:
+                hit = actor
+                break
+        if hit is self._hovered_close:
+            return
+        if self._hovered_close is not None:
+            prop = self._hovered_close.GetTextProperty()
+            prop.SetColor(0.92, 0.96, 1.0); prop.SetBackgroundOpacity(0.08)
+        self._hovered_close = hit
+        if hit is not None:
+            prop = hit.GetTextProperty()
+            prop.SetColor(1.0, 1.0, 1.0); prop.SetBackgroundColor(0.25, 0.38, 0.52)
+            prop.SetBackgroundOpacity(0.95)
+        self.window.Render()
+
     def pick(self, x, y):
         width, height = self.window.GetSize()
         if self.coordinate_editing:
+            return
+        if (not self._graph_expanded and self._horizon_close.GetVisibility()
+                and 0.94 <= x / width <= 1.0 and 0.30 <= y / height <= 0.35):
+            self._overlay_settings['horizon_inset'] = False
+            self.window.Render()
             return
         if self._horizon_map_button.GetVisibility():
             px, py = self._horizon_map_button.GetPosition()
@@ -1919,9 +2033,20 @@ class MoonWindow(GlobeMixin, HudMixin):
         if (not self._graph_expanded and self._map_mode in ('Elevation', 'Slope')
                 and self._overlay_settings['map_legend']
                 and 0.87 <= x / width <= 1.0 and 0.81 <= y / height <= 0.87):
-            self.toggle_map_legend()
+            self._overlay_settings['map_legend'] = False
+            self.window.Render()
             return
         if self.over_sky_controls(x, y):
+            if self._compare_active and self._compare is not None and self._table_pool:
+                slots, _ = self.table_layout(self.compare_n())
+                if len(self._table_pool) >= len(slots):
+                    actor = self._table_pool[len(slots) - 1]
+                    pos = actor.GetPosition(); size = [0.0, 0.0]
+                    actor.GetSize(self.renderer, size)
+                    if actor.GetVisibility() and pos[0]*width <= x <= pos[0]*width+size[0] and pos[1]*height-size[1] <= y <= pos[1]*height:
+                        self._table_notes_expanded = not self._table_notes_expanded
+                        self.update_table(); self.apply_layout(); self.window.Render()
+                        return
             if self.table_header_click(x, y):  # sort a comparison table by the clicked column
                 return
             nx, ny = x / width, y / height
@@ -1952,28 +2077,20 @@ class MoonWindow(GlobeMixin, HudMixin):
                 self.select_location(float(lat), float(lon))
 
     def run(self, qt_app=None):
+        if self._desktop_shell is not None:
+            self._desktop_shell.show()
+        self.interactor.Initialize()
+        self._sky_pump_observer = self.interactor.AddObserver("TimerEvent", self.poll_sky)
+        self._sky_timer = self.interactor.CreateRepeatingTimer(100)
+        self.poll_sky()
+        self.window.Render()
         # Handle the window-manager close button (Escape no longer quits).
         exit_observer = self.interactor.AddObserver(
             "ExitEvent", lambda obj, event: obj.SetDone(True))
-
-        def start_rendering():
-            self.interactor.Initialize()
-            self._sky_pump_observer = self.interactor.AddObserver("TimerEvent", self.poll_sky)
-            self._sky_timer = self.interactor.CreateRepeatingTimer(100)
-            self.poll_sky()
-            self.window.Render()
-
         try:
             if qt_app is not None:
-                # Let Qt create and map the native widget before VTK attempts
-                # its first OpenGL render in Initialize().
-                from desktop_ui import QtCore
-                if self._desktop_shell is not None:
-                    self._desktop_shell.show()
-                QtCore.QTimer.singleShot(0, start_rendering)
                 qt_app.exec() if hasattr(qt_app, 'exec') else qt_app.exec_()
             else:
-                start_rendering()
                 run_responsive_event_loop(self.interactor)
         finally:
             self.interactor.RemoveObserver(exit_observer)

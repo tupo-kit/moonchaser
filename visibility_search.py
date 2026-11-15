@@ -686,7 +686,9 @@ COLUMN_SPECS = (
     ('cell', 'Cell bounds (lat / lon)', 'Position', 250, None, None, None),
 )
 SPEC = {spec[0]: spec for spec in COLUMN_SPECS}
-DEFAULT_COLUMNS = ('lat', 'lon', 'sun', 'earth', 'slope', 'max_slope', 'cells', 'cell')
+PERCENT_COLUMNS = frozenset(('lat', 'lon', 'sun', 'earth', 'lunar_mean', 'lunar_sd',
+                             'sun_center', 'earth_center', 'cells', 'cell'))
+DEFAULT_COLUMNS = ('lat', 'lon', 'sun', 'earth', 'cells', 'cell')
 # Columns that need the sky statistics of compare.py (calculated in the background from the shared data).
 STATS_KEYS = frozenset(spec[0] for spec in COLUMN_SPECS
                        if spec[2] in ('Sun per lunar day', 'Centre above the horizon')
@@ -848,10 +850,10 @@ class SearchDialog:
         field(slope_box, 'max_slope', 'Max slope (deg; blank = off)', '', 0)
         field(slope_box, 'slope_radius', 'Slope radius (km; 0-20)', '1', 1)
         lunar_box = section('Lunar-day statistics', 2, 0)
-        self.lunar_avg_check = ttk.Checkbutton(lunar_box, text='Show average Sun % per lunar day for each point',
+        self.lunar_avg_check = ttk.Checkbutton(lunar_box, text='Calculate and show average Sun % per lunar day for each point',
                                                variable=self.lunar_avg, command=self._update_lunar_state)
         self.lunar_avg_check.grid(row=0, column=0, columnspan=4, sticky='w')
-        self.lunar_sd_check = ttk.Checkbutton(lunar_box, text='Show its standard deviation',
+        self.lunar_sd_check = ttk.Checkbutton(lunar_box, text='Calculate and show its standard deviation',
                                               variable=self.lunar_sd, command=self._update_lunar_state)
         self.lunar_sd_check.grid(row=1, column=0, columnspan=4, sticky='w')
         field(lunar_box, 'lunar_min_avg', 'Min avg Sun %', '', 2, 0)
@@ -862,7 +864,7 @@ class SearchDialog:
                                     wraplength=470)
         self.lunar_note.grid(row=4, column=0, columnspan=4, sticky='w')
         other_box = section('Screening', 2, 1)
-        ttk.Checkbutton(settings_pane, text='Use terrain horizon  (off: candidate clusters)', variable=self.use_terrain
+        ttk.Checkbutton(settings_pane, text='Use terrain horizon  (off: candidate clusters)', variable=self.use_terrain, command=self._update_lunar_state
                         ).pack(anchor='w', before=sections, pady=(0, 6))
         field(other_box, 'side', 'Samples per side (2-9)', '3', 0)
         field(other_box, 'horizon', 'Pessimistic horizon (deg)', '2', 1)
@@ -975,6 +977,8 @@ class SearchDialog:
         self._columns_panel_open = False
         groups = []
         for spec in COLUMN_SPECS:
+            if spec[0] not in PERCENT_COLUMNS:
+                continue
             if spec[2] not in groups:
                 groups.append(spec[2])
         for number, group in enumerate(groups):
@@ -983,7 +987,7 @@ class SearchDialog:
                         'Centre above the horizon': 'Above horizon',
                         'Directions (samples above the horizon)': 'Directions'}.get(group, group)
             column_tabs.add(box, text=tab_name)
-            members = [spec for spec in COLUMN_SPECS if spec[2] == group]
+            members = [spec for spec in COLUMN_SPECS if spec[2] == group and spec[0] in PERCENT_COLUMNS]
             for index, spec in enumerate(members):
                 ttk.Checkbutton(box, text=spec[1], variable=self.column_vars[spec[0]],
                                 command=self._columns_changed).grid(row=index // 2, column=index % 2, sticky='w', padx=6, pady=3)
@@ -1022,16 +1026,20 @@ class SearchDialog:
         """The lunar-day statistics are only offered when the interval is longer than 2 days."""
         days = self._interval_days()
         long_interval = days is not None and days > LONG_INTERVAL_DAYS
-        self.lunar_avg_check.configure(state='normal' if long_interval else 'disabled')
-        self.lunar_sd_check.configure(state='normal' if long_interval and self.lunar_avg.get() else 'disabled')
+        use_terrain = bool(self.use_terrain.get())
+        self.lunar_avg_check.configure(state='normal' if long_interval and use_terrain else 'disabled')
+        self.lunar_sd_check.configure(state='normal' if long_interval and use_terrain and self.lunar_avg.get() else 'disabled')
         for name in ('lunar_min_avg', 'lunar_max_avg', 'lunar_min_sd', 'lunar_max_sd'):
-            self.f[name].configure(state='normal' if long_interval else 'disabled')
+            enabled = long_interval and use_terrain and (not name.endswith('_sd') or self.lunar_avg.get())
+            self.f[name].configure(state='normal' if enabled else 'disabled')
         if days is None:
             note = 'Enter a valid start and end to see whether these options are available.'
+        elif not use_terrain:
+            note = 'Lunar-day statistics require a terrain-horizon search.'
         elif long_interval:
             note = (f'Interval: {days:,.1f} days (about {days / LUNAR_DAY_DAYS:,.2f} lunar days). The Sun visibility '
-                    'is computed for every complete lunar day; the table shows its mean (and SD). '
-                    'Blank limit = no limit.')
+                    'is computed for each complete lunar day when selected or when a limit is entered. '
+                    'Standard deviation requires the average. Blank limit = no limit.')
             if days < LUNAR_DAY_DAYS:
                 note += ' Shorter than one lunar day: the whole interval counts as one day (SD 0).'
         else:
@@ -1187,7 +1195,9 @@ class SearchDialog:
                 def limit(name):
                     text = get(name).strip()
                     return float(text) if text else None
-                limits = tuple(limit(n) for n in ('lunar_min_avg', 'lunar_max_avg', 'lunar_min_sd', 'lunar_max_sd'))
+                limits = (limit('lunar_min_avg'), limit('lunar_max_avg'),
+                          limit('lunar_min_sd') if self.lunar_avg.get() else None,
+                          limit('lunar_max_sd') if self.lunar_avg.get() else None)
                 if any(v is not None for v in limits):
                     lunar_filter = limits
                     # A filtered metric is always shown, so the table explains why a point passed.

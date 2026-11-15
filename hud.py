@@ -13,14 +13,16 @@ point (one colour per point, one on/off button per point) and, below them, the c
 _compare_points, _compare_index, _compare_visible, _compare (results), _stats_above_only.
 """
 from datetime import timedelta
+import textwrap
 
 import numpy as np
+import terrain
 
 from compare import POINT_COLORS, SYNODIC_DAYS, TABLE_COUNT, build_tables, lunar_day_series, next_sort, table_notes
 from sky import SKY_METHODS
 from terrain import terrain_panorama_rgba, terrain_panorama_samples
 
-SKY_LEGEND = {"JPL": "JPL Sun yellow / Earth blue", "Skyfield": "Skyfield Sun orange / Earth green"}
+SKY_LEGEND = {"JPL": "JPL\nSun yellow | Earth blue", "Skyfield": "Skyfield\nSun orange | Earth green"}
 SKY_COLORS = {"Sun JPL": (1.0, 0.8, 0.12), "Earth JPL": (0.35, 0.65, 1.0), "Sun Skyfield": (1.0, 0.35, 0.1), "Earth Skyfield": (0.3, 1.0, 0.5)}
 PANEL_HEIGHT = 0.5  # each extra graph is half a window tall; the page scrolls under the window
 EXTRA_PANELS = ("Sun", "Earth")
@@ -94,7 +96,11 @@ class HudMixin:
 
     def _init_hud(self):
         """Create every HUD actor (stats, help, horizon inset, graphs, slider, scroll bar) and lay them out."""
-        self.stats = self.make_text(0.025, 0.97, 19, top=True)
+        self.stats = self.make_text(0.025, 0.97, 14, top=True)
+        self.analysis_heading = self.make_text(0.025, 0.985, 17, top=True)
+        self.analysis_heading.SetInput('Time analysis')
+        self.analysis_hint = self.make_text(0.025, 0.845, 12, top=True)
+        self.analysis_hint.SetInput('Scroll for graphs and point tables')
         self.help = self.make_text(0.025, 0.035, 15)
         self.help.SetInput(self.GLOBE_HELP)
         self.profile_background = self.make_profile_background()
@@ -139,7 +145,7 @@ class HudMixin:
         self.next_button = self.make_text(0.77, 0.37, 14)
         self.next_button.SetInput("[ Next ]")
         self.close_button = self.make_text(0.91, 0.46, 16)
-        self.close_button.SetInput("[ Close ]")
+        self.close_button.SetInput("×")
         self.panels = {}
         for key in COMPARE_PANELS:
             title = self.make_text(0.08, 0.0, 14, top=True)
@@ -184,6 +190,7 @@ class HudMixin:
         self._table_pool = []
         self._table_sorts = [None] * TABLE_COUNT    # per table: (column, descending) or None
         self._table_headers = []            # per table: (text slot, column character spans), set by update_table
+        self._table_notes_expanded = False
         self._scrollbar_grab = 0.0
         self.scrollbar_track = self.make_overlay_lines([], (0.16, 0.2, 0.28), 8)
         self.scrollbar = self.make_overlay_lines([], (0.55, 0.65, 0.8), 8)
@@ -194,18 +201,32 @@ class HudMixin:
         actor.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
         actor.SetPosition(x, y)
         prop = actor.GetTextProperty()
-        prop.SetFontFamilyToArial()
+        prop.SetFontFamilyToCourier()
         prop.SetFontSize(size)
         prop.SetColor(0.92, 0.96, 1.0)
         prop.SetBackgroundColor(0.025, 0.035, 0.055)
         prop.SetBackgroundOpacity(0.08)
-        # VTK's math-text renderer cannot draw text shadows and warns on
-        # every affected label. Keep all HUD labels compatible with it.
         prop.ShadowOff()
+        if not hasattr(self, '_text_base_sizes'):
+            self._text_base_sizes = {}
+        self._text_base_sizes[actor] = size
         if top:
             prop.SetVerticalJustificationToTop()
         self.renderer.AddViewProp(actor)
         return actor
+
+    def rescale_text(self):
+        width, height = self.window.GetSize()
+        if width <= 1 or height <= 1 or (width, height) == getattr(self, '_text_size', None):
+            return
+        self._text_size = (width, height)
+        scale = max(0.65, min(1.35, min(width / 1280, height / 800)))
+        tables = set(getattr(self, '_table_pool', ()))
+        for actor, size in self._text_base_sizes.items():
+            if actor not in tables:
+                actor.GetTextProperty().SetFontSize(max(8, round(size * scale)))
+        if getattr(self, '_compare', None) is not None:
+            self.update_table()
 
     def overlay_mapper(self, data):
         mapper = self.vtk.vtkPolyDataMapper2D()
@@ -229,8 +250,8 @@ class HudMixin:
         data.SetPolys(cells)
         actor = self.vtk.vtkActor2D()
         actor.SetMapper(self.overlay_mapper(data))
-        actor.GetProperty().SetColor(0.11, 0.13, 0.15)
-        actor.GetProperty().SetOpacity(0.82)
+        actor.GetProperty().SetColor(0.065, 0.10, 0.16)
+        actor.GetProperty().SetOpacity(0.97)
         self.renderer.AddViewProp(actor)
         return actor
 
@@ -357,24 +378,24 @@ class HudMixin:
         if expanded:
             self._plot_box = (0.06, 0.97, 0.10 + s, 0.62 + s)
             background = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
-            bx = 0.64
+            bx = 0.69
             self._controls = {"now": (0.85, 0.92 + s, 0.905, 0.96 + s),
-                              "close": (0.91, 0.92 + s, 0.985, 0.96 + s),
-                              "previous": (bx, 0.79 + s, bx + 0.13, 0.825 + s),
-                              "next": (bx + 0.16, 0.79 + s, bx + 0.28, 0.825 + s),
-                              **{source: (bx, 0.625 + s, bx + 0.16, 0.66 + s) for source in SKY_METHODS[self._sky_method]},
+                              "close": (0.94, 0.94, 0.995, 0.995),
+                              "previous": (bx, 0.805 + s, bx + 0.13, 0.84 + s),
+                              "next": (bx + 0.16, 0.805 + s, bx + 0.28, 0.84 + s),
+                              **{source: (0.43, 0.805 + s, 0.64, 0.84 + s) for source in SKY_METHODS[self._sky_method]},
                               "legend": (0.02, 0.95 + s, 0.30, 0.995 + s)}
             positions = {self.now_button: (0.85, 0.93 + s),
-                         self.close_button: (0.91, 0.93 + s), self.time_caption: (bx, 0.89 + s),
-                         self.previous_button: (bx, 0.795 + s), self.next_button: (bx + 0.16, 0.795 + s),
-                         self.profile_title: (bx, 0.765 + s)}
+                         self.close_button: (0.965, 0.955), self.time_caption: (bx, 0.91 + s),
+                         self.previous_button: (bx, 0.81 + s), self.next_button: (bx + 0.16, 0.81 + s),
+                         self.profile_title: (0.025, 0.765 + s)}
             if compare:  # no "Now" in a comparison; the point selector takes the top row
                 del self._controls["now"]
-                self._controls["point_prev"] = (bx, 0.925 + s, bx + 0.045, 0.96 + s)
-                self._controls["point_next"] = (0.79, 0.925 + s, 0.835, 0.96 + s)
-                positions[self.point_prev_button] = (bx, 0.93 + s)
-                positions[self.point_label] = (0.69, 0.93 + s)
-                positions[self.point_next_button] = (0.79, 0.93 + s)
+                self._controls["point_prev"] = (0.43, 0.925 + s, 0.475, 0.96 + s)
+                self._controls["point_next"] = (0.62, 0.925 + s, 0.665, 0.96 + s)
+                positions[self.point_prev_button] = (0.43, 0.93 + s)
+                positions[self.point_label] = (0.48, 0.93 + s)
+                positions[self.point_next_button] = (0.62, 0.93 + s)
         else:
             self._plot_box = (0.61, 0.97, 0.12, 0.25)
             background = ((0.59, 0.055), (0.99, 0.055), (0.99, 0.35), (0.59, 0.35))
@@ -387,13 +408,18 @@ class HudMixin:
             self._bg_points.SetPoint(index, x, y, 0)
         self._bg_points.Modified()
         self.profile_background.GetMapper().GetInput().Modified()
+        self.profile_background.GetProperty().SetOpacity(0.985 if expanded else 0.92)
         for actor in self.source_buttons.values():
-            actor.SetPosition(0.64, 0.635 + s)
-        self.legend_button.SetInput("[v] Point details" if self._legend_expanded else "[>] Point details")
-        self.legend_button.SetVisibility(True)
+            actor.SetPosition(0.43, 0.81 + s)
+        self.legend_button.SetInput("Point details")
+        self.legend_button.SetVisibility(False)
         self.legend_button.SetPosition(0.025, 0.98 + s)
         self.stats.SetPosition(0.025, 0.93 + s)
-        self.stats.SetVisibility(self._legend_expanded)
+        self.stats.SetVisibility(expanded)
+        self.analysis_heading.SetPosition(0.025, 0.985 + s)
+        self.analysis_heading.SetVisibility(expanded)
+        self.analysis_hint.SetPosition(0.025, 0.845 + s)
+        self.analysis_hint.SetVisibility(expanded)
         for source, actor in self.source_buttons.items():
             actor.SetInput(("[x] " if self._shown_sources[source] else "[ ] ") + source)
             actor.SetVisibility(expanded and source in SKY_METHODS[self._sky_method])
@@ -427,6 +453,9 @@ class HudMixin:
         # Re-add the stats text last so it is drawn above the fullscreen background.
         self.renderer.RemoveViewProp(self.stats)
         self.renderer.AddViewProp(self.stats)
+        for actor in (self.analysis_heading, self.analysis_hint):
+            self.renderer.RemoveViewProp(actor)
+            self.renderer.AddViewProp(actor)
         self.renderer.RemoveViewProp(self.progress_text)
         self.renderer.AddViewProp(self.progress_text)
 
@@ -508,7 +537,7 @@ class HudMixin:
                 y += TABLE_ROW
             y += 0.03
         slots.append(y)  # notes
-        return slots, y + 0.28
+        return slots, y + (0.60 if self._table_notes_expanded else 0.08)
 
     def table_actor(self, slot):
         while len(self._table_pool) <= slot:
@@ -533,7 +562,7 @@ class HudMixin:
         width, height = self.window.GetSize()
         by_width = int(0.94 * width / (max(chars, 1) * 0.62))  # monospace advance is about 0.6 em
         by_height = int(TABLE_ROW * height / 1.5)
-        return int(np.clip(min(by_width, by_height), 8, 16))
+        return int(np.clip(min(by_width, by_height), 5, 16))
 
     def update_table(self):
         n = self.compare_n()
@@ -548,7 +577,7 @@ class HudMixin:
         compare = self._compare
         tables = build_tables(compare["points"], compare["stats"], self._table_sorts)
         notes = table_notes(compare["stats_span"], self._stats_above_only)
-        chars = max(len(line) for _, header, rows, _, _ in tables for line in (*header, *rows))
+        chars = max(len(line) for title, header, rows, _, _ in tables for line in (title, *header, *rows))
         size = self.table_font(chars)
 
         def put(slot, text, color, font_size, mono=True):
@@ -557,11 +586,11 @@ class HudMixin:
             prop = actor.GetTextProperty()
             prop.SetColor(*color)
             prop.SetFontSize(font_size)
-            (prop.SetFontFamilyToCourier if mono else prop.SetFontFamilyToArial)()
+            prop.SetFontFamilyToCourier()
             actor.SetVisibility(True)
 
-        put(0, "[ Stats over: " + ("samples above the horizon" if self._stats_above_only else "all samples")
-            + " ]   (click to change)", white, 14, mono=False)
+        put(0, "Direction averages: " + ("above horizon only" if self._stats_above_only else "all samples")
+            + "  [change]", white, min(14, size), mono=False)
         self._table_headers = []
         for t, (title, header, rows, order, spans) in enumerate(tables):
             base = 1 + t * (2 + n)
@@ -570,7 +599,10 @@ class HudMixin:
             self._table_headers.append((base + 1, spans))
             for i, row in enumerate(rows):  # rows may be sorted; each keeps the colour of its point
                 put(base + 2 + i, row, POINT_COLORS[order[i] % len(POINT_COLORS)], size)
-        put(len(slots) - 1, notes, (0.62, 0.7, 0.8), max(8, size - 1), mono=False)
+        width = max(20, int(self.window.GetSize()[0] * 0.90 / max(0.65 * max(7, size - 1), 1)))
+        wrapped_notes = '\n'.join(textwrap.fill(line, width=width) for line in notes.splitlines())
+        notes_text = ('− Table notes\n' + wrapped_notes) if self._table_notes_expanded else '+ Table notes'
+        put(len(slots) - 1, notes_text, (0.68, 0.76, 0.86), max(7, size - 1), mono=False)
         for actor in self._table_pool[len(slots):]:
             actor.SetVisibility(False)
 
@@ -730,7 +762,7 @@ class HudMixin:
         span = float(seconds[-1]) if len(seconds) > 1 else 0.0
         for key in EXTRA_PANELS:
             panel, (x0, x1, y0, y1) = self.panels[key], self._panel_boxes[key]
-            title = f"{key} centre above terrain horizon vs time (UTC), {n} points"
+            title = f"{key} height above terrain | {n} points"
             name = f"{key} {source}"
             shown = []
             if ready and span > 0 and self._shown_sources[source]:
@@ -742,7 +774,7 @@ class HudMixin:
                 elif not self._shown_sources[source]:
                     detail = "Source hidden (see the checkbox)"
                 else:
-                    detail = "No point selected: use the buttons on the right"
+                    detail = "Select a point using the coloured buttons"
                 panel["title"].SetInput(title + "\n" + detail)
                 for actor in (*panel["xlabels"], *panel["ylabels"]):
                     actor.SetVisibility(False)
@@ -756,8 +788,8 @@ class HudMixin:
                 self._cmp_lines[(key, i)].GetMapper().SetInputData(
                     self.overlay_lines_data([np.column_stack((xs, ys))]))
             self._cmp_state[key] = {"xs": xs, "high": high, "values": values}
-            panel["title"].SetInput(f"{title}\n0 deg = terrain horizon; below horizon shown as 0\n"
-                                    f"Scale 0 to {high:.1f} deg")
+            panel["title"].SetInput(f"{title}\nBelow the horizon = 0 deg | time shown in UTC\n"
+                                    f"Height: 0 to {high:.1f} deg")
             for fraction, label in zip(np.linspace(0, 1, 5), panel["xlabels"]):
                 label.SetInput(f"{epochs[0] + timedelta(seconds=float(fraction) * span):%m-%d %H:%M}")
                 label.SetVisibility(True)
@@ -982,8 +1014,8 @@ class HudMixin:
         y = self.profile_y(values)
         self.profile.GetMapper().SetInputData(self.overlay_lines_data([np.column_stack((x, y))]))
         self.profile_title.SetInput(
-            f"360-degree horizon: selected observer\n"
-            f"Elevation scale {self._profile_low:+.2f} to {self._profile_high:+.2f} deg"
+            f"Horizon\n"
+            f"Scale {self._profile_low:+.2f} to {self._profile_high:+.2f} deg"
             + ("".join("\n" + SKY_LEGEND[source] for source in SKY_METHODS[self._sky_method] if self._shown_sources[source])
                if self._graph_expanded else ""))
         for name in SKY_COLORS:
@@ -1015,8 +1047,8 @@ class HudMixin:
 
     def update_time_caption(self):
         epoch = self._epochs[self._time_index]
-        mode = ("Now (refreshes every minute)" if self._now_mode else
-                f"Sample {self._time_index + 1}/{len(self._epochs)} | trails = all samples")
+        mode = ("Updates every minute" if self._now_mode else
+                f"Sample {self._time_index + 1} of {len(self._epochs)}")
         self.time_caption.SetInput(f"UTC {epoch:%Y-%m-%d %H:%M:%S}\n{mode}")
         for actor, enabled in ((self.previous_button, self._time_index > 0),
                                (self.next_button, self._time_index < len(self._epochs) - 1)):
@@ -1026,21 +1058,10 @@ class HudMixin:
         if not self._graph_expanded:
             self.stats.SetInput(self._stats_base)
             return
-        lines = [self._stats_base, f"UTC {self._epochs[self._time_index]:%Y-%m-%d %H:%M:%S}"]
-        if self._sky_data is None:
-            lines.append(self._sky_status)
-        else:
-            for name in SKY_COLORS:
-                if name not in self._sky_data or not self._shown_sources[name.rsplit(" ", 1)[-1]]:
-                    continue
-                body, index = self._sky_data[name], self._time_index
-                lines.append(f"{name}: {body['state'][index]}  |  AZ {body['az'][index]:.2f}, EL {body['el'][index]:+.2f} deg")
-            if len(self._epochs) > 1:
-                counts = [f"{name} {np.count_nonzero(body['visible'])}/{len(self._epochs)}" for name, body in self._sky_data.items() if self._shown_sources[name.rsplit(" ", 1)[-1]]]
-                lines.append("Visible samples: " + "  |  ".join(counts))
-            if self._sky_status:
-                lines.append(self._sky_status)
-            lines.append("Center visible = visible; partial is approximate (4 limb points).")
+        lines = [f"Horizon: {np.min(self.horizon_angles):+.1f} to {np.max(self.horizon_angles):+.1f} deg"]
+        if self._sky_data is None and self._sky_status:
+            width = max(18, int(self.window.GetSize()[0] * 0.50 / 9))
+            lines.extend(textwrap.wrap(self._sky_status, width=width)[:3])
         self.stats.SetInput("\n".join(lines))
 
     def toggle_source(self, source):
