@@ -1,11 +1,12 @@
-"""Integrated Qt shell for the VTK globe, search and interval controls."""
+"""Integrated Qt shell for the VTK globe: search, points, analysis controls, top bar and comparison tables."""
+import csv
 import os
 import queue
+import re
 import sys
 import threading
 import time
 from datetime import timedelta
-from types import SimpleNamespace
 
 # QVTK's X11 render window needs a real X11 window id. Under native Wayland Qt
 # hands out a pointer-sized id, and VTK fails with "The result is out of range"
@@ -41,6 +42,13 @@ Qt = QtCore.Qt
 TIME_FORMAT = '%Y-%m-%d %H:%M:%S'
 EDIT_FORMAT = 'yyyy-MM-dd HH:mm:ss'
 MONO_FAMILY = 'monospace'
+RESULTS_HEIGHT = 300
+RESULTS_BAR = 49
+QWIDGETSIZE_MAX = 16777215
+TABLES_HEIGHT = 260
+ABOVE_ONLY, ALL_SAMPLES = 'Above horizon only', 'All samples'
+UNIT_SECONDS = {'min': 60.0, 'h': 3600.0, 'd': 86400.0}
+CELL_NUMBER = re.compile(r'([+-]?[\d,]*\.?\d+)\s*(min|h|d)?\*?')
 
 STYLE = '''
 QWidget { background: transparent; color: #e6edf5; font-size: 13px; }
@@ -49,7 +57,7 @@ QFrame#header { background: #0f1622; border-bottom: 1px solid #26334a; }
 QFrame#sidebar { background: #1a2433; border-right: 1px solid #26334a; }
 QFrame#tabRow { border-bottom: 1px solid #26334a; }
 QFrame#popup { background: #1a2433; border: 1px solid #34445a; border-radius: 6px; }
-#mono, QDateTimeEdit, QTreeWidget { font-family: "MONO"; }
+#mono, QDateTimeEdit, QTreeWidget, QTableWidget { font-family: "MONO"; }
 QLabel#brand { font-size: 14px; font-weight: 600; }
 QLabel#groupTitle { font-weight: 600; }
 QLabel#muted { color: #9fb0c3; font-size: 12px; }
@@ -74,6 +82,7 @@ QTreeWidget { background: #1a2433; border: 0; alternate-background-color: #1e2a3
 QTreeWidget::item:selected { background: #1b3a47; color: #e6edf5; }
 QHeaderView::section { background: #1a2433; color: #9fb0c3; border: 0; border-bottom: 1px solid #26334a; padding: 6px 10px; font-weight: 500; }
 QTabWidget::pane { border: 0; }
+QTabWidget::tab-bar { alignment: left; }
 QTabBar::tab { background: transparent; color: #9fb0c3; padding: 0 14px; min-height: 32px; border: 0; border-bottom: 2px solid transparent; }
 QTabBar::tab:selected { color: #e6edf5; border-bottom-color: #2bb5c5; }
 QTabBar#sideTabs::tab { min-height: 40px; font-weight: 500; }
@@ -82,6 +91,19 @@ QFrame#pointRow { border-radius: 8px; }
 QFrame#pointRow[on="true"] { background: #222e40; }
 QFrame#card { background: #1a2433; border: 1px solid #2e3c50; border-radius: 8px; }
 QFrame#barTop { border-top: 1px solid #26334a; }
+QFrame#results { background: #1a2433; border-top: 1px solid #26334a; }
+QFrame#topBar { border-bottom: 1px solid #26334a; }
+QFrame#tables { background: #131b28; border-top: 1px solid #26334a; }
+QFrame#staleBox[stale="true"] { background: #3a2f14; border: 1px solid #7a6220; border-radius: 8px; }
+QLabel#warning { color: #f5e3a8; }
+QTableWidget { background: #1a2433; alternate-background-color: #1e2a3b; border: 0; outline: 0; }
+QTableWidget::item { padding: 0 10px; }
+QTableWidget::item:selected { background: #1b3a47; color: #e6edf5; }
+QFrame#seg { background: #0f1622; border-radius: 7px; }
+QPushButton#seg { background: transparent; border: 0; border-radius: 5px; padding: 0; min-height: 26px; color: #9fb0c3; }
+QPushButton#seg:hover { background: #222e40; }
+QPushButton#seg:disabled { background: transparent; color: #5f6f83; }
+QPushButton#seg:checked { background: #2e3c50; color: #e6edf5; font-weight: 500; }
 QToolButton#icon { background: transparent; border: 0; padding: 0; min-height: 30px; min-width: 30px; }
 QToolButton#icon:hover { background: #2b3a50; }
 QScrollBar:vertical { background: transparent; width: 8px; margin: 0; }
@@ -99,6 +121,10 @@ QCheckBox::indicator:hover { border-color: #e6edf5; }
 QCheckBox:disabled { color: #5f6f83; }
 QCheckBox::indicator:disabled { background: #1c2635; border-color: #34445a; }
 QCheckBox::indicator:checked:disabled { background: #3b6b73; border-color: #3b6b73; }
+QRadioButton { spacing: 8px; }
+QRadioButton::indicator { width: 16px; height: 16px; border: 1px solid #5d708a; border-radius: 9px; background: #0f1622; }
+QRadioButton::indicator:checked { border-color: #2bb5c5; background: qradialgradient(cx: .5, cy: .5, radius: .5, fx: .5, fy: .5, stop: 0 #2bb5c5, stop: .45 #2bb5c5, stop: .55 #0f1622, stop: 1 #0f1622); }
+QRadioButton::indicator:disabled { border-color: #34445a; background: #1c2635; }
 QSplitter::handle { background: #26334a; }
 QMenu { background: #1a2433; color: #e6edf5; border: 1px solid #34445a; border-radius: 6px; padding: 4px; }
 QMenu::item { padding: 6px 24px 6px 24px; border-radius: 4px; }
@@ -139,16 +165,90 @@ class Label(QtWidgets.QLabel):
         if 'state' in kw: self.setEnabled(kw['state'] != 'disabled')
 
 
-class MirrorLabel:
-    def __init__(self, *labels): self.labels = labels
+class StatusLabel(Label):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.setObjectName('muted')
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+    def setText(self, text):
+        self.setToolTip(text)
+        super().setText(text)
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setPen(self.palette().color(QtGui.QPalette.WindowText))
+        painter.drawText(self.rect(), Qt.AlignLeft | Qt.AlignVCenter,
+                         self.fontMetrics().elidedText(self.text(), Qt.ElideRight, self.width()))
+
+
+class Segmented(QtWidgets.QFrame):
+    changed = QtCore.Signal(str)
+    def __init__(self, values):
+        super().__init__()
+        self.setObjectName('seg')
+        self.value = values[0]
+        self.buttons = {}
+        row = QtWidgets.QHBoxLayout(self)
+        row.setContentsMargins(2, 2, 2, 2)
+        row.setSpacing(2)
+        group = QtWidgets.QButtonGroup(self)
+        for value in values:
+            button = QtWidgets.QPushButton(value)
+            button.setObjectName('seg')
+            button.setCheckable(True)
+            button.clicked.connect(lambda _checked=False, v=value: self._clicked(v))
+            group.addButton(button)
+            row.addWidget(button, 1)
+            self.buttons[value] = button
+        self.buttons[self.value].setChecked(True)
+    def _clicked(self, value):
+        if value != self.value:
+            self.value = value
+            self.changed.emit(value)
+    def get(self): return self.value
+    def set(self, value):
+        self.value = value
+        self.buttons[value].setChecked(True)
     def configure(self, **kw):
-        for label in self.labels: label.configure(**kw)
+        if 'values' in kw:
+            for value, button in self.buttons.items(): button.setVisible(value in kw['values'])
+
+
+class TerrainSwitch(Segmented):
+    def __init__(self):
+        super().__init__(('Quick scan', 'Precise'))
+        super().set('Precise')
+    def get(self): return self.value == 'Precise'
+    def set(self, value): super().set('Precise' if value else 'Quick scan')
+
+
+class Gate:
+    def __init__(self, target, needs=None):
+        self.target, self.needs, self.allowed = target, needs, False
+        target.setEnabled(False)
+    def configure(self, **kw):
+        if 'state' in kw:
+            self.allowed = kw['state'] != 'disabled'
+            self.apply()
+    def apply(self):
+        self.target.setEnabled(self.allowed and (self.needs is None or self.needs()))
 
 
 class Button(QtWidgets.QPushButton):
     def configure(self, **kw):
         if 'text' in kw: self.setText(str(kw['text']))
         if 'state' in kw: self.setEnabled(kw['state'] != 'disabled')
+
+
+class CancelButton(Button):
+    def __init__(self, text, *companions):
+        super().__init__(text)
+        self.companions = companions
+        self.configure(state='disabled')
+    def configure(self, **kw):
+        if 'state' in kw:
+            running = kw['state'] != 'disabled'
+            self.setVisible(running)
+            for widget in self.companions: widget.setVisible(running)
 
 
 class Check(QtWidgets.QCheckBox):
@@ -215,6 +315,9 @@ class Tree(QtWidgets.QTreeWidget):
         self.setRootIsDecorated(False)
         self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.header().setSectionsClickable(True)
+        self.header().setStretchLastSection(False)
+        for index in range(1, len(self.keys)):
+            self.headerItem().setTextAlignment(index, Qt.AlignRight | Qt.AlignVCenter)
         self.header().sectionClicked.connect(self._heading_clicked)
         self.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
     def _heading_clicked(self, index):
@@ -245,6 +348,8 @@ class Tree(QtWidgets.QTreeWidget):
             if tag in self.tag_colors:
                 brush = QtGui.QBrush(self.tag_colors[tag])
                 for i in range(len(self.keys)): item.setForeground(i, brush)
+        for i in range(1, len(self.keys)):
+            if self.keys[i] != 'cell': item.setTextAlignment(i, Qt.AlignRight | Qt.AlignVCenter)
         self.addTopLevelItem(item)
     def selection(self):
         chosen = {str(item.data(0, Qt.UserRole)) for item in self.selectedItems()}
@@ -263,8 +368,7 @@ class Tree(QtWidgets.QTreeWidget):
 
 
 class TabAdapter:
-    def __init__(self, tabs): self.tabs = tabs
-    def select(self, page): self.tabs.setCurrentWidget(page)
+    def __init__(self, select): self.select = select
 
 
 class WindowAdapter:
@@ -280,10 +384,6 @@ class WindowAdapter:
         return timer
     def after_cancel(self, timer):
         if timer is not None: timer.stop(); timer.deleteLater()
-    def deiconify(self): self.panel.shell.show_panel('search')
-    def lift(self): pass
-    def focus_force(self): pass
-    def destroy(self): self.panel.widget.hide()
 
 
 def group(title, layout):
@@ -298,6 +398,40 @@ def group(title, layout):
     return box
 
 
+def muted_label(text):
+    label = QtWidgets.QLabel(text)
+    label.setObjectName('muted')
+    return label
+
+
+def counted(count, noun):
+    return f'{count:,} {noun}{"" if count == 1 else "s"}'
+
+
+def cell_value(text):
+    match = CELL_NUMBER.fullmatch(text.strip())
+    return float(match[1].replace(',', '')) * UNIT_SECONDS.get(match[2], 1.0) if match else None
+
+
+def dot_icon(color):
+    pixmap = QtGui.QPixmap(20, 20)
+    pixmap.fill(Qt.transparent)
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing)
+    painter.setBrush(color)
+    painter.setPen(Qt.NoPen)
+    painter.drawEllipse(QtCore.QPointF(10, 10), 6, 6)
+    painter.end()
+    pixmap.setDevicePixelRatio(2)
+    return QtGui.QIcon(pixmap)
+
+
+def form_layout():
+    form = QtWidgets.QFormLayout()
+    form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+    return form
+
+
 def labeled(layout, title, widget):
     label = QtWidgets.QLabel(title)
     label.setObjectName('muted')
@@ -310,7 +444,6 @@ class SearchPanel(search.SearchDialog):
         self.shell, self.owner = shell, owner
         self.widget = QtWidgets.QWidget()
         self.window = WindowAdapter(self)
-        self.tk = SimpleNamespace(TclError=RuntimeError)
         self.fetch, self.cache = owner.fetch_skyfield, owner._point_cache
         self.on_close, self.on_apply = None, owner.apply_visibility_search
         self.existing_points = lambda: list(owner._points)
@@ -328,141 +461,387 @@ class SearchPanel(search.SearchDialog):
         self._display_items, self.last_parameters, self._refinement_sectors = [], None, None
         self._sort = self._cluster_cache = None
         self.finished = self.was_cancelled = False
+        self._pairing = False
+        self._graph_seen = False
+        self._reopen_results = False
+        self.results_collapsed = False
+        self.results_height = RESULTS_HEIGHT
+        self.workspace_tabs = TabAdapter(self._select_workspace)
+        self.workspace_settings, self.workspace_results = 'settings', 'results'
+        self.settings_tabs, self.area_tab = TabAdapter(lambda _page: None), None
         outer = QtWidgets.QVBoxLayout(self.widget)
-        outer.setContentsMargins(16, 8, 16, 12)
-        outer.setSpacing(8)
-        self.page_tabs = QtWidgets.QTabWidget()
-        self.search_page = QtWidgets.QWidget(); self.results_page = QtWidgets.QWidget()
-        self.page_tabs.addTab(self.search_page, 'Criteria')
-        self.page_tabs.addTab(self.results_page, 'Results')
-        outer.addWidget(self.page_tabs, 1)
-        self.workspace_tabs = TabAdapter(self.page_tabs)
-        self.workspace_settings, self.workspace_results = self.search_page, self.results_page
-        self.settings_tabs, self.area_tab = self.workspace_tabs, self.search_page
-        self._build_criteria()
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._build_criteria(outer)
         self._build_results()
-        self.status = MirrorLabel(self.criteria_status, self.results_status)
+        shell.right.addWidget(self.results_panel)
+        shell.right.setStretchFactor(1, 0)
         self._update_lunar_state()
         self._refresh_headings()
         if owner._search_session is not None: self.restore(owner._search_session)
         self.poll()
 
-    def _build_criteria(self):
-        container = QtWidgets.QVBoxLayout(self.search_page)
-        container.setContentsMargins(0, 8, 0, 0)
-        self.use_terrain = Check('Use terrain horizon')
-        self.use_terrain.set(True)
-        container.addWidget(self.use_terrain)
-        mode_note = QtWidgets.QLabel('Off: find optimistic candidate clusters first.')
-        mode_note.setObjectName('muted'); mode_note.setWordWrap(True); container.addWidget(mode_note)
-        scroll = self.criteria_scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True); scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        body = QtWidgets.QWidget(); stack = QtWidgets.QVBoxLayout(body)
-        stack.setContentsMargins(3, 3, 6, 6); stack.setSpacing(8)
+    def _build_criteria(self, outer):
+        scroll = self.criteria_scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        body = QtWidgets.QWidget()
+        stack = QtWidgets.QVBoxLayout(body)
+        stack.setContentsMargins(16, 16, 16, 16)
+        stack.setSpacing(18)
         self.f = {}
-        def field(form, key, label, value):
-            entry = Entry(str(value)); self.f[key] = entry; labeled(form, label, entry)
         for name, value in zip(('start', 'end'), self.shell.interval):
-            entry = Entry(value.strftime(TIME_FORMAT), self.search_page)
+            entry = Entry(value.strftime(TIME_FORMAT), self.widget)
             entry.hide()
             self.f[name] = entry
-        f = QtWidgets.QFormLayout()
-        field(f, 'step', 'Step (hours)', '2')
-        stack.addWidget(group('Time', f))
-        f = QtWidgets.QFormLayout()
-        for key, label, value in [('min_earth','Earth minimum %','50'),('max_earth','Earth maximum %','100'),
-                                  ('min_sun','Sun minimum %','30'),('max_sun','Sun maximum %','100')]: field(f,key,label,value)
-        note = QtWidgets.QLabel('Maximums apply to terrain searches.'); note.setObjectName('muted'); note.setWordWrap(True); f.addRow(note)
-        stack.addWidget(group('Visibility', f))
-        f = QtWidgets.QFormLayout()
-        for key,label,value in [('spacing','Grid spacing (deg)','10'),('lat','Latitude min, max','-90, 90'),
-                                 ('lon','Longitude start, end','-180, 180')]: field(f,key,label,value)
-        self.area_box = group('Area', f); stack.addWidget(self.area_box)
-        f = QtWidgets.QFormLayout()
-        field(f,'max_slope','Maximum slope (deg; optional)','')
-        field(f,'slope_radius','Slope radius (km)','1')
-        stack.addWidget(group('Slope', f))
-        f = QtWidgets.QFormLayout()
-        field(f,'side','Samples per side','3')
-        field(f,'horizon','Pessimistic horizon (deg)','2')
-        self.screen_mode = Combo(); self.screen_mode.addItems(['Pessimistic center','All cells'])
-        self.range_mode = Combo(); self.range_mode.addItems(['On','Off'])
-        labeled(f,'Cell screening',self.screen_mode); labeled(f,'Optimistic range',self.range_mode)
-        note = QtWidgets.QLabel('Screening is approximate and can miss suitable cells.'); note.setObjectName('muted'); note.setWordWrap(True); f.addRow(note)
-        stack.addWidget(group('Screening', f))
-        f = QtWidgets.QFormLayout()
+        self.use_terrain = TerrainSwitch()
+        mode = QtWidgets.QVBoxLayout()
+        mode.setSpacing(8)
+        mode.addWidget(self.use_terrain)
+        note = QtWidgets.QLabel('Precise uses the terrain horizon and returns points. Quick scan ignores terrain and returns candidate clusters.')
+        note.setObjectName('muted')
+        note.setWordWrap(True)
+        mode.addWidget(note)
+        stack.addLayout(mode)
+        visibility = QtWidgets.QGridLayout()
+        visibility.setSpacing(8)
+        self._pair_row(visibility, 0, 'Earth %', Entry('50'), Entry('100'), 'min_earth', 'max_earth')
+        self._pair_row(visibility, 1, 'Sun %', Entry('30'), Entry('100'), 'min_sun', 'max_sun')
+        stack.addWidget(group('Visibility', visibility))
+        area = QtWidgets.QGridLayout()
+        area.setSpacing(8)
+        for key, value in (('lat', '-90, 90'), ('lon', '-180, 180')):
+            hidden = Entry(value, self.widget)
+            hidden.hide()
+            self.f[key] = hidden
+        self.lat_min, self.lat_max, self.lon_min, self.lon_max = Entry('-90'), Entry('90'), Entry('-180'), Entry('180')
+        self._pair_row(area, 0, 'Latitude', self.lat_min, self.lat_max)
+        self._pair_row(area, 1, 'Longitude', self.lon_min, self.lon_max)
+        self._link_pair('lat', self.lat_min, self.lat_max)
+        self._link_pair('lon', self.lon_min, self.lon_max)
+        for row, (key, label, value) in enumerate((('spacing', 'Grid, deg', '10'), ('step', 'Step, hours', '2')), 2):
+            entry = Entry(value)
+            self.f[key] = entry
+            area.addWidget(self._muted(label), row, 0)
+            area.addWidget(entry, row, 1)
+        self.area_box = group('Area', area)
+        stack.addWidget(self.area_box)
+        stack.addWidget(self._build_advanced())
+        stack.addStretch(1)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+        for name in ('start', 'end'): self.f[name].textChanged.connect(self._interval_edited)
+        self.lunar_avg_check.clicked.connect(self._update_lunar_state)
+        self.lunar_sd_check.clicked.connect(self._update_lunar_state)
+        self.use_terrain.changed.connect(self._update_lunar_state)
+        bottom = QtWidgets.QFrame()
+        bottom.setObjectName('barTop')
+        pinned = QtWidgets.QVBoxLayout(bottom)
+        pinned.setContentsMargins(16, 12, 16, 16)
+        pinned.setSpacing(8)
+        self.status = StatusLabel('Choose criteria and start the search.')
+        pinned.addWidget(self.status)
+        self.progress = Progress()
+        self.progress.setTextVisible(False)
+        pinned.addWidget(self.progress)
+        buttons = QtWidgets.QHBoxLayout()
+        self.start_button = Button('Start search')
+        self.start_button.setObjectName('primary')
+        self.start_button.setFixedHeight(36)
+        self.start_button.clicked.connect(self.start)
+        self.cancel_button = CancelButton('Cancel', self.progress)
+        self.cancel_button.setFixedHeight(36)
+        self.cancel_button.clicked.connect(self.cancel.set)
+        buttons.addWidget(self.start_button, 1)
+        buttons.addWidget(self.cancel_button)
+        pinned.addLayout(buttons)
+        outer.addWidget(bottom)
+
+    def _build_advanced(self):
+        box = QtWidgets.QWidget()
+        stack = QtWidgets.QVBoxLayout(box)
+        stack.setContentsMargins(0, 0, 0, 0)
+        stack.setSpacing(18)
+        toggle = QtWidgets.QPushButton()
+        toggle.setObjectName('ghost')
+        toggle.setCheckable(True)
+        toggle.setFixedHeight(28)
+        row = QtWidgets.QHBoxLayout(toggle)
+        row.setContentsMargins(0, 0, 0, 0)
+        title = QtWidgets.QLabel('Advanced')
+        title.setObjectName('groupTitle')
+        summary = QtWidgets.QLabel('Slope · Screening · Lunar-day statistics ›')
+        summary.setObjectName('muted')
+        for label in (title, summary): label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        row.addWidget(title)
+        row.addStretch(1)
+        row.addWidget(summary)
+        stack.addWidget(toggle)
+        content = QtWidgets.QWidget()
+        inner = QtWidgets.QVBoxLayout(content)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(18)
+        def field(form, key, label, value):
+            entry = Entry(str(value))
+            self.f[key] = entry
+            labeled(form, label, entry)
+        f = form_layout()
+        field(f, 'max_slope', 'Maximum slope (deg; optional)', '')
+        field(f, 'slope_radius', 'Slope radius (km)', '1')
+        inner.addWidget(group('Slope', f))
+        f = form_layout()
+        field(f, 'side', 'Samples per side', '3')
+        field(f, 'horizon', 'Pessimistic horizon (deg)', '2')
+        self.screen_mode = Combo()
+        self.screen_mode.addItems(['Pessimistic center', 'All cells'])
+        self.range_mode = Combo()
+        self.range_mode.addItems(['On', 'Off'])
+        labeled(f, 'Cell screening', self.screen_mode)
+        labeled(f, 'Optimistic range', self.range_mode)
+        note = QtWidgets.QLabel('Screening is approximate and can miss suitable cells.')
+        note.setObjectName('muted')
+        note.setWordWrap(True)
+        f.addRow(note)
+        inner.addWidget(group('Screening', f))
+        f = form_layout()
         self.lunar_avg_check = self.lunar_avg = Check('Calculate and show average Sun % per lunar day')
         self.lunar_sd_check = self.lunar_sd = Check('Calculate and show standard deviation')
         self.lunar_sd_check.setToolTip('Enable the average first. Available for terrain searches longer than two days.')
-        f.addRow(self.lunar_avg_check); f.addRow(self.lunar_sd_check)
-        for key,label in [('lunar_min_avg','Minimum average %'),('lunar_max_avg','Maximum average %'),
-                          ('lunar_min_sd','Minimum SD %'),('lunar_max_sd','Maximum SD %')]: field(f,key,label,'')
-        self.lunar_note = Label(); self.lunar_note.setObjectName('muted'); self.lunar_note.setWordWrap(True); f.addRow(self.lunar_note)
-        stack.addWidget(group('Lunar-day statistics',f)); stack.addStretch(1)
-        scroll.setWidget(body); container.addWidget(scroll,1)
-        for name in ('start','end'): self.f[name].textChanged.connect(self._interval_edited)
-        self.lunar_avg_check.clicked.connect(self._update_lunar_state)
-        self.lunar_sd_check.clicked.connect(self._update_lunar_state)
-        self.use_terrain.clicked.connect(self._update_lunar_state)
-        buttons = QtWidgets.QHBoxLayout()
-        self.start_button = Button('Start search'); self.start_button.setObjectName('primary'); self.start_button.clicked.connect(self.start)
-        self.cancel_button = Button('Cancel'); self.cancel_button.setEnabled(False); self.cancel_button.clicked.connect(self.cancel.set)
-        buttons.addWidget(self.start_button); buttons.addWidget(self.cancel_button); container.addLayout(buttons)
-        self.progress = Progress(); self.progress.setTextVisible(False); container.addWidget(self.progress)
-        self.criteria_status = Label('Choose criteria and start the search.'); self.criteria_status.setWordWrap(True); container.addWidget(self.criteria_status)
-        self.details = QtWidgets.QWidget(); detail_layout = QtWidgets.QVBoxLayout(self.details); detail_layout.setContentsMargins(0,0,0,0)
-        self.fill_label = Label(); self.cache_label = Label(); self.range_label = Label(); self.horizon_label = Label()
-        for label in (self.fill_label,self.cache_label,self.range_label,self.horizon_label):
-            label.setObjectName('muted'); label.setWordWrap(True); detail_layout.addWidget(label)
+        f.addRow(self.lunar_avg_check)
+        f.addRow(self.lunar_sd_check)
+        for key, label in [('lunar_min_avg', 'Minimum average %'), ('lunar_max_avg', 'Maximum average %'),
+                           ('lunar_min_sd', 'Minimum SD %'), ('lunar_max_sd', 'Maximum SD %')]: field(f, key, label, '')
+        self.lunar_note = Label()
+        self.lunar_note.setObjectName('muted')
+        self.lunar_note.setWordWrap(True)
+        f.addRow(self.lunar_note)
+        inner.addWidget(group('Lunar-day statistics', f))
+        self.details = QtWidgets.QWidget()
+        detail_layout = QtWidgets.QVBoxLayout(self.details)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        self.fill_label, self.cache_label, self.range_label, self.horizon_label = Label(), Label(), Label(), Label()
+        for label in (self.fill_label, self.cache_label, self.range_label, self.horizon_label):
+            label.setObjectName('muted')
+            label.setWordWrap(True)
+            detail_layout.addWidget(label)
         self.details.hide()
-        details_button=QtWidgets.QPushButton('Calculation details'); details_button.setCheckable(True)
-        details_button.toggled.connect(self.details.setVisible); container.addWidget(details_button); container.addWidget(self.details)
+        details_button = QtWidgets.QPushButton('Calculation details')
+        details_button.setCheckable(True)
+        details_button.toggled.connect(self.details.setVisible)
+        inner.addWidget(details_button)
+        inner.addWidget(self.details)
+        content.hide()
+        stack.addWidget(content)
+        toggle.toggled.connect(content.setVisible)
+        toggle.toggled.connect(lambda on: summary.setText('Slope · Screening · Lunar-day statistics ' + ('⌄' if on else '›')))
+        return box
+
+    def _muted(self, text):
+        label = QtWidgets.QLabel(text)
+        label.setObjectName('muted')
+        return label
+
+    def _pair_row(self, grid, row, title, low, high, low_key=None, high_key=None):
+        if low_key:
+            self.f[low_key], self.f[high_key] = low, high
+        grid.setColumnMinimumWidth(0, 90)
+        grid.setColumnMinimumWidth(2, 12)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        grid.addWidget(self._muted(title), row, 0)
+        grid.addWidget(low, row, 1)
+        grid.addWidget(self._muted('–'), row, 2)
+        grid.addWidget(high, row, 3)
+
+    def _link_pair(self, key, low, high):
+        hidden = self.f[key]
+        def compose():
+            if self._pairing: return
+            self._pairing = True
+            hidden.setText(f'{low.text()}, {high.text()}')
+            self._pairing = False
+        def split(text):
+            parts = text.replace(';', ',').split(',')
+            if self._pairing or len(parts) != 2: return
+            self._pairing = True
+            low.setText(parts[0].strip())
+            high.setText(parts[1].strip())
+            self._pairing = False
+        low.textChanged.connect(compose)
+        high.textChanged.connect(compose)
+        hidden.textChanged.connect(split)
 
     def _interval_edited(self):
         self.shell.set_interval(self.f['start'].get(), self.f['end'].get())
         self._update_lunar_state()
 
     def _build_results(self):
-        root=QtWidgets.QVBoxLayout(self.results_page); root.setContentsMargins(0,8,0,0)
-        bar=QtWidgets.QHBoxLayout(); bar.addWidget(QtWidgets.QLabel('View'))
-        self.view_mode=Combo(); self.view_mode.addItems(['Points','Clusters']); self.view_mode.currentTextChanged.connect(lambda _: self.populate_results('Showing') if self.results else None)
-        bar.addWidget(self.view_mode,1)
-        columns=QtWidgets.QPushButton('Columns'); columns.setCheckable(True); bar.addWidget(columns); root.addLayout(bar)
-        self._columns=tuple(spec[0] for spec in search.COLUMN_SPECS)
-        self._heading_labels={spec[0]:spec[1] for spec in search.COLUMN_SPECS}
-        self.column_vars={}
-        column_panel=QtWidgets.QWidget(); colgrid=QtWidgets.QGridLayout(column_panel); colgrid.setContentsMargins(2,2,2,2)
-        visible_keys=search.PERCENT_COLUMNS
-        default_keys=search.DEFAULT_COLUMNS
-        visible_index=0
-        for spec in search.COLUMN_SPECS:
-            checkbox=Check(spec[1]); checkbox.set(spec[0] in default_keys); checkbox.clicked.connect(self._columns_changed)
-            self.column_vars[spec[0]]=checkbox
-            if spec[0] in visible_keys:
-                colgrid.addWidget(checkbox,visible_index//2,visible_index%2);visible_index+=1
-        colscroll=QtWidgets.QScrollArea();colscroll.setWidgetResizable(True);colscroll.setWidget(column_panel);colscroll.setMaximumHeight(190);colscroll.hide()
-        columns.toggled.connect(colscroll.setVisible); root.addWidget(colscroll)
-        self.table=Tree(self._columns)
-        for spec in search.COLUMN_SPECS:self.table.column(spec[0],width=spec[3])
+        panel = self.results_panel = QtWidgets.QFrame()
+        panel.setObjectName('results')
+        panel.hide()
+        root = QtWidgets.QVBoxLayout(panel)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        header = QtWidgets.QFrame()
+        header.setObjectName('tabRow')
+        header.setFixedHeight(48)
+        bar = QtWidgets.QHBoxLayout(header)
+        bar.setContentsMargins(14, 0, 14, 0)
+        bar.setSpacing(10)
+        title = QtWidgets.QLabel('Results')
+        title.setObjectName('groupTitle')
+        bar.addWidget(title)
+        self.count_label = QtWidgets.QLabel()
+        self.count_label.setObjectName('muted')
+        bar.addWidget(self.count_label)
+        self.view_mode = Segmented(('Points', 'Clusters'))
+        self.view_mode.setFixedSize(170, 32)
+        self.view_mode.changed.connect(lambda _: self.populate_results('Showing') if self.results else None)
+        bar.addSpacing(8)
+        bar.addWidget(self.view_mode)
+        bar.addStretch(1)
+        self.columns_button = QtWidgets.QPushButton('Columns')
+        self.columns_button.setObjectName('ghost')
+        self.columns_button.clicked.connect(self._show_columns)
+        bar.addWidget(self.columns_button)
+        selected = lambda: bool(self.table.selection())
+        one = lambda: len(self.table.selection()) == 1
+        compare = Button('Compare')
+        compare.clicked.connect(self.analyze_selected)
+        add = Button('Add to points')
+        add.setObjectName('primary')
+        add.clicked.connect(self.add_selected)
+        more = QtWidgets.QPushButton('⋯')
+        more.setAccessibleName('More actions')
+        self.more_menu = QtWidgets.QMenu(self.shell)
+        more.setMenu(self.more_menu)
+        self.collapse_button = QtWidgets.QPushButton('⌄')
+        self.collapse_button.setObjectName('ghost')
+        self.collapse_button.setAccessibleName('Collapse results')
+        self.collapse_button.clicked.connect(lambda: self.set_results_collapsed(not self.results_collapsed))
+        for widget in (compare, add, more, self.collapse_button): bar.addWidget(widget)
+        self.analyze_button, self.add_button = Gate(compare, selected), Gate(add, selected)
+        self.view_button = self._menu_action('View selected', self.view_selected, selected)
+        self.select_all_button = self._menu_action('Select all', self.select_all)
+        self.marks_button = self._menu_action('Show on globe', self.show_all)
+        self.sector_button = self._menu_action('Refine in Precise', self.refine_selected_sector, one)
+        self.more_menu.addSeparator()
+        self.export_button = self._menu_action('Save CSV', self.export)
+        self.more_menu.addAction('Clear markers', self.clear)
+        self.gates = [self.analyze_button, self.add_button, self.view_button, self.select_all_button,
+                      self.marks_button, self.sector_button, self.export_button]
+        root.addWidget(header)
+        self._columns = tuple(spec[0] for spec in search.COLUMN_SPECS)
+        self._heading_labels = {spec[0]: spec[1] for spec in search.COLUMN_SPECS}
+        self.column_vars = {}
+        self._build_columns_popup()
+        self.table = Tree(self._columns)
+        for spec in search.COLUMN_SPECS: self.table.column(spec[0], width=spec[3])
         self.table.itemDoubleClicked.connect(lambda *_: self.view_selected())
-        root.addWidget(self.table,1)
-        self.results_status=Label('Results will appear here.');self.results_status.setWordWrap(True);root.addWidget(self.results_status)
-        hint=QtWidgets.QLabel('Shift / Ctrl to select multiple points. Select a cluster to refine it.')
-        hint.setObjectName('muted');hint.setWordWrap(True);root.addWidget(hint)
-        grid=QtWidgets.QGridLayout()
-        self.view_button=Button('View selected');self.view_button.clicked.connect(self.view_selected)
-        self.select_all_button=Button('Select all');self.select_all_button.clicked.connect(self.select_all)
-        self.add_button=Button('Add points');self.add_button.clicked.connect(self.add_selected)
-        self.analyze_button=Button('Compare');self.analyze_button.clicked.connect(self.analyze_selected)
-        self.marks_button=Button('Show on globe');self.marks_button.clicked.connect(self.show_all)
-        self.sector_button=Button('Search cluster');self.sector_button.clicked.connect(self.refine_selected_sector)
-        self.export_button=Button('Save CSV');self.export_button.clicked.connect(self.export)
-        self.clear_button=Button('Clear markers');self.clear_button.clicked.connect(self.clear)
-        buttons=(self.view_button,self.select_all_button,self.add_button,self.analyze_button,
-                 self.marks_button,self.sector_button,self.export_button,self.clear_button)
-        for i,button in enumerate(buttons):
-            grid.addWidget(button,i//2,i%2)
-            if button is not self.clear_button:button.setEnabled(False)
-        root.addLayout(grid)
+        self.table.itemSelectionChanged.connect(self._selection_changed)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(
+            lambda pos: self.more_menu.popup(self.table.viewport().mapToGlobal(pos)))
+        self.results_body = self.table
+        root.addWidget(self.table, 1)
+
+    def _menu_action(self, text, callback, needs=None):
+        action = self.more_menu.addAction(text, callback)
+        return Gate(action, needs)
+
+    def _build_columns_popup(self):
+        popup = self.columns_popup = QtWidgets.QFrame(self.shell, Qt.Popup)
+        popup.setObjectName('popup')
+        layout = QtWidgets.QGridLayout(popup)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setHorizontalSpacing(24)
+        index = 0
+        for spec in search.COLUMN_SPECS:
+            checkbox = Check(spec[1])
+            checkbox.set(spec[0] in search.DEFAULT_COLUMNS)
+            checkbox.clicked.connect(self._columns_changed)
+            self.column_vars[spec[0]] = checkbox
+            if spec[0] in search.PERCENT_COLUMNS:
+                layout.addWidget(checkbox, index // 2, index % 2)
+                index += 1
+
+    def _show_columns(self):
+        popup = self.columns_popup
+        popup.adjustSize()
+        button = self.columns_button
+        point = button.mapToGlobal(QtCore.QPoint(button.width() - popup.width(), -popup.height() - 4))
+        popup.move(point)
+        popup.show()
+
+    def _selection_changed(self):
+        for gate in self.gates: gate.apply()
+        self._update_count()
+
+    def _update_count(self):
+        shown = bool(self.results)
+        if shown and self.results_panel.isHidden() and not self.shell._zen:
+            self.results_panel.show()
+            if not self.results_collapsed: QtCore.QTimer.singleShot(0, self._open_height)
+        elif not shown:
+            self.results_panel.hide()
+            self.count_label.setText('')
+            return
+        clustered = self.view_mode.get() == 'Clusters'
+        total = len(self._clusters()) if clustered else len(self.results)
+        noun = 'cluster' if clustered else 'point'
+        selected = len(self.table.selection())
+        self.count_label.setText(counted(total, noun) + (f' · {selected} selected' if selected else ''))
+
+    def populate_results(self, label):
+        super().populate_results(label)
+        self._update_count()
+
+    def start(self):
+        super().start()
+        self._update_count()
+
+    def _select_workspace(self, page):
+        if page == self.workspace_results:
+            if self.results and not self.owner._graph_expanded:
+                self.set_results_collapsed(False)
+        else:
+            self.shell.show_panel('search')
+
+    def set_results_collapsed(self, collapsed):
+        if collapsed and not self.results_collapsed:
+            self.results_height = max(self.results_panel.height(), RESULTS_BAR)
+        self.results_collapsed = collapsed
+        self.results_body.setVisible(not collapsed)
+        self.collapse_button.setText('⌃' if collapsed else '⌄')
+        self.results_panel.setMaximumHeight(RESULTS_BAR if collapsed else QWIDGETSIZE_MAX)
+        if self.results_panel.isVisible():
+            QtCore.QTimer.singleShot(0, self._open_height)
+
+    def set_zen(self, hidden):
+        if hidden:
+            self.results_panel.hide()
+        else:
+            self._update_count()
+
+    def _open_height(self):
+        split = self.shell.right
+        height = RESULTS_BAR if self.results_collapsed else self.results_height
+        sizes = split.sizes()
+        total = sum(sizes)
+        sizes[1] = height
+        sizes[0] = max(1, total - height - sizes[2])
+        split.setSizes(sizes)
+
+    def sync_graph(self, expanded):
+        if expanded == self._graph_seen:
+            return
+        self._graph_seen = expanded
+        if expanded:
+            self._reopen_results = not self.results_collapsed
+            if self._reopen_results: self.set_results_collapsed(True)
+        elif self._reopen_results:
+            self._reopen_results = False
+            self.set_results_collapsed(False)
 
     def export(self):
         path,_=QtWidgets.QFileDialog.getSaveFileName(self.widget,'Save results','','CSV files (*.csv)')
@@ -486,37 +865,78 @@ class TimePanel(QtWidgets.QWidget):
     def __init__(self, shell, owner):
         super().__init__()
         self.shell, self.owner = shell, owner
+        self.graph_rows = []
+        self.graph_key = None
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(12)
-        form = QtWidgets.QFormLayout()
+        root.setSpacing(18)
+        sampling = QtWidgets.QVBoxLayout()
+        sampling.setSpacing(8)
+        title = QtWidgets.QLabel('Sampling')
+        title.setObjectName('groupTitle')
+        sampling.addWidget(title)
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+        grid.setColumnMinimumWidth(0, 90)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
         self.step = Entry()
+        self.step.setObjectName('mono')
         self.unit = QtWidgets.QComboBox()
         self.unit.addItems(['seconds', 'minutes', 'hours', 'days'])
-        self.method = QtWidgets.QComboBox()
-        self.method.addItems(list(sky.SKY_METHODS))
-        labeled(form, 'Step', self.step)
-        labeled(form, 'Step unit', self.unit)
-        labeled(form, 'Model', self.method)
-        root.addWidget(group('Analysis', form))
-        note = QtWidgets.QLabel('Analyzes the selected location or comparison points over the interval set in the header.')
-        note.setObjectName('muted')
+        self.method = Segmented(tuple(sky.SKY_METHODS))
+        grid.addWidget(muted_label('Step'), 0, 0)
+        grid.addWidget(self.step, 0, 1)
+        grid.addWidget(self.unit, 0, 2)
+        grid.addWidget(muted_label('Model'), 1, 0)
+        grid.addWidget(self.method, 1, 1, 1, 2)
+        sampling.addLayout(grid)
+        note = muted_label('Skyfield works offline in a limited date range. JPL Horizons needs internet.')
         note.setWordWrap(True)
-        root.addWidget(note)
+        sampling.addWidget(note)
+        root.addLayout(sampling)
+        graphs = QtWidgets.QVBoxLayout()
+        graphs.setSpacing(4)
+        head = QtWidgets.QHBoxLayout()
+        head.setContentsMargins(0, 0, 8, 4)
+        title = QtWidgets.QLabel('Points on graphs')
+        title.setObjectName('groupTitle')
+        head.addWidget(title)
+        head.addStretch(1)
+        self.horizon_title = muted_label('Horizon of')
+        head.addWidget(self.horizon_title)
+        graphs.addLayout(head)
+        self.graph_layout = QtWidgets.QVBoxLayout()
+        self.graph_layout.setSpacing(2)
+        graphs.addLayout(self.graph_layout)
+        self.graph_note = muted_label('')
+        self.graph_note.setWordWrap(True)
+        graphs.addWidget(self.graph_note)
+        root.addLayout(graphs)
+        root.addStretch(1)
         self.error = QtWidgets.QLabel()
         self.error.setObjectName('error')
         self.error.setWordWrap(True)
         root.addWidget(self.error)
-        apply = QtWidgets.QPushButton('Analyze interval')
-        apply.setObjectName('primary')
-        apply.clicked.connect(self.apply)
-        root.addWidget(apply)
-        self.reopen_button = QtWidgets.QPushButton('Reopen last analysis')
-        self.reopen_button.setEnabled(False)
-        self.reopen_button.clicked.connect(owner.reopen_analysis)
-        root.addWidget(self.reopen_button)
-        root.addStretch(1)
+        self.box = QtWidgets.QFrame()
+        self.box.setObjectName('staleBox')
+        self.box_layout = QtWidgets.QVBoxLayout(self.box)
+        self.box_layout.setSpacing(10)
+        self.banner = QtWidgets.QLabel()
+        self.banner.setObjectName('warning')
+        self.banner.setWordWrap(True)
+        self.box_layout.addWidget(self.banner)
+        self.apply_button = QtWidgets.QPushButton()
+        self.apply_button.setObjectName('primary')
+        self.apply_button.setFixedHeight(36)
+        self.apply_button.clicked.connect(self.apply)
+        self.box_layout.addWidget(self.apply_button)
+        root.addWidget(self.box)
         self.load_saved()
+        self.step.textChanged.connect(self.sync)
+        self.unit.currentTextChanged.connect(self.sync)
+        self.method.changed.connect(self.sync)
 
     def load_saved(self):
         saved = self.owner._saved_interval
@@ -526,16 +946,356 @@ class TimePanel(QtWidgets.QWidget):
             step, unit, method = 60, 'minutes', self.owner._sky_method
         self.step.setText(str(step))
         self.unit.setCurrentText(unit)
-        self.method.setCurrentText(method)
+        if method in self.method.buttons:
+            self.method.set(method)
 
     def apply(self):
         start, stop = (value.strftime(TIME_FORMAT) for value in self.shell.interval)
         try:
-            self.owner.set_time_interval(start, stop, float(self.step.text()), self.unit.currentText(), self.method.currentText())
+            self.owner.set_time_interval(start, stop, float(self.step.text()), self.unit.currentText(), self.method.get())
         except (ValueError, OverflowError) as error:
             self.error.setText(str(error))
         else:
             self.error.clear()
+        self.shell.sync_state()
+
+    def running(self):
+        owner = self.owner
+        return owner._graph_expanded and owner._compare_active and owner._compare is None and owner._enable_ephemeris
+
+    def stale_reasons(self):
+        used = self.owner._analysis_inputs
+        if used is None or not self.shell.has_analysis():
+            return []
+        reasons = []
+        if self.owner.analysis_points() != used['points']:
+            reasons.append('Points changed.')
+        if self.shell.interval != (used['start'], used['stop']):
+            reasons.append('Interval changed.')
+        try:
+            step = float(self.step.text()) * sky.TIME_UNITS[self.unit.currentText()]
+        except ValueError:
+            step = None
+        if (step, self.method.get()) != (used['step'], used['method']):
+            reasons.append('Sampling changed.')
+        if terrain.EYE_HEIGHT_M != used['eye']:
+            reasons.append('Observer height changed.')
+        return reasons
+
+    def analyze_state(self):
+        if self.running():
+            return 'Analyzing…', False
+        if self.stale_reasons():
+            return 'Update analysis', True
+        count = len(self.owner.analysis_points())
+        return (f'Analyze {counted(count, "point")}' if count else 'Analyze selected location'), True
+
+    def sync(self, *_):
+        reasons = self.stale_reasons()
+        self.banner.setVisible(bool(reasons))
+        self.banner.setText('<b>Results are out of date.</b> ' + ' '.join(reasons))
+        self.box.setProperty('stale', bool(reasons))
+        self.box.style().unpolish(self.box)
+        self.box.style().polish(self.box)
+        margin = 12 if reasons else 0
+        self.box_layout.setContentsMargins(margin, margin, margin, margin)
+        text, enabled = self.analyze_state()
+        self.apply_button.setText(text)
+        self.apply_button.setEnabled(enabled)
+        self.sync_graph_points()
+        if self.shell.points is not None:
+            self.shell.points.sync_button()
+
+    def sync_graph_points(self):
+        owner = self.owner
+        points = list(owner._compare_points) if owner._compare_active and owner._graph_expanded else []
+        listed = len(points) > 1
+        key = (tuple(points), tuple(owner._point_names.get(point) for point in points)) if listed else None
+        if key != self.graph_key:
+            self.graph_key = key
+            self.clear_graph_rows()
+            if listed:
+                self.graph_rows = [GraphPointRow(self, index, point) for index, point in enumerate(points)]
+                for row in self.graph_rows:
+                    self.graph_layout.addWidget(row)
+        self.horizon_title.setVisible(listed)
+        self.graph_note.setVisible(not listed)
+        if not listed:
+            self.graph_note.setText('No points ticked: the analysis uses the selected location.' if not owner.analysis_points()
+                                    else 'Run the analysis to choose which points are drawn.')
+            return
+        ready = owner._compare is not None
+        for index, row in enumerate(self.graph_rows):
+            row.sync(owner._compare_visible[index] if index < len(owner._compare_visible) else True,
+                     index == owner._compare_index, ready)
+
+    def clear_graph_rows(self):
+        for row in self.graph_rows:
+            self.graph_layout.removeWidget(row)
+            row.hide()
+            row.deleteLater()
+        self.graph_rows = []
+
+    def set_point_drawn(self, index, drawn):
+        owner = self.owner
+        if index < len(owner._compare_visible) and owner._compare_visible[index] != drawn:
+            owner.toggle_point_visibility(index)
+
+    def set_horizon(self, index):
+        if self.owner._compare_index != index:
+            self.owner.compare_activate(index)
+
+
+class GraphPointRow(QtWidgets.QFrame):
+    def __init__(self, panel, index, point):
+        super().__init__()
+        owner = panel.owner
+        self.setObjectName('pointRow')
+        row = QtWidgets.QHBoxLayout(self)
+        row.setContentsMargins(8, 6, 8, 6)
+        row.setSpacing(10)
+        self.drawn = Check()
+        self.drawn.setAccessibleName(f'Show point {index + 1} on graphs')
+        self.drawn.toggled.connect(lambda value: panel.set_point_drawn(index, value))
+        row.addWidget(self.drawn)
+        badge = QtWidgets.QLabel(str(index + 1))
+        badge.setObjectName('mono')
+        badge.setAlignment(Qt.AlignCenter)
+        badge.setFixedSize(24, 24)
+        badge.setStyleSheet(f'background: {point_color(index)}; color: #10151f; border-radius: 12px; font-weight: 500;')
+        row.addWidget(badge)
+        name = QtWidgets.QLabel(owner._point_names.get(point) or f'Point {index + 1}')
+        name.setStyleSheet('font-weight: 500;')
+        row.addWidget(name, 1)
+        self.horizon = QtWidgets.QRadioButton()
+        self.horizon.setAccessibleName(f'Show horizon of point {index + 1}')
+        self.horizon.toggled.connect(lambda value: value and panel.set_horizon(index))
+        row.addWidget(self.horizon)
+
+    def sync(self, drawn, current, ready):
+        for button, value in ((self.drawn, drawn), (self.horizon, current)):
+            button.blockSignals(True)
+            button.setChecked(value)
+            button.blockSignals(False)
+            button.setEnabled(ready)
+        self.setProperty('on', current)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+
+class DataTable(QtWidgets.QTableWidget):
+    def __init__(self, headers, rows, colors):
+        super().__init__(len(rows), len(headers))
+        self.headers, self.rows, self.colors = headers, rows, colors
+        self.sort = None
+        self.keys = [[cell_value(cell) for cell in row] for row in rows]
+        for index, row in enumerate(self.keys):
+            row[0] = index
+        self.setObjectName('mono')
+        self.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.setAlternatingRowColors(True)
+        self.setShowGrid(False)
+        self.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.verticalHeader().hide()
+        self.verticalHeader().setDefaultSectionSize(28)
+        header = self.horizontalHeader()
+        header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionsClickable(True)
+        header.sectionClicked.connect(self.sort_by)
+        self.show_rows()
+
+    def sort_by(self, column):
+        self.sort = compare.next_sort(self.sort, column)
+        self.show_rows()
+
+    def show_rows(self):
+        order = compare.sort_order(self.keys, self.sort)
+        labels = list(self.headers)
+        if self.sort is not None:
+            labels[self.sort[0]] += ' ▼' if self.sort[1] else ' ▲'
+        self.setHorizontalHeaderLabels(labels)
+        for column in range(1, len(labels)):
+            self.horizontalHeaderItem(column).setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        for position, index in enumerate(order):
+            for column, text in enumerate(self.rows[index]):
+                item = QtWidgets.QTableWidgetItem(text)
+                if column:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                else:
+                    item.setIcon(dot_icon(self.colors[index]))
+                self.setItem(position, column, item)
+        self.resizeColumnsToContents()
+
+    def selected_text(self):
+        cells = {(item.row(), item.column()) for item in self.selectedIndexes()}
+        rows = sorted({row for row, _ in cells})
+        columns = sorted({column for _, column in cells})
+        return '\n'.join('\t'.join(self.item(row, column).text() if (row, column) in cells else '' for column in columns)
+                         for row in rows)
+
+    def keyPressEvent(self, event):
+        if event.matches(QtGui.QKeySequence.Copy):
+            QtWidgets.QApplication.clipboard().setText(self.selected_text())
+        else:
+            super().keyPressEvent(event)
+
+
+class TablesPanel(QtWidgets.QFrame):
+    def __init__(self, shell, owner):
+        super().__init__()
+        self.setObjectName('tables')
+        self.shell, self.owner = shell, owner
+        self.source = self.key = None
+        self.data = []
+        self.shown = False
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(16, 10, 16, 8)
+        root.setSpacing(8)
+        top = QtWidgets.QHBoxLayout()
+        top.setSpacing(10)
+        top.addWidget(muted_label('Direction averages'))
+        self.mode = Segmented((ABOVE_ONLY, ALL_SAMPLES))
+        self.mode.setFixedWidth(250)
+        self.mode.changed.connect(self._mode_changed)
+        top.addWidget(self.mode)
+        top.addStretch(1)
+        root.addLayout(top)
+        self.tabs = QtWidgets.QTabWidget()
+        root.addWidget(self.tabs, 1)
+        self.notes_toggle = QtWidgets.QPushButton('› Table notes')
+        self.notes_toggle.setObjectName('ghost')
+        self.notes_toggle.setCheckable(True)
+        self.notes_toggle.setFixedHeight(26)
+        self.notes_toggle.toggled.connect(self._notes_toggled)
+        root.addWidget(self.notes_toggle, 0, Qt.AlignLeft)
+        self.notes = muted_label('')
+        self.notes.setWordWrap(True)
+        self.notes_scroll = QtWidgets.QScrollArea()
+        self.notes_scroll.setWidgetResizable(True)
+        self.notes_scroll.setMaximumHeight(110)
+        self.notes_scroll.setWidget(self.notes)
+        self.notes_scroll.hide()
+        root.addWidget(self.notes_scroll)
+
+    def _mode_changed(self, value):
+        if (value == ABOVE_ONLY) != self.owner._stats_above_only:
+            self.owner.toggle_stats_mode()
+
+    def _notes_toggled(self, on):
+        self.notes_toggle.setText(('⌄' if on else '›') + ' Table notes')
+        self.notes_scroll.setVisible(on)
+
+    def _open_height(self):
+        split = self.shell.right
+        sizes = split.sizes()
+        total = sum(sizes)
+        sizes[2] = TABLES_HEIGHT
+        sizes[0] = max(1, total - sizes[1] - TABLES_HEIGHT)
+        split.setSizes(sizes)
+
+    def sync(self):
+        owner = self.owner
+        result = owner._compare
+        self.shown = bool(not self.shell._zen and owner._graph_expanded and owner._compare_active and result is not None
+                          and result.get('stats') is not None and len(result['points']) > 1)
+        if not self.shown:
+            self.hide()
+            return
+        self.mode.set(ABOVE_ONLY if owner._stats_above_only else ALL_SAMPLES)
+        names = tuple(owner._point_names.get(point) for point in result['points'])
+        if result['stats'] is not self.source or (names, owner._stats_above_only) != self.key:
+            self.source, self.key = result['stats'], (names, owner._stats_above_only)
+            self.rebuild(result)
+        if self.isHidden():
+            self.show()
+            QtCore.QTimer.singleShot(0, self._open_height)
+
+    def rebuild(self, result):
+        owner = self.owner
+        sorts = [self.tabs.widget(index).sort for index in range(self.tabs.count())]
+        current = self.tabs.currentIndex()
+        while self.tabs.count():
+            widget = self.tabs.widget(0)
+            self.tabs.removeTab(0)
+            widget.deleteLater()
+        colors = [QtGui.QColor.fromRgbF(*compare.POINT_COLORS[index % len(compare.POINT_COLORS)])
+                  for index in range(len(result['points']))]
+        self.data = []
+        for number, (title, header, lines, _, spans) in enumerate(compare.build_tables(result['points'], result['stats'])):
+            headers = ['\n'.join(part for part in (header[0][a:b].strip(), header[1][a:b].strip()) if part) for a, b in spans]
+            rows = [[line[a:b].strip() for a, b in spans] for line in lines]
+            for index, (point, row) in enumerate(zip(result['points'], rows)):
+                row[0] = f'{index + 1} {owner._point_names.get(point) or f"Point {index + 1}"}'
+            table = DataTable(headers, rows, colors)
+            if number < len(sorts):
+                table.sort = sorts[number]
+                table.show_rows()
+            self.tabs.addTab(table, title)
+            self.data.append((title, headers, rows))
+        if 0 <= current < self.tabs.count():
+            self.tabs.setCurrentIndex(current)
+        self.notes.setText(compare.table_notes(result['stats_span'], owner._stats_above_only))
+
+    def export(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Export CSV', 'moon_analysis.csv', 'CSV files (*.csv)')
+        if path:
+            if not path.lower().endswith('.csv'):
+                path += '.csv'
+            self.export_to(path)
+
+    def export_to(self, path):
+        try:
+            with open(path, 'w', newline='', encoding='utf-8') as file:
+                out = csv.writer(file)
+                for index, (title, headers, rows) in enumerate(self.data):
+                    if index:
+                        out.writerow([])
+                    out.writerow([title])
+                    out.writerow([header.replace('\n', ' ') for header in headers])
+                    out.writerows(rows)
+        except OSError as error:
+            QtWidgets.QMessageBox.warning(self, 'Export CSV', f'Could not save the file: {error}')
+
+
+class TopBar(QtWidgets.QFrame):
+    def __init__(self, shell):
+        super().__init__()
+        self.shell = shell
+        self.setObjectName('topBar')
+        self.setFixedHeight(48)
+        row = QtWidgets.QHBoxLayout(self)
+        row.setContentsMargins(16, 0, 16, 0)
+        row.setSpacing(12)
+        self.view = Segmented(('Globe', 'Analysis'))
+        self.view.setFixedWidth(180)
+        self.view.changed.connect(self._view_changed)
+        row.addWidget(self.view)
+        self.summary = muted_label('')
+        row.addWidget(self.summary)
+        row.addStretch(1)
+        self.export = QtWidgets.QPushButton('Export CSV')
+        self.export.clicked.connect(lambda: shell.tables.export())
+        row.addWidget(self.export)
+
+    def _view_changed(self, value):
+        owner = self.shell.owner
+        if value == 'Analysis':
+            owner.reopen_analysis()
+        else:
+            owner.close_graph()
+        self.shell.sync_state()
+
+    def sync(self):
+        shell = self.shell
+        analysis = shell.has_analysis()
+        self.view.set('Analysis' if shell.owner._graph_expanded else 'Globe')
+        button = self.view.buttons['Analysis']
+        button.setEnabled(analysis)
+        button.setToolTip('' if analysis else 'Run an analysis to see it here.')
+        self.summary.setText(shell.analysis_summary() if analysis else '')
+        self.export.setEnabled(shell.tables.shown)
+        self.export.setToolTip('' if shell.tables.shown else 'Tables appear when two or more points are analyzed.')
 
 
 class CoordinateField(QtWidgets.QLineEdit):
@@ -606,7 +1366,7 @@ class PointRow(QtWidgets.QFrame):
         row.setContentsMargins(12, 10, 12, 10)
         row.setSpacing(10)
         included = point not in owner._point_off
-        self.check = QtWidgets.QCheckBox()
+        self.check = Check()
         self.check.setChecked(included)
         self.check.setToolTip('Take part in the analysis')
         self.check.setAccessibleName(f'Include point {index + 1} in analysis')
@@ -748,10 +1508,15 @@ class PointsPanel(QtWidgets.QWidget):
         self.count.setText(f'{total} of {compare.MAX_POINTS} points')
         self.save_button.setEnabled(bool(total))
         self.clear_button.setEnabled(bool(total))
-        self.analyze_button.setText(f'Analyze {ticked} point{"" if ticked == 1 else "s"}')
-        self.analyze_button.setEnabled(bool(ticked))
         self.analyze_button.setToolTip('' if ticked else 'Tick at least one point to analyze.')
+        self.sync_button()
         self.mark_selected()
+
+    def sync_button(self):
+        text, enabled = self.shell.time.analyze_state()
+        ticked = len(self.owner.analysis_points())
+        self.analyze_button.setText(text if ticked else 'Analyze 0 points')
+        self.analyze_button.setEnabled(enabled and bool(ticked))
 
     def mark_selected(self):
         selected = self.owner.point_index(self.owner.lat, self.owner.lon)
@@ -904,6 +1669,7 @@ class MainShell(QtWidgets.QMainWindow):
         self.owner = None
         self.search = None
         self.time = None
+        self.tables = None
         self.points = None
         self.card = None
         self.current_panel = None
@@ -931,9 +1697,21 @@ class MainShell(QtWidgets.QMainWindow):
         self.splitter.setChildrenCollapsible(False)
         self.splitter.setHandleWidth(3)
         self.sidebar = self._build_sidebar()
-        self.vtk_widget = GlobeWidget(self.splitter)
+        self.right = QtWidgets.QSplitter(Qt.Vertical)
+        self.right.setChildrenCollapsible(False)
+        self.right.setHandleWidth(3)
+        self.vtk_widget = GlobeWidget(self.right)
+        self.right.addWidget(self.vtk_widget)
+        self.right.setStretchFactor(0, 1)
+        self.topbar = TopBar(self)
+        column = QtWidgets.QWidget()
+        stack = QtWidgets.QVBoxLayout(column)
+        stack.setContentsMargins(0, 0, 0, 0)
+        stack.setSpacing(0)
+        stack.addWidget(self.topbar)
+        stack.addWidget(self.right, 1)
         self.splitter.addWidget(self.sidebar)
-        self.splitter.addWidget(self.vtk_widget)
+        self.splitter.addWidget(column)
         self.card = LocationCard(self, self.vtk_widget)
         self.card.hide()
         self.vtk_widget.installEventFilter(self)
@@ -1056,6 +1834,10 @@ class MainShell(QtWidgets.QMainWindow):
             start = sky.utc_now()
             self.interval = (start, start + timedelta(days=search.LUNAR_DAY_DAYS))
         self.search = SearchPanel(self, owner)
+        self.tables = TablesPanel(self, owner)
+        self.tables.hide()
+        self.right.addWidget(self.tables)
+        self.right.setStretchFactor(2, 0)
         self.time = TimePanel(self, owner)
         self.points = PointsPanel(self, owner)
         self.add_page('search', 'Search', self.search.widget)
@@ -1070,6 +1852,7 @@ class MainShell(QtWidgets.QMainWindow):
         if self.points is None:
             return
         self.points.refresh()
+        self.time.sync()
         self.tab_bar.setTabText(self.tab_keys.index('points'), f'Points · {len(self.owner._points)}')
 
     def eventFilter(self, obj, event):
@@ -1109,6 +1892,8 @@ class MainShell(QtWidgets.QMainWindow):
             self.interval_button.setText(f'{start:%Y-%m-%d %H:%M} → {end:%Y-%m-%d %H:%M} UTC')
         finally:
             self._syncing = False
+        if self.time is not None:
+            self.time.sync()
 
     def set_preset(self, days):
         start = sky.utc_now()
@@ -1157,7 +1942,6 @@ class MainShell(QtWidgets.QMainWindow):
         owner = self.owner
         if owner is None or self.points is None:
             return
-        self.time.reopen_button.setEnabled(owner._analysis_can_reopen and not owner._graph_expanded)
         location = (owner.lat, owner.lon)
         if location != self._shown_location and not self.coord_field.hasFocus():
             self._shown_location = location
@@ -1165,6 +1949,20 @@ class MainShell(QtWidgets.QMainWindow):
             self.set_coordinate_error('')
             self.points.mark_selected()
         self.card.update_state()
+        self.search.sync_graph(owner._graph_expanded)
+        self.tables.sync()
+        self.topbar.sync()
+        self.time.sync()
+
+    def has_analysis(self):
+        owner = self.owner
+        return owner._analysis_inputs is not None and (owner._graph_expanded or owner._analysis_snapshot is not None)
+
+    def analysis_summary(self):
+        inputs = self.owner._analysis_inputs
+        points = len(inputs['points'])
+        where = counted(points, 'point') if points else 'Selected location'
+        return f"{where} · {counted(inputs['samples'], 'sample')} · {inputs['method']}"
 
     def edit_eye_height(self):
         if self.owner is None:
@@ -1303,6 +2101,9 @@ class MainShell(QtWidgets.QMainWindow):
             return
         self._zen = not self._zen
         self.header.setVisible(not self._zen)
+        self.topbar.setVisible(not self._zen)
+        self.search.set_zen(self._zen)
+        self.tables.sync()
         self.zen_hint.setVisible(self._zen)
         if self._zen:
             self._zen_sidebar = self.sidebar.isVisible()

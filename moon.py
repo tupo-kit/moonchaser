@@ -13,16 +13,16 @@ Prepared maps are saved beside this script for later runs.
 Press G to focus the coordinate field; L to hide/show the lat/lon grid (its spacing follows the zoom); V for terrain view; E to set the eye height; R to reset; F for fullscreen. Escape does nothing; close the window to quit.
 Sun/Earth positions use Skyfield (offline, limited date range) or JPL Horizons (internet, wide range);
 you pick the model in the Analysis tab, and only that model is queried. Time defaults to UTC now.
-Press T to open the Analysis tab; analyzing opens a fullscreen horizon + Sun/Earth graph.
-That window scrolls (mouse wheel, Up/Down, PageUp/PageDown, Home/End) to more graphs: Sun elevation vs
+Press T to open the Analysis tab; analyzing opens a fullscreen horizon + Sun/Earth graph (switch back with Globe | Analysis in the top bar).
+That page scrolls (mouse wheel, Up/Down, PageUp/PageDown, Home/End) to more graphs: Sun elevation vs
 time and Earth elevation vs time.
 Point comparison: Shift+click (or A for the current point) adds numbered, coloured points; P opens the Points tab
 (rename, tick the points to analyze, remove, save to / load from a file; names are stored with the coordinates). T opens the analysis page:
 the horizon graph shows one point (use the < > buttons, or the , and .
 keys, to change it), the Sun/Earth graphs combine all points (a button per point switches its graph on/off)
-and, further down the page, tables compare sunlight, Earth visibility and the azimuth / elevation statistics.
+and, in a Qt panel under the graphs, tables compare sunlight, Earth visibility and the azimuth / elevation statistics (Export CSV in the top bar).
 Use Previous/Next, the Left/Right arrow keys (Shift: 10 samples) or the time slider under the horizon graph to step
-samples; drag the scroll bar at the right edge to scroll; Close returns to the horizon-only view.
+samples; drag the scroll bar at the right edge to scroll; Globe in the top bar returns to the horizon-only view.
 
 Files (keep them in one folder; run moon.py):
   terrain.py  DEM/texture download + loading, terrain sampling, horizon, panorama, lat/lon grid (no VTK).
@@ -33,7 +33,7 @@ Files (keep them in one folder; run moon.py):
   point_data.py  memory-only store shared by the search window and the comparison (horizon + classified sky per
               point and interval), so no point is calculated twice.
   visibility_search.py  coarse, terrain-aware search for visibility thresholds.
-  desktop_ui.py  Qt shell: header, sidebar tabs (Search, Points, Analysis), location card.
+  desktop_ui.py  Qt shell: header, top bar (Globe | Analysis), sidebar tabs (Search, Points, Analysis), tables panel, location card.
   moon.py     MoonWindow (glue: state, input handling, sky worker thread) and main().
 Dependencies: terrain <- sky <- compare <- point_data <- visibility_search, hud, globe <- moon. Other files must use `terrain.COLOR_PATH`, not a copy.
 """
@@ -209,6 +209,7 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._graph_expanded = False  # False: horizon only. True: fullscreen horizon + Sun/Earth graph.
         self._analysis_snapshot = None
         self._analysis_can_reopen = False
+        self._analysis_inputs = None
         self._hovered_close = None
         self._scroll = 0.0  # window heights the expanded page is scrolled down
         self._panel_boxes = {}
@@ -845,7 +846,14 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._epochs = epochs
         self._time_index = 0
         self._interval_step_minutes = float(step) * TIME_UNITS[unit]
+        self.record_analysis(self.analysis_points(), start, stop, self._interval_step_minutes, method, len(epochs))
         self.request_sky_update()
+
+    def record_analysis(self, points, start, stop, step_minutes, method, samples):
+        self._analysis_inputs = {
+            'points': list(points), 'start': parse_utc(start).replace(microsecond=0),
+            'stop': parse_utc(stop).replace(microsecond=0), 'step': step_minutes, 'method': method,
+            'eye': terrain.EYE_HEIGHT_M, 'samples': samples}
 
     def set_now(self):
         self._now_mode = True
@@ -917,6 +925,8 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._epochs = epochs
         self._time_index = 0
         self._interval_step_minutes = float(step_hours) * 60.0
+        self.record_analysis([self._analysis_single_point] if self._analysis_single_point else self.analysis_points(),
+                             start, stop, self._interval_step_minutes, self._sky_method, len(epochs))
         self.apply_layout()
         self.request_sky_update()
         if render:
@@ -1144,7 +1154,8 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._analysis_snapshot = None
         self._analysis_can_reopen = False
         if self._compare_active and self._graph_expanded:
-            self.request_sky_update()  # the worker recomputes every point's horizon and Sun / Earth data
+            if self._desktop_shell is None:
+                self.request_sky_update()  # the worker recomputes every point's horizon and Sun / Earth data
         else:
             selected = self._search_selected  # select_location forgets it; the eye height does not change which point it is
             self.select_location(self.lat, self.lon, render=False)
@@ -1327,7 +1338,7 @@ class MoonWindow(GlobeMixin, HudMixin):
         self.refresh_point_marks()
         if self._desktop_shell is not None:
             self._desktop_shell.refresh_points()
-        if self._compare_active:
+        if self._compare_active and self._desktop_shell is None:
             self._analysis_single_point = None
             self.request_sky_update()  # recalculate for the new set, including a single point
         if render:

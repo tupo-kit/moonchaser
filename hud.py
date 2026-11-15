@@ -9,7 +9,8 @@ Pure helpers (split_at_zero, dash_polyline, dim_color) have no VTK dependency.
 
 Point comparison (see compare.py): while self._compare_active, the page shows the horizon graph of one
 point (arrow buttons switch it), Sun/Earth graphs and a "Sun visible % per lunar day" graph that combine every
-point (one colour per point, one on/off button per point) and, below them, the comparison tables. Extra host state: _compare_active,
+point (one colour per point, one on/off button per point) and, below them, the comparison tables (drawn here only without
+a desktop shell; the Qt shell shows them in its own panel). Extra host state: _compare_active,
 _compare_points, _compare_index, _compare_visible, _compare (results), _stats_above_only.
 """
 from datetime import timedelta
@@ -100,7 +101,7 @@ class HudMixin:
         self.analysis_heading = self.make_text(0.025, 0.985, 17, top=True)
         self.analysis_heading.SetInput('Time analysis')
         self.analysis_hint = self.make_text(0.025, 0.845, 12, top=True)
-        self.analysis_hint.SetInput('Scroll for graphs and point tables')
+        self.analysis_hint.SetInput('Scroll for graphs' if self._desktop_shell else 'Scroll for graphs and point tables')
         self.help = self.make_text(0.025, 0.035, 15)
         self.help.SetInput(self.GLOBE_HELP)
         self.profile_background = self.make_profile_background()
@@ -434,6 +435,9 @@ class HudMixin:
         for actor in (self.now_button, self.close_button, self.time_caption,
                       self.previous_button, self.next_button):
             actor.SetVisibility(expanded)
+        if self._desktop_shell is not None:
+            self.close_button.SetVisibility(False)
+            self._controls.pop("close", None)
         self.now_button.SetVisibility(expanded and not compare)
         for actor in (self.point_prev_button, self.point_label, self.point_next_button):
             actor.SetVisibility(compare)
@@ -491,6 +495,8 @@ class HudMixin:
     def page_height(self):
         """Pages are 2 window heights (horizon + Sun + Earth); a comparison adds the lunar graph and the tables."""
         if self._compare_active and self._graph_expanded:
+            if self._desktop_shell is not None:
+                return COMPARE_PAGE_HEIGHT
             return COMPARE_PAGE_HEIGHT + self.table_layout(len(self._compare_points))[1]
         return PAGE_HEIGHT
 
@@ -548,7 +554,7 @@ class HudMixin:
 
     def layout_table(self, s):
         n = self.compare_n()
-        if not n:
+        if not n or self._desktop_shell is not None:
             for actor in self._table_pool:
                 actor.SetVisibility(False)
             return
@@ -566,6 +572,8 @@ class HudMixin:
 
     def update_table(self):
         n = self.compare_n()
+        if self._desktop_shell is not None:
+            return
         if not n or self._compare is None or self._compare.get("stats") is None:
             for actor in self._table_pool:
                 actor.SetVisibility(False)
