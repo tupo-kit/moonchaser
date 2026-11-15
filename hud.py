@@ -38,6 +38,13 @@ BELOW_DASH_PX, BELOW_GAP_PX = 7.0, 5.0
 BACKGROUND_RGB = (0.025, 0.035, 0.055)
 
 
+def scaled_horizon_bounds(low, high, zoom):
+    """Zoom the vertical preview around its center without moving its angular origin."""
+    center = (float(low) + float(high)) / 2.0
+    half = (float(high) - float(low)) / (2.0 * float(zoom))
+    return center - half, center + half
+
+
 def dim_color(color, factor=0.6):
     """Blend a colour towards the dark background (used for 'below the horizon')."""
     return tuple(factor * c + (1.0 - factor) * b for c, b in zip(color, BACKGROUND_RGB))
@@ -150,6 +157,8 @@ class HudMixin:
         self.panels = {}
         for key in COMPARE_PANELS:
             title = self.make_text(0.08, 0.0, 14, top=True)
+            title.GetTextProperty().SetBackgroundColor(0.067, 0.102, 0.16)
+            title.GetTextProperty().SetBackgroundOpacity(0.96)
             axes = self.make_overlay_lines([], (0.4, 0.48, 0.58), 1)
             xlabels, ylabels = [], []
             for _ in range(5):
@@ -377,7 +386,7 @@ class HudMixin:
             self._scroll = min(self._scroll, self.page_height() - 1.0)
         s = self._scroll if expanded else 0.0  # screen y = page y + s
         if expanded:
-            self._plot_box = (0.06, 0.97, 0.10 + s, 0.62 + s)
+            self._plot_box = (0.06, 0.97, 0.10 + s, (0.90 if self._desktop_shell is not None else 0.62) + s)
             background = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
             bx = 0.69
             self._controls = {"now": (0.85, 0.92 + s, 0.905, 0.96 + s),
@@ -398,13 +407,15 @@ class HudMixin:
                 positions[self.point_label] = (0.48, 0.93 + s)
                 positions[self.point_next_button] = (0.62, 0.93 + s)
         else:
-            self._plot_box = (0.61, 0.97, 0.12, 0.25)
-            background = ((0.59, 0.055), (0.99, 0.055), (0.99, 0.35), (0.59, 0.35))
+            left, bottom, right, top = self._horizon_preview_rect
+            width, height = right - left, top - bottom
+            self._plot_box = (left + width * .05, right - width * .05, bottom + height * .22, bottom + height * .66)
+            background = ((left, bottom), (right, bottom), (right, top), (left, top))
             self._controls = {"legend": (0.02, 0.95, 0.30, 0.995)}
             positions = {self.now_button: (0.90, 0.46),
                          self.close_button: (0.91, 0.46), self.time_caption: (0.61, 0.43),
                          self.previous_button: (0.61, 0.37), self.next_button: (0.77, 0.37),
-                         self.profile_title: (0.61, 0.32)}
+                         self.profile_title: (left + width * .05, top - height * .10)}
         for index, (x, y) in enumerate(background):
             self._bg_points.SetPoint(index, x, y, 0)
         self._bg_points.Modified()
@@ -437,13 +448,22 @@ class HudMixin:
             actor.SetVisibility(expanded)
         if self._desktop_shell is not None:
             self.close_button.SetVisibility(False)
-            self._controls.pop("close", None)
-        self.now_button.SetVisibility(expanded and not compare)
+            self.stats.SetVisibility(False)
+            self.analysis_heading.SetVisibility(False)
+            self.analysis_hint.SetVisibility(False)
+            for actor in (self.now_button, self.time_caption, self.previous_button, self.next_button, *self.source_buttons.values()):
+                actor.SetVisibility(False)
+            for key in ("close", "now", "previous", "next", *SKY_METHODS[self._sky_method]):
+                self._controls.pop(key, None)
+        self.now_button.SetVisibility(expanded and not compare and self._desktop_shell is None)
         for actor in (self.point_prev_button, self.point_label, self.point_next_button):
-            actor.SetVisibility(compare)
+            actor.SetVisibility(compare and self._desktop_shell is None)
+        if self._desktop_shell is not None:
+            self._controls.pop('point_prev', None)
+            self._controls.pop('point_next', None)
         self.help.SetVisibility(not expanded)
         self.layout_panels(s)
-        self._slider_box = (x0, x1, 0.04 + s) if expanded else None
+        self._slider_box = (x0, x1, 0.04 + s) if expanded and self._desktop_shell is None else None
         # Scroll bar (drag the thumb, or click the track): thumb length = visible fraction of the page.
         thumb, track = [], []
         if expanded:
@@ -504,8 +524,11 @@ class HudMixin:
         for key in COMPARE_PANELS:
             for i in range(n):
                 if (key, i) in self._cmp_lines:
+                    color = self.compare_color(i)
+                    self._cmp_lines[(key, i)].GetProperty().SetColor(*color)
+                    self._cmp_markers[(key, i)][-1].GetProperty().SetColor(*color)
                     continue
-                color = POINT_COLORS[i % len(POINT_COLORS)]
+                color = self.compare_color(i)
                 self._cmp_lines[(key, i)] = self.make_overlay_lines([], color, 2)
                 self._cmp_markers[(key, i)] = self.make_bullseye(color)
                 toggle = self.make_text(0.4, 0.0, 13)
@@ -606,7 +629,7 @@ class HudMixin:
             put(base + 1, "\n".join(header), white, size)
             self._table_headers.append((base + 1, spans))
             for i, row in enumerate(rows):  # rows may be sorted; each keeps the colour of its point
-                put(base + 2 + i, row, POINT_COLORS[order[i] % len(POINT_COLORS)], size)
+                put(base + 2 + i, row, self.compare_color(order[i]), size)
         width = max(20, int(self.window.GetSize()[0] * 0.90 / max(0.65 * max(7, size - 1), 1)))
         wrapped_notes = '\n'.join(textwrap.fill(line, width=width) for line in notes.splitlines())
         notes_text = ('− Table notes\n' + wrapped_notes) if self._table_notes_expanded else '+ Table notes'
@@ -689,7 +712,7 @@ class HudMixin:
         """Sun and Earth elevation graphs."""
         expanded = self._graph_expanded
         for key, panel in self.panels.items():
-            for actor in (panel["title"], *panel["xlabels"], *panel["ylabels"]):
+            for actor in (panel["title"], panel["axes"], *panel["xlabels"], *panel["ylabels"]):
                 actor.SetVisibility(expanded and key in self.panel_keys())
         for actor in (*self.panel_terrain.values(), *self.panel_lines.values()):
             actor.GetMapper().SetInputData(self.overlay_lines_data([]))
@@ -758,7 +781,7 @@ class HudMixin:
         self._cmp_state = {}
         k = min(self._compare_index, max(n - 1, 0))
         self.point_label.SetInput(f"Point {k + 1}/{n}")
-        self.point_label.GetTextProperty().SetColor(*POINT_COLORS[k % len(POINT_COLORS)])
+        self.point_label.GetTextProperty().SetColor(*self.compare_color(k))
         compare, epochs = self._compare, self._epochs
         ready = compare is not None and len(epochs) > 1
         if compare is None:
@@ -859,7 +882,7 @@ class HudMixin:
             state = self._cmp_state.get(key)
             x0, x1, y0, y1 = self._panel_boxes[key]
             for i in range(n):
-                color = POINT_COLORS[i % len(POINT_COLORS)]
+                color = self.compare_color(i)
                 on = self._compare_visible[i]
                 text = ("[x] " if on else "[ ] ") + f"P{i + 1}"
                 if state is not None and i in state["values"]:
@@ -1014,12 +1037,15 @@ class HudMixin:
                 high = max(high, float(np.max(body["el"] + body["radius"])))
         low = min(low, float(np.min(angles)) - 5.0)
         padding = max((high - low) * 0.08, 0.01)
-        self._profile_low, self._profile_high = low - padding, high + padding
+        low, high = low - padding, high + padding
+        self._profile_low, self._profile_high = low, high
         self.update_panorama()
         values = np.append(angles, angles[0])
         x0, x1, y0, y1 = self._plot_box
         x = np.linspace(x0, x1, len(values))
         y = self.profile_y(values)
+        if not self._graph_expanded:
+            y = np.clip(y, y0, y1)
         self.profile.GetMapper().SetInputData(self.overlay_lines_data([np.column_stack((x, y))]))
         self.profile_title.SetInput(
             f"Horizon\n"

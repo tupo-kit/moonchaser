@@ -5,24 +5,23 @@ Run:     python moon.py
 Texture: python moon.py --texture /path/to/color.jpg
 
 NASA color and elevation maps download on first run and retain their original resolution.
-Left-drag to orbit; middle-drag or Shift-left-drag to pan; wheel to zoom.
+Use the Navigate tool to orbit; middle-drag or Shift-left-drag to pan; wheel to zoom.
 Ctrl-left-drag (or Ctrl-middle-drag) orbits the terrain point under the cursor.
-Click the Moon to select an observer.
+Use Add to pick observers, or the search panel's area tool to set search bounds.
 Zoom stops above the terrain. The inset shows all 360 horizon bearings.
 Prepared maps are saved beside this script for later runs.
 Press G to focus the coordinate field; L to hide/show the lat/lon grid (its spacing follows the zoom); V for terrain view; E to set the eye height; R to reset; F for fullscreen. Escape does nothing; close the window to quit.
 Sun/Earth positions use Skyfield (offline, limited date range) or JPL Horizons (internet, wide range);
 you pick the model in the Analysis tab, and only that model is queried. Time defaults to UTC now.
-Press T to open the Analysis tab; analyzing opens a fullscreen horizon + Sun/Earth graph (switch back with Globe | Analysis in the top bar).
+Press T to open the Analysis tab; use the sidebar to switch between the map and analysis.
 That page scrolls (mouse wheel, Up/Down, PageUp/PageDown, Home/End) to more graphs: Sun elevation vs
 time and Earth elevation vs time.
-Point comparison: Shift+click (or A for the current point) adds numbered, coloured points; P opens the Points tab
+Point comparison: Shift-click with Add adds a temporary selection; Add to points saves it. P opens the Points tab
 (rename, tick the points to analyze, remove, save to / load from a file; names are stored with the coordinates). T opens the analysis page:
-the horizon graph shows one point (use the < > buttons, or the , and .
-keys, to change it), the Sun/Earth graphs combine all points (a button per point switches its graph on/off)
+the horizon graph shows one point (choose it in the Analysis sidebar), the Sun/Earth graphs combine all points
 and, in a Qt panel under the graphs, tables compare sunlight, Earth visibility and the azimuth / elevation statistics (Export CSV in the top bar).
-Use Previous/Next, the Left/Right arrow keys (Shift: 10 samples) or the time slider under the horizon graph to step
-samples; drag the scroll bar at the right edge to scroll; Globe in the top bar returns to the horizon-only view.
+Use Previous/Next, the Left/Right arrow keys (Shift: 10 samples) or the fixed time slider to step
+samples; drag the scroll bar at the right edge to scroll; use the sidebar to return to the map.
 
 Files (keep them in one folder; run moon.py):
   terrain.py  DEM/texture download + loading, terrain sampling, horizon, panorama, lat/lon grid (no VTK).
@@ -50,7 +49,7 @@ from PIL import Image
 import sky
 import terrain
 from compare import MAX_POINTS, normalize_point, point_stats, same_point
-from visibility_search import MAX_DISPLAY_RESULTS, cluster_color
+from visibility_search import cluster_color
 from globe import GlobeMixin
 import map_modes
 import point_data
@@ -80,6 +79,10 @@ class MoonWindow(GlobeMixin, HudMixin):
         super().on_render_start(obj, event)
         if not hasattr(self, '_map_label'):
             return
+        size = tuple(self.window.GetSize())
+        if self._panorama_samples is not None and min(size) > 1 and size != self._panorama_window_size:
+            self._panorama_window_size = size
+            self.update_panorama()
         self.rescale_text()
         if self._desktop_shell is not None:
             self._desktop_shell.sync_state()
@@ -87,19 +90,24 @@ class MoonWindow(GlobeMixin, HudMixin):
         expanded = self._graph_expanded
         self._overlay_button.SetVisibility(not expanded and self._desktop_shell is None)
         self.help.SetVisibility(not expanded and settings['help'] and self._desktop_shell is None)
-        self.grid_caption.SetVisibility(self.grid_caption.GetVisibility() and settings['grid_caption'])
-        self.points_caption.SetVisibility(self.points_caption.GetVisibility() and settings['points_caption'])
+        self.grid_caption.SetVisibility(False)
+        self.points_caption.SetVisibility(False)
         self._map_label.SetVisibility(not expanded and settings['map_status'] and self._desktop_shell is None)
         self.horizon.SetVisibility(not self._terrain_view and settings['horizon_outline'])
+        if self._selection_actor is not None:
+            self._selection_actor.SetVisibility(not self._terrain_view and not expanded)
         self.legend_button.SetVisibility(False)
-        self.stats.SetVisibility(expanded)
+        self.stats.SetVisibility(expanded and self._desktop_shell is None)
         inset = expanded or settings['horizon_inset']
         x0, x1, y0, y1 = self._plot_box
         self._horizon_map_button.SetPosition(x1, y1 + (0.07 if expanded else 0.018))
-        self._horizon_map_button.SetVisibility(inset)
+        self._horizon_map_button.SetVisibility(inset and not (expanded and self._desktop_shell is not None))
+        self._horizon_close.SetPosition(self._horizon_preview_rect[2] - 0.025, self._horizon_preview_rect[3] - 0.035)
         self._horizon_close.SetVisibility(inset and not expanded)
         for actor in (self.profile_background, self.profile_title, self.profile, self.profile_axes, *self.profile_labels):
             actor.SetVisibility(inset)
+        if expanded and self._desktop_shell is not None:
+            self.profile_title.SetVisibility(False)
         self.panorama.SetVisibility(inset and self._panorama_samples is not None)
         for group in (self.sky_hlines, self.sky_trails_below, self.sky_trails,
                       self.sky_samples_below, self.sky_samples):
@@ -197,10 +205,21 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._search_session = None
         self._point_cache = point_data.CACHE  # shared with the search window: stored sky data is never recomputed
         self._visibility_dialog = None
-        self._points = []              # [(lat, lon), ...] chosen with Shift+click / A / P
+        self._points = []              # saved analysis points, independent of temporary selections
+        self._selected_locations = []  # temporary map selections, independent of saved analysis points
+        self._selection_actor = None
+        self._rectangle_actor = None
+        self._area_fill_actor = None
+        self._area_bounds = None
+        self._area_drawing = False
+        self._previous_map_tool = 'Navigate'
+        self._panorama_window_size = None
+        self._horizon_preview_rect = (0.59, 0.055, 0.99, 0.35)
+        self._map_tool = 'Navigate'
         self._point_names = {}         # {point: name}; a point without a name is shown as 'Point N'
         self._point_off = set()        # points kept in the list and on the globe but left out of the analysis
         self._compare_active = False   # True: the graph window compares _compare_points
+        self._analysis_points_override = None
         self._compare_points = []      # snapshot of _points used by the running comparison
         self._compare_index = 0        # point shown in the horizon graph
         self._compare_visible = []     # per point: shown in the combined Sun/Earth graphs
@@ -221,7 +240,7 @@ class MoonWindow(GlobeMixin, HudMixin):
         self.renderer.SetBackground(0.025, 0.035, 0.055)
         self.renderer.UseFXAAOn()
         self.window = render_window if render_window is not None else vtk.vtkRenderWindow()
-        self.window.SetWindowName("Moon Horizon - Desktop Viewer")
+        self.window.SetWindowName("Moonchaser")
         if render_window is None:
             self.window.SetSize(1280, 900)
         # Some X11/GLX drivers cannot create a multisampled context. FXAA on
@@ -259,15 +278,20 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._map_legend_button = self.make_text(0.87, 0.82, 14)
         self._map_legend_button.SetVisibility(False)
         self._map_colorbar = vtk.vtkScalarBarActor()
-        self._map_colorbar.SetPosition(0.87, 0.37)
-        self._map_colorbar.SetWidth(0.12)
-        self._map_colorbar.SetHeight(0.42)
-        self._map_colorbar.SetNumberOfLabels(5)
+        self._map_colorbar.SetOrientationToHorizontal()
+        self._map_colorbar.SetPosition(0.025, 0.025)
+        self._map_colorbar.SetWidth(0.30)
+        self._map_colorbar.SetHeight(0.075)
+        self._map_colorbar.SetBarRatio(0.2)
+        self._map_colorbar.SetNumberOfLabels(3)
+        self._map_colorbar.UnconstrainedFontSizeOn()
+        self._map_colorbar.GetLabelTextProperty().SetFontSize(12)
+        self._map_colorbar.GetTitleTextProperty().SetFontSize(12)
         self._map_colorbar.SetLabelFormat('%.1f')
         self._map_colorbar.GetLabelTextProperty().SetColor(1, 1, 1)
         self._map_colorbar.GetTitleTextProperty().SetColor(1, 1, 1)
-        self._map_colorbar.GetLabelTextProperty().SetFontFamilyToCourier()
-        self._map_colorbar.GetTitleTextProperty().SetFontFamilyToCourier()
+        self._map_colorbar.GetLabelTextProperty().SetFontFamilyToArial()
+        self._map_colorbar.GetTitleTextProperty().SetFontFamilyToArial()
         self._map_colorbar.GetLabelTextProperty().ShadowOff()
         self._map_colorbar.GetTitleTextProperty().ShadowOff()
         self._map_colorbar.SetVisibility(False)
@@ -278,6 +302,7 @@ class MoonWindow(GlobeMixin, HudMixin):
         class MoonInteraction(vtk.vtkInteractorStyleUser):
             def __init__(self):
                 super().__init__()
+                self._area_last_update = 0.0
                 self._moon_drag_press = None
                 self._moon_drag_last = None
                 self._moon_drag_dragged = False
@@ -288,6 +313,7 @@ class MoonWindow(GlobeMixin, HudMixin):
                 self.AddObserver("LeftButtonReleaseEvent", self.left_up)
                 self.AddObserver("MiddleButtonPressEvent", self.middle_down)
                 self.AddObserver("MiddleButtonReleaseEvent", self.middle_up)
+                self.AddObserver("RightButtonPressEvent", self.right_down)
                 self.AddObserver("MouseMoveEvent", self.mouse_move)
                 self.AddObserver("MouseWheelForwardEvent", lambda obj, event: owner.wheel(-1))
                 self.AddObserver("MouseWheelBackwardEvent", lambda obj, event: owner.wheel(1))
@@ -297,24 +323,41 @@ class MoonWindow(GlobeMixin, HudMixin):
 
             def left_down(self, obj, event):
                 interactor = self.GetInteractor()
-                mode = "surface_look" if owner._terrain_view and not owner._graph_expanded else ("look" if interactor.GetControlKey() else ("pan" if interactor.GetShiftKey() else "orbit"))
+                self._selection_extend = bool(interactor.GetShiftKey())
+                edge = owner.horizon_resize_edge(*interactor.GetEventPosition())
+                if edge:
+                    mode = 'resize'
+                    self._resize_edge, self._resize_rect = edge, owner._horizon_preview_rect
+                elif not owner._graph_expanded and not owner._terrain_view and owner._map_tool == 'Add':
+                    mode = 'look' if interactor.GetControlKey() else ('pan' if interactor.GetShiftKey() else 'select')
+                elif not owner._graph_expanded and not owner._terrain_view and owner._map_tool == 'Area':
+                    mode = 'rectangle'
+                else:
+                    mode = "surface_look" if owner._terrain_view and not owner._graph_expanded else ("look" if interactor.GetControlKey() else ("pan" if interactor.GetShiftKey() else "orbit"))
                 self.start_drag(mode, "left")
 
             def middle_down(self, obj, event):
                 mode = "surface_look" if owner._terrain_view and not owner._graph_expanded else ("look" if self.GetInteractor().GetControlKey() else "pan")
                 self.start_drag(mode, "middle")
 
+            def right_down(self, obj, event):
+                if owner._area_drawing:
+                    self._moon_drag_press = self._moon_drag_last = None
+                    self._moon_drag_mode = self._moon_drag_button = self._moon_drag_pan_depth = None
+                    if owner._desktop_shell is not None:
+                        owner._desktop_shell.cancel_area_tool()
+
             def start_drag(self, mode, button):
                 if self._moon_drag_press is not None:
                     return
                 self._moon_drag_mode, self._moon_drag_button = mode, button
                 self._moon_drag_press = self.GetInteractor().GetEventPosition()
-                if owner.over_sky_controls(*self._moon_drag_press):
+                if mode != "resize" and owner.over_sky_controls(*self._moon_drag_press):
                     self._moon_drag_mode = "ui"
-                if owner.scrollbar_hit(*self._moon_drag_press):
+                if mode != "resize" and owner.scrollbar_hit(*self._moon_drag_press):
                     self._moon_drag_mode = "scrollbar"
                     owner.scrollbar_press(self._moon_drag_press[1])
-                elif owner.slider_hit(*self._moon_drag_press):
+                elif mode != "resize" and owner.slider_hit(*self._moon_drag_press):
                     self._moon_drag_mode = "slider"
                     owner.slider_drag(self._moon_drag_press[0])
                 self._moon_drag_last = self._moon_drag_press
@@ -323,13 +366,36 @@ class MoonWindow(GlobeMixin, HudMixin):
                                                 if self._moon_drag_mode == "look" else None)
                 self._moon_drag_pan_depth = (float(np.linalg.norm(
                     np.array(owner.renderer.GetActiveCamera().GetPosition()) - owner.view_surface_target()))
-                    if self._moon_drag_mode == "pan" else None)
+                    if self._moon_drag_mode in ("pan", "select") else None)
 
             def mouse_move(self, obj, event):
                 if self._moon_drag_press is None:
-                    owner.update_close_hover(*self.GetInteractor().GetEventPosition())
+                    pos = self.GetInteractor().GetEventPosition()
+                    owner.update_close_hover(*pos)
+                    if owner._desktop_shell is not None:
+                        owner._desktop_shell.set_preview_cursor(owner.horizon_resize_edge(*pos))
                     return
                 current = self.GetInteractor().GetEventPosition()
+                if self._moon_drag_mode == 'resize':
+                    owner.resize_horizon_preview(self._resize_edge, self._resize_rect, self._moon_drag_press, current)
+                    self._moon_drag_dragged = True
+                    return
+                if self._moon_drag_mode == 'rectangle':
+                    if np.hypot(current[0] - self._moon_drag_press[0], current[1] - self._moon_drag_press[1]) > 5:
+                        self._moon_drag_dragged = True
+                        now = time.monotonic()
+                        if now - self._area_last_update >= 0.08:
+                            self._area_last_update = now
+                            owner.select_search_rectangle(self._moon_drag_press, current, commit=False)
+                    return
+                if self._moon_drag_mode == 'select':
+                    if np.hypot(current[0] - self._moon_drag_press[0], current[1] - self._moon_drag_press[1]) > 5:
+                        self._moon_drag_dragged = True
+                    if self._moon_drag_dragged:
+                        dx, dy = current[0] - self._moon_drag_last[0], current[1] - self._moon_drag_last[1]
+                        owner.orbit(dx, dy)
+                    self._moon_drag_last = current
+                    return
                 if self._moon_drag_mode in ("scrollbar", "slider"):
                     if self._moon_drag_mode == "scrollbar":
                         owner.scrollbar_drag(current[1])
@@ -341,7 +407,7 @@ class MoonWindow(GlobeMixin, HudMixin):
                     if np.hypot(current[0] - self._moon_drag_press[0], current[1] - self._moon_drag_press[1]) > 5:
                         self._moon_drag_dragged = True
                     return
-                if ((self._moon_drag_mode in ("pan", "look", "surface_look") and current != self._moon_drag_press)
+                if ((self._moon_drag_mode in ("look", "surface_look") and current != self._moon_drag_press)
                         or np.hypot(current[0] - self._moon_drag_press[0], current[1] - self._moon_drag_press[1]) > 5):
                     self._moon_drag_dragged = True
                 if self._moon_drag_dragged:
@@ -367,11 +433,14 @@ class MoonWindow(GlobeMixin, HudMixin):
                     return
                 if self._moon_drag_press is not None and button == "left":
                     position = self.GetInteractor().GetEventPosition()
-                    if not self._moon_drag_dragged and self._moon_drag_mode in ("orbit", "ui"):
+                    if self._moon_drag_mode == 'rectangle' and self._moon_drag_dragged:
+                        owner.select_search_rectangle(self._moon_drag_press, position, commit=True)
+                    elif not self._moon_drag_dragged and self._moon_drag_mode == 'select':
+                        owner.pick(*position, select_new=True, extend=self._selection_extend)
+                    elif not self._moon_drag_dragged and self._moon_drag_mode == 'pan' and self._selection_extend:
+                        owner.pick(*position, select_new=(owner._map_tool == 'Add'), extend=True)
+                    elif not self._moon_drag_dragged and self._moon_drag_mode in ("orbit", "ui"):
                         owner.pick(*position)
-                    elif (self._moon_drag_mode == "pan" and np.hypot(position[0] - self._moon_drag_press[0],
-                                                                      position[1] - self._moon_drag_press[1]) <= 3):
-                        owner.add_point_at(*position)  # Shift+click without moving: add a comparison point
                 self._moon_drag_press = self._moon_drag_last = None
                 self._moon_drag_mode = self._moon_drag_button = self._moon_drag_pan_depth = None
                 self._moon_drag_cursor_pivot = None
@@ -401,8 +470,6 @@ class MoonWindow(GlobeMixin, HudMixin):
                     owner.begin_visibility_search()
                 elif key == "i":
                     owner.analyze_selected_search_point()
-                elif key == "a":
-                    owner.add_current_point()
                 elif key == "p":
                     owner.begin_points_entry()
                 elif key == "m":
@@ -411,9 +478,9 @@ class MoonWindow(GlobeMixin, HudMixin):
                     owner.toggle_map_legend()
                 elif key == "h":
                     owner.begin_overlay_settings()
-                elif key in ("comma", "less"):
+                elif key in ("comma", "less") and owner._desktop_shell is None:
                     owner.step_point(-1)
-                elif key in ("period", "greater"):
+                elif key in ("period", "greater") and owner._desktop_shell is None:
                     owner.step_point(1)
                 elif key == "bracketleft":
                     owner.step_time(-1)
@@ -500,8 +567,7 @@ class MoonWindow(GlobeMixin, HudMixin):
         visible = (self._map_mode in ('Elevation', 'Slope') and not self._graph_expanded
                    and self._overlay_settings['map_legend'])
         self._map_colorbar.SetVisibility(visible and self._map_legend_open)
-        self._map_legend_button.SetVisibility(visible)
-        self._map_legend_button.SetInput('×  Legend' if self._map_legend_open else '+  Legend')
+        self._map_legend_button.SetVisibility(False)
 
     def toggle_map_legend(self):
         if self._map_mode not in ('Elevation', 'Slope') or self._graph_expanded:
@@ -519,8 +585,8 @@ class MoonWindow(GlobeMixin, HudMixin):
             return True
         width, height = self.window.GetSize()
         nx, ny = x / max(width, 1), y / max(height, 1)
-        return ((self._overlay_settings['horizon_inset'] and 0.59 <= nx <= 0.99 and 0.055 <= ny <= 0.35)
-                or (self._overlay_settings['point_details'] and 0.02 <= nx <= 0.30 and 0.95 <= ny <= 0.995))
+        left, bottom, right, top = self._horizon_preview_rect
+        return bool(self._overlay_settings['horizon_inset'] and left <= nx <= right and bottom <= ny <= top)
 
     def _start_map_generation(self, mode):
         self._map_busy = mode
@@ -617,7 +683,7 @@ class MoonWindow(GlobeMixin, HudMixin):
     def close_graph(self):
         was_compare = self._compare_active
         self._analysis_can_reopen = True
-        if self._compare_active and self._compare is not None:
+        if self._compare_active:
             self._analysis_snapshot = {
                 'compare': self._compare, 'points': list(self._compare_points),
                 'visible': list(self._compare_visible), 'index': self._compare_index,
@@ -638,7 +704,7 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._epochs = [utc_now()]
         self._time_index = 0
         if was_compare:  # the globe follows the point that was shown in the horizon graph
-            self.select_location(self.lat, self.lon, render=False)
+            self.select_location(self.lat, self.lon, render=False, extend_selection=True)
         self.apply_layout()
         self.update_profile(self.horizon_angles)
         self.update_stats()
@@ -660,6 +726,11 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._interval_step_minutes = snapshot['step']
         self._now_mode = False
         self._scroll = 0.0
+        if self._compare is None:
+            self.apply_layout()
+            self.request_sky_update()
+            self.window.Render()
+            return
         self.compare_activate(self._compare_index, refresh=False)
         self.apply_layout(); self.update_profile(self.horizon_angles)
         self.update_stats(); self.update_table()
@@ -837,6 +908,7 @@ class MoonWindow(GlobeMixin, HudMixin):
         self.update_map_legend()
         self._compare_active = True
         self._analysis_single_point = None
+        self._analysis_points_override = None
         self._compare = None
         current = (self.lat, self.lon)
         self._compare_points = []
@@ -890,16 +962,21 @@ class MoonWindow(GlobeMixin, HudMixin):
                 self.set_points(points)
             rows = dialog.marker_results if dialog.marker_results is not None else dialog.results
             is_sector = bool(rows and rows[0].get('kind') == 'sector')
-            self.show_visibility_markers(rows if is_sector else rows[:MAX_DISPLAY_RESULTS], mode=dialog.marker_mode)
+            self.show_visibility_markers(rows, mode=dialog.marker_mode)
             if dialog.selected is not None:
                 point = dialog.selected
                 self.lookup_coordinates(f"{point['lat']}, {point['lon']}", render=False)
                 self._search_selected = point
                 if dialog.analyze:
-                    self.analyze_selected_search_point(render=False, use_points=dialog.add_to_compare)
+                    selected = [normalize_point(row['lat'], row['lon']) for row in dialog.selected_points]
+                    self.analyze_selected_search_point(render=False, points=selected or None)
+                    if self._desktop_shell is not None:
+                        self._desktop_shell.show_panel('time')
+                elif dialog.add_to_compare and self._desktop_shell is not None:
+                    self._desktop_shell.show_panel('points')
         self.window.Render()
 
-    def analyze_selected_search_point(self, render=True, use_points=None):
+    def analyze_selected_search_point(self, render=True, use_points=None, points=None):
         """Analyze the searched point or selected point set over the search interval."""
         if self._search_selected is None or self._search_parameters is None:
             return
@@ -914,9 +991,10 @@ class MoonWindow(GlobeMixin, HudMixin):
         self.update_map_legend()
         self._scroll = 0.0
         self._compare_active = True
+        self._analysis_points_override = list(points) if points is not None else None
         if use_points is None:
             use_points = len(self.analysis_points()) > 1
-        self._analysis_single_point = None if use_points else normalize_point(
+        self._analysis_single_point = None if use_points or points is not None else normalize_point(
             self._search_selected['lat'], self._search_selected['lon'])
         self._compare_index = 0
         self._compare = None
@@ -925,7 +1003,8 @@ class MoonWindow(GlobeMixin, HudMixin):
         self._epochs = epochs
         self._time_index = 0
         self._interval_step_minutes = float(step_hours) * 60.0
-        self.record_analysis([self._analysis_single_point] if self._analysis_single_point else self.analysis_points(),
+        analyzed = self._analysis_points_override or ([self._analysis_single_point] if self._analysis_single_point else self.analysis_points())
+        self.record_analysis(analyzed,
                              start, stop, self._interval_step_minutes, self._sky_method, len(epochs))
         self.apply_layout()
         self.request_sky_update()
@@ -933,7 +1012,7 @@ class MoonWindow(GlobeMixin, HudMixin):
             self.window.Render()
 
     def show_visibility_markers(self, results, mode='Points'):
-        """Draw selectable points and, in cluster mode, colored cell outlines."""
+        """Draw selectable point markers or ungridded filled clusters."""
         from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
         for actor in (self._search_actor, self._search_outline_actor, self._search_fill_actor):
             if actor is not None:
@@ -946,6 +1025,7 @@ class MoonWindow(GlobeMixin, HudMixin):
             return
         if mode == 'Clusters':
             self.show_search_cluster_fills(results)
+            return
         if results[0].get('kind') == 'sector':
             return  # Candidate clusters are areas, not verified point markers.
         lat = np.radians([item['lat'] for item in results])
@@ -981,8 +1061,6 @@ class MoonWindow(GlobeMixin, HudMixin):
         picker.PickFromListOn()
         picker.AddPickList(actor)
         self._search_point_picker = picker
-        if mode == 'Clusters':
-            self.show_search_cell_outlines(results)
 
     def show_search_cluster_fills(self, results):
         """Color globe mesh cells under candidate sectors with translucent cluster hues."""
@@ -1029,18 +1107,17 @@ class MoonWindow(GlobeMixin, HudMixin):
         actor = self.vtk.vtkActor()
         actor.SetMapper(mapper)
         actor.GetProperty().LightingOff()
+        actor.GetProperty().EdgeVisibilityOff()
         actor.GetProperty().SetOpacity(0.35)
-        is_sector = results[0].get('kind') == 'sector'
-        actor.SetPickable(is_sector)
+        actor.SetPickable(True)
         self.renderer.AddActor(actor)
         self._search_fill_actor = actor
-        if is_sector:
-            self._search_fill_rows = [results[int(i)] for i in indices]
-            picker = self.vtk.vtkCellPicker()
-            picker.SetTolerance(0.0001)
-            picker.PickFromListOn()
-            picker.AddPickList(actor)
-            self._search_fill_picker = picker
+        self._search_fill_rows = [results[int(i)] for i in indices]
+        picker = self.vtk.vtkCellPicker()
+        picker.SetTolerance(0.0001)
+        picker.PickFromListOn()
+        picker.AddPickList(actor)
+        self._search_fill_picker = picker
 
     def show_search_cell_outlines(self, results):
         """Outline matched cells in their cluster colors on the terrain mesh."""
@@ -1086,7 +1163,7 @@ class MoonWindow(GlobeMixin, HudMixin):
         self.renderer.AddActor(actor)
         self._search_outline_actor = actor
 
-    def pick_search_marker(self, x, y):
+    def pick_search_marker(self, x, y, extend=False):
         if self._terrain_view:
             return False
         if self._search_fill_picker is not None and self._search_fill_picker.Pick(x, y, 0, self.renderer):
@@ -1118,7 +1195,7 @@ class MoonWindow(GlobeMixin, HudMixin):
             if self._visibility_dialog is not None:
                 self._visibility_dialog.select_sector_on_globe(row)
             return True
-        self.select_location(row['lat'], row['lon'], render=False)
+        self.select_location(row['lat'], row['lon'], render=False, extend_selection=extend)
         self._search_selected = row
         self._stats_base += "\nSearch point selected; press I to analyze its interval"
         self.update_stats()
@@ -1174,11 +1251,17 @@ class MoonWindow(GlobeMixin, HudMixin):
             self.window.Render()
         return lat, lon
 
-    def select_location(self, lat, lon, render=True):
+    def select_location(self, lat, lon, render=True, extend_selection=False):
         from vtk.util.numpy_support import numpy_to_vtk
 
         self._search_selected = None
         self.lat, self.lon = float(lat), float(lon)
+        point = normalize_point(lat, lon)
+        if not extend_selection:
+            self._selected_locations = [point]
+        elif not any(same_point(point, other) for other in self._selected_locations):
+            self._selected_locations.append(point)
+        self.refresh_selection_marks()
         self._points_note = ""
         angles, distances, hlat, hlon = compute_horizon_360(lat, lon)
         self.horizon_angles = angles
@@ -1233,6 +1316,34 @@ class MoonWindow(GlobeMixin, HudMixin):
             lat, lon, self._panorama_texture_rgb, bearings=max(360, self.window.GetSize()[0]))
         self._panorama_range = None
 
+    def horizon_resize_edge(self, x, y):
+        if self._graph_expanded or self._terrain_view or not self._overlay_settings['horizon_inset']:
+            return ''
+        width, height = self.window.GetSize()
+        left, bottom, right, top = self._horizon_preview_rect
+        nx, ny = x / max(1, width), y / max(1, height)
+        margin_x, margin_y = 7 / max(1, width), 7 / max(1, height)
+        if not (left-margin_x <= nx <= right+margin_x and bottom-margin_y <= ny <= top+margin_y):
+            return ''
+        horizontal = 'l' if abs(nx-left) <= margin_x else ('r' if abs(nx-right) <= margin_x else '')
+        vertical = 'b' if abs(ny-bottom) <= margin_y else ('t' if abs(ny-top) <= margin_y else '')
+        return horizontal + vertical
+
+    def resize_horizon_preview(self, edge, original, press, current):
+        width, height = self.window.GetSize()
+        dx = (current[0] - press[0]) / max(1, width)
+        dy = (current[1] - press[1]) / max(1, height)
+        left, bottom, right, top = original
+        min_width, min_height = min(0.8, 240 / max(1, width)), min(0.8, 150 / max(1, height))
+        if 'l' in edge: left = max(0.0, min(right - min_width, left + dx))
+        if 'r' in edge: right = min(1.0, max(left + min_width, right + dx))
+        if 'b' in edge: bottom = max(0.0, min(top - min_height, bottom + dy))
+        if 't' in edge: top = min(1.0, max(bottom + min_height, top + dy))
+        self._horizon_preview_rect = left, bottom, right, top
+        self.apply_layout()
+        self.update_profile(self.horizon_angles)
+        self.window.Render()
+
     def build_stats_base(self, lat, lon, angles, distances, heading="SELECTED LOCATION"):
         elevation = float(sample_dem_bilinear(lat, lon))
         return (
@@ -1247,7 +1358,8 @@ class MoonWindow(GlobeMixin, HudMixin):
     def sync_compare_points(self):
         """Take over the current point set for a comparison (all points shown, index kept in range)."""
         single = getattr(self, '_analysis_single_point', None)
-        points = [single] if single is not None else self.analysis_points() or [(self.lat, self.lon)]
+        override = self._analysis_points_override
+        points = list(override) if override is not None else ([single] if single is not None else self.analysis_points() or [(self.lat, self.lon)])
         if points != self._compare_points:
             self._compare_points = points
             self._compare_visible = [True] * len(points)
@@ -1259,6 +1371,14 @@ class MoonWindow(GlobeMixin, HudMixin):
 
     def point_index(self, lat, lon):
         return next((i for i, point in enumerate(self._points) if same_point(point, (lat, lon))), None)
+
+    def compare_color(self, index):
+        from compare import POINT_COLORS
+        if 0 <= index < len(self._compare_points):
+            saved = self.point_index(*self._compare_points[index])
+            if saved is not None:
+                index = saved
+        return POINT_COLORS[index % len(POINT_COLORS)]
 
     def set_point_name(self, point, name):
         name = name.strip()
@@ -1295,29 +1415,47 @@ class MoonWindow(GlobeMixin, HudMixin):
         return False
 
     def add_current_point(self):
-        self.add_point(self.lat, self.lon)
+        points = list(self._points)
+        for point in self._selected_locations or [(self.lat, self.lon)]:
+            if not any(same_point(point, other) for other in points):
+                points.append(point)
+        if len(points) > MAX_POINTS:
+            self._points_note = f'A set holds at most {MAX_POINTS} points.'
+            if self._desktop_shell is not None:
+                self._desktop_shell.card.setToolTip(self._points_note)
+            self.window.Render()
+            return
+        self.set_points(points)
+
+    def refresh_selection_marks(self):
+        """Show additional unsaved selections without modifying the saved point set."""
+        if self._selection_actor is not None:
+            self.renderer.RemoveActor(self._selection_actor)
+            self._selection_actor = None
+        extra = [p for p in self._selected_locations if not same_point(p, (self.lat, self.lon))]
+        if not extra:
+            return
+        points = self.vtk.vtkPoints()
+        vertices = self.vtk.vtkCellArray()
+        for lat, lon in extra:
+            position = self.terrain_overlay_points(np.asarray(lat_lon_to_xyz(lat, lon, offset=0.0)))[0]
+            index = points.InsertNextPoint(*position)
+            vertices.InsertNextCell(1); vertices.InsertCellPoint(index)
+        data = self.vtk.vtkPolyData(); data.SetPoints(points); data.SetVerts(vertices)
+        mapper = self.vtk.vtkPolyDataMapper(); mapper.SetInputData(data)
+        self.configure_surface_overlay(mapper)
+        actor = self.vtk.vtkActor(); actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(1.0, 0.5, 0.18); actor.GetProperty().SetPointSize(10)
+        actor.GetProperty().LightingOff(); actor.PickableOff()
+        self.renderer.AddActor(actor); self._selection_actor = actor
 
     def add_point_at(self, x, y):
-        """Shift+click on the Moon: select that location and add it to the comparison set."""
+        """Add a temporary selection without changing the saved point set."""
         if self._graph_expanded or self._terrain_view:
             return
-        if self.picker.Pick(x, y, 0, self.renderer):
-            px, py, pz = self.picker.GetPickPosition()
-            radius = np.sqrt(px * px + py * py + pz * pz)
-            if radius > 0:
-                lat = float(np.degrees(np.arcsin(np.clip(pz / radius, -1, 1))))
-                lon = float(np.degrees(np.arctan2(py, px)))
-                points = list(self._points)
-                for point in (normalize_point(self.lat, self.lon), normalize_point(lat, lon)):
-                    if not any(same_point(point, other) for other in points):
-                        points.append(point)
-                if len(points) > MAX_POINTS:
-                    self._points_note = f'A set holds at most {MAX_POINTS} points.'
-                    self.window.Render()
-                    return
-                self.select_location(lat, lon, render=False)
-                self.set_points(points)
-                self.window.Render()
+        location = self.surface_location_at(x, y)
+        if location is not None:
+            self.select_location(*location, extend_selection=True)
 
     def set_points(self, points, names=None):
         points = list(points)
@@ -1404,7 +1542,7 @@ class MoonWindow(GlobeMixin, HudMixin):
     def update_close_hover(self, x, y):
         width, height = self.window.GetSize()
         hit = None
-        for actor in (self._horizon_close, self._map_legend_button, self.close_button):
+        for actor in (self._horizon_close, self.close_button):
             if not actor.GetVisibility():
                 continue
             position = actor.GetPosition(); size = [0.0, 0.0]
@@ -1424,10 +1562,123 @@ class MoonWindow(GlobeMixin, HudMixin):
             prop.SetBackgroundOpacity(0.95)
         self.window.Render()
 
-    def pick(self, x, y):
+    def surface_location_at(self, x, y):
+        if not self.picker.Pick(x, y, 0, self.renderer):
+            return None
+        px, py, pz = self.picker.GetPickPosition()
+        radius = np.sqrt(px * px + py * py + pz * pz)
+        if radius <= 0:
+            return None
+        return (float(np.degrees(np.arcsin(np.clip(pz / radius, -1, 1)))),
+                float(np.degrees(np.arctan2(py, px))))
+
+    def pick_saved_point(self, x, y, extend=False):
         width, height = self.window.GetSize()
+        camera = np.asarray(self.renderer.GetActiveCamera().GetPosition())
+        closest = None
+        for index, mark in enumerate(self.point_marks):
+            if not mark['point'].GetVisibility():
+                continue
+            position = mark['position']
+            self.renderer.SetWorldPoint(*position, 1.0); self.renderer.WorldToDisplay()
+            px, py, _ = self.renderer.GetDisplayPoint()
+            distance = np.hypot(px - x, py - y)
+            if distance > 15 or (closest is not None and distance >= closest[0]):
+                continue
+            hit = self.surface_hit(camera, position - camera)
+            if hit is not None and np.linalg.norm(hit - position) <= 0.003:
+                closest = (distance, index)
+        if closest is None:
+            return False
+        self.select_location(*self._points[closest[1]], extend_selection=extend)
+        return True
+
+    def select_search_rectangle(self, start, end, commit=False):
+        first = self.surface_location_at(*start)
+        last = self.surface_location_at(*end)
+        if first is None or last is None:
+            return
+        lat0, lat1 = sorted((first[0], last[0]))
+        lon_delta = (last[1] - first[1] + 180.0) % 360.0 - 180.0
+        lon0, lon1 = sorted((first[1], first[1] + lon_delta))
+        if lat1 - lat0 < 1e-5 or lon1 - lon0 < 1e-5:
+            return
+        self.draw_search_area((lat0, lat1, lon0, lon1))
+        if commit and self._desktop_shell is not None:
+            panel = self._desktop_shell.search
+            panel._refinement_sectors = None
+            for field, value in ((panel.lat_min, lat0), (panel.lat_max, lat1),
+                                 (panel.lon_min, lon0), (panel.lon_max, lon1)):
+                field.setText(f'{value:.6f}'.rstrip('0').rstrip('.'))
+            self._desktop_shell.finish_area_tool()
+            self._desktop_shell.show_panel('search')
+            panel.criteria_scroll.ensureWidgetVisible(panel.area_box)
+
+    def draw_search_area(self, bounds):
+        """Draw the selected lat/lon area on the globe using the existing surface mesh."""
+        from vtk.util.numpy_support import numpy_to_vtkIdTypeArray
+        lat0, lat1, lon0, lon1 = map(float, bounds)
+        if not (np.isfinite([lat0, lat1, lon0, lon1]).all() and -90 <= lat0 < lat1 <= 90 and lon0 < lon1):
+            self.hide_search_area()
+            return
+        lon1 = min(lon1, lon0 + 360.0)
+        bounds = (lat0, lat1, lon0, lon1)
+        if bounds == self._area_bounds and self._area_fill_actor is not None:
+            self._area_fill_actor.VisibilityOn()
+            if self._rectangle_actor is not None: self._rectangle_actor.VisibilityOn()
+            self.window.Render()
+            return
+        n = max(48, min(720, int(np.ceil(max(lat1 - lat0, lon1 - lon0) * 2))))
+        lats = np.concatenate((np.full(n, lat0), np.linspace(lat0, lat1, n),
+                               np.full(n, lat1), np.linspace(lat1, lat0, n), [lat0]))
+        lons = np.concatenate((np.linspace(lon0, lon1, n), np.full(n, lon1),
+                               np.linspace(lon1, lon0, n), np.full(n, lon0), [lon0]))
+        latr, lonr = np.radians(lats), np.radians(lons)
+        directions = np.column_stack((np.cos(latr)*np.cos(lonr), np.cos(latr)*np.sin(lonr), np.sin(latr)))
+        coords = self.terrain_overlay_points(directions)
+        if self._rectangle_actor is not None:
+            self.renderer.RemoveActor(self._rectangle_actor)
+        self._rectangle_actor = self.make_graticule_actor((0.16, 0.9, 1.0), 3.0, 1.0, -4.0)
+        self._rectangle_actor.GetMapper().SetInputData(self.polylines_to_polydata([coords]))
+        self._rectangle_actor.VisibilityOn()
+        if self._area_fill_actor is not None:
+            self.renderer.RemoveActor(self._area_fill_actor)
+        rows, cols = 360, 720
+        lat_centers = 90.0 - (np.arange(rows) + 0.5) * 0.5
+        lon_centers = -180.0 + (np.arange(cols) + 0.5) * 0.5
+        rr = np.flatnonzero((lat_centers > lat0 - .25 + 1e-10) & (lat_centers < lat1 + .25 - 1e-10))
+        delta = (lon_centers - (lon0 + lon1) / 2 + 180) % 360 - 180
+        cc = np.flatnonzero(np.abs(delta) < (lon1 - lon0) / 2 + .25 - 1e-10)
+        grid_r, grid_c = np.meshgrid(rr, cc, indexing='ij')
+        base = grid_r.ravel() * (cols + 1) + grid_c.ravel()
+        quads = np.column_stack((base, base + cols + 1, base + cols + 2, base + 1)).astype(np.int64)
+        cells = self.vtk.vtkCellArray()
+        cells.SetData(numpy_to_vtkIdTypeArray(np.arange(0, quads.size + 1, 4, dtype=np.int64), deep=True),
+                      numpy_to_vtkIdTypeArray(quads.ravel(), deep=True))
+        data = self.vtk.vtkPolyData(); data.SetPoints(self.mesh.GetPoints()); data.SetPolys(cells)
+        mapper = self.vtk.vtkPolyDataMapper(); mapper.SetInputData(data)
+        self.configure_surface_overlay(mapper)
+        mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(0.0, -2.0)
+        fill = self.vtk.vtkActor(); fill.SetMapper(mapper); fill.GetProperty().SetColor(0.16, 0.70, 0.85)
+        fill.GetProperty().SetOpacity(0.25); fill.GetProperty().LightingOff(); fill.PickableOff()
+        self.renderer.AddActor(fill); self._area_fill_actor = fill; self._area_bounds = bounds
+        self.window.Render()
+
+    def hide_search_area(self):
+        changed = False
+        for actor in (self._rectangle_actor, self._area_fill_actor):
+            if actor is not None and actor.GetVisibility():
+                actor.VisibilityOff(); changed = True
+        if changed: self.window.Render()
+
+    def pick(self, x, y, select_new=False, extend=False):
+        width, height = self.window.GetSize()
+        close_pos = self._horizon_close.GetPosition()
+        close_size = [0.0, 0.0]
+        self._horizon_close.GetSize(self.renderer, close_size)
         if (not self._graph_expanded and self._horizon_close.GetVisibility()
-                and 0.94 <= x / width <= 1.0 and 0.30 <= y / height <= 0.35):
+                and close_pos[0]*width-6 <= x <= close_pos[0]*width+close_size[0]+6
+                and close_pos[1]*height-6 <= y <= close_pos[1]*height+close_size[1]+6):
             self._overlay_settings['horizon_inset'] = False
             self.window.Render()
             return
@@ -1440,12 +1691,6 @@ class MoonWindow(GlobeMixin, HudMixin):
                 return
         if self._desktop_shell is None and not self._graph_expanded and 0.73 <= x / width <= 0.87 and 0.94 <= y / height <= 1.0:
             self.begin_overlay_settings()
-            return
-        if (not self._graph_expanded and self._map_mode in ('Elevation', 'Slope')
-                and self._overlay_settings['map_legend']
-                and 0.87 <= x / width <= 1.0 and 0.81 <= y / height <= 0.87):
-            self._overlay_settings['map_legend'] = False
-            self.window.Render()
             return
         if self.over_sky_controls(x, y):
             if self._compare_active and self._compare is not None and self._table_pool:
@@ -1476,16 +1721,13 @@ class MoonWindow(GlobeMixin, HudMixin):
                         actions[name]()
                     break
             return
-        if self.pick_search_marker(x, y):
+        if not select_new:
+            if self.pick_saved_point(x, y, extend=extend) or self.pick_search_marker(x, y, extend=extend):
+                return
             return
-        if self.picker.Pick(x, y, 0, self.renderer):
-            self._search_selected = None
-            px, py, pz = self.picker.GetPickPosition()
-            radius = np.sqrt(px * px + py * py + pz * pz)
-            if radius > 0:
-                lat = np.degrees(np.arcsin(np.clip(pz / radius, -1, 1)))
-                lon = np.degrees(np.arctan2(py, px))
-                self.select_location(float(lat), float(lon))
+        location = self.surface_location_at(x, y)
+        if location is not None:
+            self.select_location(*location, extend_selection=extend)
 
     def run(self, qt_app=None):
         if self._desktop_shell is not None:
