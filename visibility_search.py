@@ -1,6 +1,6 @@
 """Coarse, cancellable lunar surface search for terrain-aware visibility.
 
-Run via S in moon.py. Skyfield is used locally. Percentages are estimated by
+Hosted by the Search panel of desktop_ui.py. Skyfield is used locally. Percentages are estimated by
 trapezoidal integration of sampled visibility (partly visible counts; Earth
 occulting the Sun is included). An optional sampled maximum slope filters sites.
 Minimum and maximum Sun / Earth visibility limit the results; for searches longer than 2 days the
@@ -33,7 +33,6 @@ import terrain
 from compare import (LUNAR_DAY_DAYS, MAX_POINTS, format_duration, lunar_day_stats, max_slope_cached, next_sort,
                      normalize_point, same_point, visibility_percent)  # visibility_percent, lunar_day_stats: re-exported
 MAX_GRID_POINTS = 100_000
-MAX_DISPLAY_RESULTS = 500
 LONG_INTERVAL_DAYS = 2.0  # lunar-day statistics are offered above this interval length
 _elevation_stats_lock = threading.Lock()
 _elevation_stats_source = None
@@ -265,23 +264,6 @@ def grid_cells(lat_min, lat_max, lon_min, lon_max, spacing):
     return [(float(lat_min + i * spacing), float(min(lat_min + (i + 1) * spacing, lat_max)),
              float(lon_min + j * spacing), float(min(lon_min + (j + 1) * spacing, lon_max)))
             for i in range(nlat) for j in range(nlon)]
-
-
-def subdivide_cluster(sectors, bounds, spacing):
-    """Refine only member sectors, clipped to the user's chosen bounds."""
-    lat0, lat1, lon0, lon1 = bounds
-    cells = []
-    for a, b, c, d in sectors:
-        clipped = (max(a, lat0), min(b, lat1), max(c, lon0), min(d, lon1))
-        if clipped[0] >= clipped[1] or clipped[2] >= clipped[3]:
-            continue
-        subcells = grid_cells(*clipped, spacing)
-        if len(cells) + len(subcells) > MAX_GRID_POINTS:
-            raise ValueError(f'Too many cells in this cluster; choose at most {MAX_GRID_POINTS:,}.')
-        cells.extend(subcells)
-    if not cells:
-        raise ValueError('The chosen range does not intersect the selected cluster.')
-    return cells
 
 
 def cell_sample_points(cell, side):
@@ -1041,8 +1023,9 @@ COLUMN_SPECS = (
 )
 SPEC = {spec[0]: spec for spec in COLUMN_SPECS}
 PERCENT_COLUMNS = frozenset(('lat', 'lon', 'sun', 'earth', 'lunar_mean', 'lunar_sd',
-                             'sun_center', 'earth_center', 'cells', 'cell'))
-DEFAULT_COLUMNS = ('lat', 'lon', 'sun', 'earth', 'cells', 'cell')
+                             'sun_center', 'earth_center', 'sun_az', 'sun_el', 'earth_az', 'earth_el',
+                             'elevation', 'slope', 'cells', 'cell'))
+DEFAULT_COLUMNS = ('lat', 'lon', 'sun', 'earth', 'sun_az', 'sun_el', 'earth_az', 'earth_el', 'elevation', 'slope', 'cells', 'cell')
 # Columns that need the sky statistics of compare.py (calculated in the background from the shared data).
 STATS_KEYS = frozenset(spec[0] for spec in COLUMN_SPECS
                        if spec[2] in ('Sun per lunar day', 'Centre above the horizon')
@@ -1081,290 +1064,8 @@ def _fill_worker(messages, cancel, generation, rows, epochs, fetch, cache, need_
 
 
 class SearchDialog:
-    """Tk-only UI; all horizon and ephemeris work stays in a worker thread."""
-    workers_setting = 0   # worker processes: 0 = automatic, 1 = this thread only (class default: SearchPanel in
-                          # desktop_ui does not call __init__)
-    def __init__(self, parent, fetch, previous=None, on_close=None, existing_points=None, on_apply=None,
-                 cache=None):
-        import tkinter as tk
-        from tkinter import ttk
-        self.tk, self.ttk, self.fetch = tk, ttk, fetch
-        self.cache = cache  # point_data.PointDataCache shared with the comparison (None: no sharing)
-        self.workers_setting = 0       # worker processes: 0 = automatic, 1 = this thread only
-        self._fill_cancel = threading.Event()
-        self._fill_generation = 0
-        self._fill_running = False
-        self._fill_dirty = False
-        self._fill_refreshed = 0.0
-        self._tick = 0
-        self.on_close = on_close
-        # Called when a button wants the viewer to act (show on globe, add points, analyze, clear).
-        # The window stays open; only Close (or the window's own close button) closes it.
-        self.on_apply = on_apply
-        self.existing_points = existing_points or (lambda: [])
-        self._closed = False
-        self.window = tk.Toplevel(parent)
-        self.window.title('Search lunar visibility')
-        self.window.protocol('WM_DELETE_WINDOW', self.close)
-        width = min(1320, max(640, self.window.winfo_screenwidth() - 40))
-        height = min(860, max(520, self.window.winfo_screenheight() - 80))
-        self.window.geometry(f'{width}x{height}')
-        self.messages = queue.Queue()
-        self.cancel = threading.Event()
-        self.worker = None
-        self.timer = None
-        self.results = []
-        self.selected = None
-        self.selected_points = []
-        self.add_to_compare = False
-        self.show_matches = False
-        self.clear_markers = False
-        self.analyze = False
-        self.marker_results = None
-        self.marker_mode = 'Points'
-        self._display_items = []
-        self.last_parameters = None
-        self._refinement_sectors = None
-        self._sort = None              # (column key, descending) of the results table, or None
-        self._cluster_cache = None
-        self.finished = False
-        self.was_cancelled = False
-        shell = ttk.Frame(self.window, padding=(16, 12))
-        shell.pack(fill='both', expand=True)
-        heading = ttk.Frame(shell)
-        heading.pack(fill='x', pady=(0, 10))
-        ttk.Label(heading, text='Visibility search', font=('TkDefaultFont', 16, 'bold')).pack(side='left')
-        ttk.Label(heading, text='  Set criteria, run a search, then inspect the results.').pack(side='left')
-        self.workspace_tabs = None
-        if width < 1000:
-            panes = ttk.Notebook(shell)
-            settings_pane = ttk.Frame(panes, padding=(0, 8))
-            results_pane = ttk.Frame(panes, padding=(0, 8))
-            panes.add(settings_pane, text='Search settings')
-            panes.add(results_pane, text='Results')
-            self.workspace_tabs = panes
-            self.workspace_settings, self.workspace_results = settings_pane, results_pane
-        else:
-            panes = ttk.Panedwindow(shell, orient='horizontal')
-            settings_pane = ttk.Frame(panes, padding=(0, 0, 12, 0), width=420)
-            results_pane = ttk.Frame(panes, padding=(12, 0, 0, 0), width=720)
-            panes.add(settings_pane, weight=0)
-            panes.add(results_pane, weight=1)
-        panes.pack(fill='both', expand=True)
-        ttk.Label(settings_pane, text='SEARCH SETTINGS', font=('TkDefaultFont', 10, 'bold')).pack(anchor='w', pady=(0, 6))
-        now = sky.utc_now()
-        self.f = {}  # name -> Entry
-        self.use_terrain = tk.BooleanVar(master=self.window, value=True)
-        self.lunar_avg = tk.BooleanVar(master=self.window, value=False)
-        self.lunar_sd = tk.BooleanVar(master=self.window, value=False)
-        sections = ttk.Notebook(settings_pane)
-        sections.pack(fill='both', expand=True)
-        pages, page_tabs = [], []
-        for title in ('Basics', 'Area & slope', 'Advanced'):
-            tab = ttk.Frame(sections)
-            page_tabs.append(tab)
-            sections.add(tab, text=title)
-            canvas = tk.Canvas(tab, height=300, highlightthickness=0, borderwidth=0)
-            scroll = ttk.Scrollbar(tab, orient='vertical', command=canvas.yview)
-            canvas.configure(yscrollcommand=scroll.set)
-            scroll.pack(side='right', fill='y')
-            canvas.pack(side='left', fill='both', expand=True)
-            page = ttk.Frame(canvas, padding=(8, 8))
-            window_id = canvas.create_window((0, 0), window=page, anchor='nw')
-            page.bind('<Configure>', lambda event, c=canvas: c.configure(scrollregion=c.bbox('all')))
-            canvas.bind('<Configure>', lambda event, c=canvas, item=window_id: c.itemconfigure(item, width=event.width))
-            pages.append(page)
-        self.settings_tabs, self.area_page = sections, pages[1]
-        self.area_tab = page_tabs[1]
-        for page in pages:
-            page.columnconfigure(0, weight=1)
-
-        def section(title, row, column):
-            box = ttk.LabelFrame(pages[row], text=title, padding=(8, 6))
-            box.grid(row=column, column=0, sticky='ew', pady=(0, 8))
-            box.columnconfigure(1, weight=1)
-            box.columnconfigure(3, weight=1)
-            return box
-
-        def field(box, name, label, value, row, column=0):
-            ttk.Label(box, text=label).grid(row=row, column=column * 2, sticky='w', padx=(0, 5), pady=2)
-            entry = ttk.Entry(box, width=11 if column else 14)
-            entry.insert(0, value)
-            entry.grid(row=row, column=column * 2 + 1, sticky='ew', padx=(0, 10), pady=2)
-            self.f[name] = entry
-
-        time_box = section('Time', 0, 0)
-        field(time_box, 'start', 'Start (UTC)', now.strftime('%Y-%m-%d %H:%M:%S'), 0)
-        field(time_box, 'end', 'End (UTC)', (now + timedelta(days=LUNAR_DAY_DAYS)).strftime('%Y-%m-%d %H:%M:%S'), 1)
-        field(time_box, 'step', 'Step (hours)', '2', 2)
-        visible_box = section('Visible % of the time', 0, 1)
-        field(visible_box, 'min_earth', 'Min Earth', '50', 0, 0)
-        field(visible_box, 'max_earth', 'Max Earth', '100', 0, 1)
-        field(visible_box, 'min_sun', 'Min Sun', '30', 1, 0)
-        field(visible_box, 'max_sun', 'Max Sun', '100', 1, 1)
-        ttk.Label(visible_box, text='Maximums need the terrain search (not used by optimistic sectors).',
-                  wraplength=420).grid(row=2, column=0, columnspan=4, sticky='w')
-        area_box = section('Area', 1, 0)
-        field(area_box, 'spacing', 'Grid spacing (deg)', '10', 0)
-        field(area_box, 'lat', 'Latitude min, max', '-90, 90', 1)
-        field(area_box, 'lon', 'Longitude start, end', '-180, 180', 2)
-        slope_box = section('Slope', 1, 1)
-        field(slope_box, 'max_slope', 'Max slope (deg; blank = off)', '', 0)
-        field(slope_box, 'slope_radius', 'Slope radius (km; 0-20)', '1', 1)
-        lunar_box = section('Lunar-day statistics', 2, 0)
-        self.lunar_avg_check = ttk.Checkbutton(lunar_box, text='Calculate and show average Sun % per lunar day for each point',
-                                               variable=self.lunar_avg, command=self._update_lunar_state)
-        self.lunar_avg_check.grid(row=0, column=0, columnspan=4, sticky='w')
-        self.lunar_sd_check = ttk.Checkbutton(lunar_box, text='Calculate and show its standard deviation',
-                                              variable=self.lunar_sd, command=self._update_lunar_state)
-        self.lunar_sd_check.grid(row=1, column=0, columnspan=4, sticky='w')
-        field(lunar_box, 'lunar_min_avg', 'Min avg Sun %', '', 2, 0)
-        field(lunar_box, 'lunar_max_avg', 'Max avg Sun %', '', 2, 1)
-        field(lunar_box, 'lunar_min_sd', 'Min SD %', '', 3, 0)
-        field(lunar_box, 'lunar_max_sd', 'Max SD %', '', 3, 1)
-        self.lunar_note = ttk.Label(lunar_box, text='Blank limit = no limit. Limits also apply when the columns are hidden.',
-                                    wraplength=470)
-        self.lunar_note.grid(row=4, column=0, columnspan=4, sticky='w')
-        other_box = section('Screening', 2, 1)
-        ttk.Checkbutton(settings_pane, text='Use terrain horizon  (off: candidate clusters)', variable=self.use_terrain, command=self._update_lunar_state
-                        ).pack(anchor='w', before=sections, pady=(0, 6))
-        field(other_box, 'side', 'Samples per side (2-9)', '3', 0)
-        field(other_box, 'horizon', 'Pessimistic horizon (deg)', '2', 1)
-        ttk.Label(other_box, text='Cell screening').grid(row=2, column=0, sticky='w', pady=2)
-        self.screen_mode = ttk.Combobox(other_box, values=('Pessimistic center', 'All cells'), state='readonly', width=14)
-        self.screen_mode.set('Pessimistic center')
-        self.screen_mode.grid(row=2, column=1, sticky='ew', padx=(0, 10), pady=2)
-        ttk.Label(other_box, text='Optimistic range estimate').grid(row=3, column=0, sticky='w', pady=2)
-        self.range_mode = ttk.Combobox(other_box, values=('On', 'Off'), state='readonly', width=14)
-        self.range_mode.set('On')
-        self.range_mode.grid(row=3, column=1, sticky='ew', pady=2)
-        field(other_box, 'workers', 'Worker processes (0 = auto, 1 = off)', '0', 4)
-        for name in ('start', 'end'):
-            self.f[name].bind('<KeyRelease>', lambda event: self._update_lunar_state())
-            self.f[name].bind('<FocusOut>', lambda event: self._update_lunar_state())
-        self._update_lunar_state()
-        ttk.Label(settings_pane, text='Screening is approximate and can miss suitable cells.',
-                  wraplength=390).pack(anchor='w', pady=(8, 3))
-        controls = ttk.Frame(settings_pane)
-        controls.pack(fill='x', before=sections, pady=(3, 0))
-        self.start_button = ttk.Button(controls, text='Start search', command=self.start)
-        self.start_button.pack(side='left')
-        self.cancel_button = ttk.Button(controls, text='Cancel search', command=self.cancel.set, state='disabled')
-        self.cancel_button.pack(side='left', padx=6)
-        self.progress = ttk.Progressbar(settings_pane, mode='determinate')
-        self.progress.pack(fill='x', before=sections, pady=(8, 3))
-        self.status = ttk.Label(settings_pane, text='Choose criteria and start the search.', wraplength=380)
-        self.status.pack(anchor='w', before=sections)
-        self._details_open = False
-        self.details_toggle = ttk.Button(settings_pane, text='Show calculation details', command=self._toggle_status_details)
-        self.details_toggle.pack(anchor='w', before=sections, pady=(6, 3))
-        self.details_panel = ttk.Frame(settings_pane)
-        self.fill_label = ttk.Label(self.details_panel, text='', wraplength=380)
-        self.fill_label.pack(anchor='w')
-        self.cache_label = ttk.Label(self.details_panel, text='', wraplength=380)
-        self.cache_label.pack(anchor='w')
-        self.range_label = ttk.Label(self.details_panel, text='', wraplength=380)
-        self.range_label.pack(anchor='w')
-        self.horizon_label = ttk.Label(self.details_panel, text='', wraplength=380)
-        self.horizon_label.pack(anchor='w')
-        frame = results_pane
-        ttk.Label(frame, text='RESULTS', font=('TkDefaultFont', 10, 'bold')).pack(anchor='w')
-        ttk.Label(frame, text='Select with Shift or Ctrl. Click a column heading to sort.',
-                  wraplength=600).pack(anchor='w', pady=(2, 6))
-        mode_frame = ttk.Frame(frame)
-        mode_frame.pack(fill='x', pady=(4, 0))
-        ttk.Label(mode_frame, text='Results:').pack(side='left')
-        self.view_mode = ttk.Combobox(mode_frame, values=('Points', 'Clusters'), state='readonly', width=14)
-        self.view_mode.set('Points')
-        self.view_mode.pack(side='left', padx=5)
-        self.view_mode.bind('<<ComboboxSelected>>', lambda event: self.populate_results('Showing'))
-        columns = tuple(spec[0] for spec in COLUMN_SPECS)
-        self._columns = columns
-        self._heading_labels = {spec[0]: spec[1] for spec in COLUMN_SPECS}
-        self.column_vars = {key: tk.BooleanVar(master=self.window, value=key in DEFAULT_COLUMNS) for key in columns}
-        table_frame = ttk.Frame(frame)
-        table_frame.pack(fill='both', expand=True, pady=8)
-        self.table_frame = table_frame
-        self.table = ttk.Treeview(table_frame, columns=columns, show='headings', height=8, selectmode='extended')
-        scrollbar = ttk.Scrollbar(table_frame, orient='vertical', command=self.table.yview)
-        h_scrollbar = ttk.Scrollbar(table_frame, orient='horizontal', command=self.table.xview)
-        self.table.configure(yscrollcommand=scrollbar.set, xscrollcommand=h_scrollbar.set)
-        scrollbar.pack(side='right', fill='y')
-        h_scrollbar.pack(side='bottom', fill='x')
-        for spec in COLUMN_SPECS:
-            self.table.column(spec[0], width=spec[3], minwidth=spec[3], stretch=False, anchor='center')
-        self._refresh_headings()
-        self.table.pack(side='left', fill='both', expand=True)
-        self.table.bind('<Double-1>', self.view_selected)
-        self.table.bind('<Control-a>', self.select_all)
-        self.table.bind('<Control-A>', self.select_all)
-        buttons = ttk.Frame(frame)
-        # Pack actions before the expanding table so small windows do not clip them.
-        buttons.pack(fill='x', before=table_frame, pady=(3, 0))
-        actions = ttk.Frame(buttons)
-        actions.pack(fill='x')
-        more_actions = ttk.Frame(buttons)
-        more_actions.pack(fill='x', pady=(3, 0))
-        self.view_button = ttk.Button(actions, text='View selected', command=self.view_selected, state='disabled')
-        self.view_button.pack(side='left')
-        self.select_all_button = ttk.Button(actions, text='Select all', command=self.select_all, state='disabled')
-        self.select_all_button.pack(side='left', padx=5)
-        self.add_button = ttk.Button(actions, text='Add selected', command=self.add_selected, state='disabled')
-        self.add_button.pack(side='left')
-        self.analyze_button = ttk.Button(actions, text='Compare selected', command=self.analyze_selected, state='disabled')
-        self.analyze_button.pack(side='left', padx=5)
-        self.marks_button = ttk.Button(more_actions, text='Show all on globe', command=self.show_all, state='disabled')
-        self.marks_button.pack(side='left', padx=5)
-        self.sector_button = ttk.Button(more_actions, text='Search selected cluster', command=self.refine_selected_sector, state='disabled')
-        self.sector_button.pack(side='left', padx=5)
-        self.export_button = ttk.Button(more_actions, text='Save CSV', command=self.export, state='disabled')
-        self.export_button.pack(side='left', padx=5)
-        ttk.Button(more_actions, text='Close', command=self.close).pack(side='right')
-        ttk.Button(more_actions, text='Clear markers', command=self.clear).pack(side='right', padx=5)
-        # Column choice: a collapsible set of check boxes, in sections, right above the table heading.
-        columns_bar = ttk.Frame(frame)
-        columns_bar.pack(fill='x', before=table_frame)
-        self.columns_toggle = ttk.Button(columns_bar, text='Choose columns', command=self._toggle_column_panel)
-        self.columns_toggle.pack(side='left')
-        ttk.Label(columns_bar, text='  Optional columns are calculated after the search.').pack(side='left')
-        self.columns_panel = tk.Toplevel(self.window)
-        self.columns_panel.title('Result columns')
-        self.columns_panel.withdraw()
-        self.columns_panel.protocol('WM_DELETE_WINDOW', self._toggle_column_panel)
-        column_content = ttk.Frame(self.columns_panel, padding=14)
-        column_content.pack(fill='both', expand=True)
-        ttk.Label(column_content, text='Result columns', font=('TkDefaultFont', 14, 'bold')).pack(anchor='w')
-        ttk.Label(column_content, text='Choose the information to show in the table.').pack(anchor='w', pady=(2, 8))
-        column_tabs = ttk.Notebook(column_content)
-        column_tabs.pack(fill='both', expand=True)
-        self._columns_panel_open = False
-        groups = []
-        for spec in COLUMN_SPECS:
-            if spec[0] not in PERCENT_COLUMNS:
-                continue
-            if spec[2] not in groups:
-                groups.append(spec[2])
-        for number, group in enumerate(groups):
-            box = ttk.Frame(column_tabs, padding=10)
-            tab_name = {'Visible % of the interval': 'Visibility', 'Sun per lunar day': 'Lunar day',
-                        'Centre above the horizon': 'Above horizon',
-                        'Directions (samples above the horizon)': 'Directions'}.get(group, group)
-            column_tabs.add(box, text=tab_name)
-            members = [spec for spec in COLUMN_SPECS if spec[2] == group and spec[0] in PERCENT_COLUMNS]
-            for index, spec in enumerate(members):
-                ttk.Checkbutton(box, text=spec[1], variable=self.column_vars[spec[0]],
-                                command=self._columns_changed).grid(row=index // 2, column=index % 2, sticky='w', padx=6, pady=3)
-        ttk.Button(column_content, text='Done', command=self._toggle_column_panel).pack(anchor='e', pady=(10, 0))
-        self.window.bind('<Escape>', lambda event: self.close())
-        if previous is not None:
-            self.restore(previous)
-        # The Tk root is withdrawn and is not the VTK window. Making this
-        # dialog transient or grabbing it can leave it hidden behind VTK.
-        self.window.deiconify()
-        self.window.update_idletasks()
-        self.window.lift()
-        self.window.focus_force()
-        self.poll()
+    """Search engine and results logic; the UI is provided by desktop_ui.SearchPanel."""
+    workers_setting = 0   # worker processes: 0 = automatic, 1 = this thread only (SearchPanel does not call __init__)
 
     @staticmethod
     def _pair(text):
@@ -1416,28 +1117,12 @@ class SearchDialog:
         if sector:
             labels['sun'], labels['earth'] = 'Sun optimistic %', 'Earth optimistic %'
         shown = [key for key in self._columns
-                 if self.column_vars[key].get() and not (sector and key in SECTOR_HIDDEN)] or ['lat']
+                 if self.column_vars[key].get() and not (sector and key in SECTOR_HIDDEN)
+                 and (self.view_mode.get() == 'Clusters' or key not in ('cells', 'cell'))] or ['lat']
         self.table.configure(displaycolumns=shown)
         for key in self._columns:
             arrow = (' \u25bc' if self._sort[1] else ' \u25b2') if self._sort and self._sort[0] == key else ''
             self.table.heading(key, text=labels[key] + arrow, command=lambda k=key: self._sort_by(k))
-
-    def _toggle_column_panel(self):
-        self._columns_panel_open = not self._columns_panel_open
-        if self._columns_panel_open:
-            self.columns_panel.deiconify()
-            self.columns_panel.lift()
-        else:
-            self.columns_panel.withdraw()
-        self.columns_toggle.configure(text='Close columns' if self._columns_panel_open else 'Choose columns')
-
-    def _toggle_status_details(self):
-        self._details_open = not self._details_open
-        if self._details_open:
-            self.details_panel.pack(fill='x', before=self.settings_tabs, pady=(4, 0))
-        else:
-            self.details_panel.pack_forget()
-        self.details_toggle.configure(text='Hide calculation details' if self._details_open else 'Show calculation details')
 
     def _columns_changed(self):
         self._refresh_headings()
@@ -1446,7 +1131,9 @@ class SearchDialog:
             self._maybe_fill()
 
     def _visible_keys(self):
-        return [key for key in self._columns if self.column_vars[key].get()]
+        return [key for key in self._columns if self.column_vars[key].get()
+                and not (self.is_sector_results() and key in SECTOR_HIDDEN)
+                and (self.view_mode.get() == 'Clusters' or key not in ('cells', 'cell'))]
 
     def _fill_plan(self):
         """(rows that need work, need statistics, need max slope) for the ticked optional columns."""
@@ -1516,10 +1203,7 @@ class SearchDialog:
             lat_min, lat_max = self._pair(get('lat'))
             lon_min, lon_max = self._pair(get('lon'))
             use_terrain = bool(self.use_terrain.get())
-            if use_terrain and self._refinement_sectors is not None:
-                cells = subdivide_cluster(self._refinement_sectors, (lat_min, lat_max, lon_min, lon_max), spacing)
-            else:
-                cells = grid_cells(lat_min, lat_max, lon_min, lon_max, spacing)
+            cells = grid_cells(lat_min, lat_max, lon_min, lon_max, spacing)
             side_value = float(get('side'))
             if not np.isfinite(side_value) or not side_value.is_integer() or not 2 <= side_value <= 9:
                 raise ValueError('Samples per side must be an integer from 2 to 9.')
@@ -1581,7 +1265,6 @@ class SearchDialog:
         self._stop_fill()
         self.workers_setting = workers
         self.cancel.clear()
-        self._refinement_sectors = None
         self.results = []
         self.selected = None
         self.show_matches = False
@@ -1597,8 +1280,8 @@ class SearchDialog:
         if lunar_sd:
             self.column_vars['lunar_sd'].set(True)
         self._refresh_headings()
-        self.table.delete(*self.table.get_children())
-        for button in (self.view_button, self.select_all_button, self.add_button, self.analyze_button, self.marks_button, self.export_button, self.sector_button):
+        self.table.clear_rows()
+        for button in (self.view_button, self.select_all_button, self.add_button, self.analyze_button, self.marks_button, self.export_button):
             button.configure(state='disabled')
         self.start_button.configure(state='disabled')
         self.cancel_button.configure(state='normal')
@@ -1652,6 +1335,9 @@ class SearchDialog:
                     self.finished = True
                     self.was_cancelled = cancelled
                     self.populate_results('Cancelled' if cancelled else 'Complete')
+                    if self.results:
+                        self.selected = None
+                        self.show_all()
                     self.start_button.configure(state='normal')
                     self.cancel_button.configure(state='disabled')
                     if self.workspace_tabs is not None:
@@ -1745,9 +1431,10 @@ class SearchDialog:
         return present + missing
 
     def populate_results(self, label):
+        self._refresh_headings()
         previous = {id(self._display_items[int(i)][0]) for i in self.table.selection()
                     if int(i) < len(self._display_items)}
-        self.table.delete(*self.table.get_children())
+        self.table.clear_rows()
         clusters = self._clusters()
         cluster_for_row = {id(row): index for index, cluster in enumerate(clusters) for row in cluster}
         clustered = self.view_mode.get() == 'Clusters'
@@ -1758,10 +1445,10 @@ class SearchDialog:
             values, sort_values = self._group_values(members, clustered, sector_cluster)
             entries.append((members, values, sort_values))
         entries = self._sorted(entries)
-        self._display_items = [entry[0] for entry in entries[:MAX_DISPLAY_RESULTS]]
+        self._display_items = [entry[0] for entry in entries]
         number = lambda value, form: '-' if value is None else format(value, form)
         reselect = []
-        for index, (members, values, _) in enumerate(entries[:MAX_DISPLAY_RESULTS]):
+        for index, (members, values, _) in enumerate(entries):
             row = members[0]
             cluster_index = cluster_for_row[id(row)]
             if clustered:
@@ -1785,19 +1472,18 @@ class SearchDialog:
                 reselect.append(str(index))
         if reselect:
             self.table.selection_set(reselect)
-        suffix = (f' Globe shows at most {MAX_DISPLAY_RESULTS} points; CSV contains all points.'
-                  if not sector_cluster and len(self.results) > MAX_DISPLAY_RESULTS else '')
-        if len(groups) > MAX_DISPLAY_RESULTS:
-            suffix += f' Table shows the first {MAX_DISPLAY_RESULTS}' + (' in the chosen order.' if self._sort else '.')
+        suffix = ''
         noun = 'clusters' if clustered else ('candidate sectors' if sector_cluster else 'points')
-        explanation = ' Candidate clusters; optimistic estimates may miss high sites and differ by sector. Select a cluster to search.' if sector_cluster else ''
+        if len(groups) == 1:
+            noun = noun[:-1]
+        explanation = ' Candidate clusters use optimistic estimates and may differ from terrain results.' if sector_cluster else ''
         self.status.configure(text=f"{label}: {len(groups):,} {noun}, {len(self.results):,} matching cells.{suffix}{explanation}")
         if self.results:
             for button in (self.select_all_button, self.marks_button, self.export_button):
                 button.configure(state='normal')
-            for button in (self.view_button, self.add_button, self.analyze_button):
+            self.view_button.configure(state='normal')
+            for button in (self.add_button, self.analyze_button):
                 button.configure(state='disabled' if sector_cluster else 'normal')
-            self.sector_button.configure(state='normal' if sector_cluster else 'disabled')
 
     def is_sector_results(self):
         return bool(self.last_parameters and len(self.last_parameters) > 16 and not self.last_parameters[16])
@@ -1843,7 +1529,7 @@ class SearchDialog:
 
     def view_selected(self, event=None):
         if self.is_sector_results():
-            self.refine_selected_sector()
+            self.show_selected()
             return
         selected = self.table.selection()
         if selected:
@@ -1855,11 +1541,28 @@ class SearchDialog:
             self.apply_to_viewer('Shown on the globe.')
 
     def select_all(self, event=None):
-        rows = self.table.get_children()
-        self.table.selection_set(rows)
-        self.status.configure(text=(f'Selected {len(rows):,} clusters; select one to search.' if self.is_sector_results()
-                                    else f'Selected {len(rows):,} displayed rows. Comparisons hold at most {MAX_POINTS} points.'))
+        # One Qt selection range avoids a signal and repaint for every row.
+        total = len(self._display_items)
+        limit = 20000
+        count = min(total, limit)
+        self.table.select_first(count)
+        if count < total:
+            self.status.configure(text=f'Selected first {count:,} of {total:,} rows; use the table to choose other rows. Analysis supports {MAX_POINTS} points.')
+        else:
+            self.status.configure(text=f'Selected all {count:,} rows. Analysis supports {MAX_POINTS} points.')
         return 'break'
+
+    def show_selected(self):
+        selected = self.table.selection()
+        if not selected:
+            self.status.configure(text='Select one or more rows first.')
+            return
+        members = [row for item in selected for row in self._display_items[int(item)]]
+        self.selected = None
+        self.marker_mode = 'Clusters' if self.is_sector_results() else self.view_mode.get()
+        self.marker_results = self._marker_rows(members)
+        self.show_matches = True
+        self.apply_to_viewer(f'Showing {len(selected):,} selected rows on the globe.')
 
     def add_selected(self, analyze=False):
         if self.is_sector_results():
@@ -1892,49 +1595,48 @@ class SearchDialog:
                              else f'Added {len(rows):,} point(s) to the comparison set.')
 
     def analyze_selected(self):
-        self.add_selected(analyze=True)
-
-    def refine_selected_sector(self):
-        if not self.is_sector_results():
-            self.status.configure(text='Run an optimistic sector search first.')
-            return
-        if self.worker is not None and self.worker.is_alive():
-            self.status.configure(text='Wait for the search to finish or cancel it first.')
+        if self.is_sector_results():
+            self.status.configure(text='Candidate clusters are not verified points. Search a selected cluster first.')
             return
         selected = self.table.selection()
-        if len(selected) != 1:
-            self.status.configure(text='Select exactly one cluster.')
+        rows = []
+        for item in selected:
+            for row in self._display_items[int(item)]:
+                point = normalize_point(row['lat'], row['lon'])
+                if not any(same_point(point, normalize_point(r['lat'], r['lon'])) for r in rows):
+                    rows.append(row)
+                    if len(rows) > MAX_POINTS:
+                        self.status.configure(text=f'At most {MAX_POINTS} points can be analyzed at once. Select fewer points or a smaller cluster.')
+                        return
+        if not rows:
+            self.status.configure(text='Select one or more rows first.')
             return
-        members = self._display_items[int(selected[0])]
-        self._refinement_sectors = [(row['cell_lat_min'], row['cell_lat_max'], row['cell_lon_min'], row['cell_lon_max'])
-                                    for row in members]
-        lat0 = min(cell[0] for cell in self._refinement_sectors)
-        lat1 = max(cell[1] for cell in self._refinement_sectors)
-        lon0 = min(cell[2] for cell in self._refinement_sectors)
-        lon1 = max(cell[3] for cell in self._refinement_sectors)
-        spacing = max(0.1, min(min(cell[1] - cell[0], cell[3] - cell[2]) for cell in self._refinement_sectors) / 5.0)
-        for name, value in (('spacing', f'{spacing:.6g}'), ('lat', f'{lat0:g}, {lat1:g}'), ('lon', f'{lon0:g}, {lon1:g}')):
-            self._set(name, value)
-        self.use_terrain.set(True)
-        if self.workspace_tabs is not None:
-            self.workspace_tabs.select(self.workspace_settings)
-        self.settings_tabs.select(self.area_tab)
-        self.status.configure(text=f'{len(members):,} cluster sectors selected. Adjust parameters, then start the terrain search; only these sectors will be checked.')
+        if len(rows) > MAX_POINTS:
+            self.status.configure(text=f'At most {MAX_POINTS} points can be analyzed at once.')
+            return
+        self.selected_points = rows
+        self.selected = rows[0]
+        self.add_to_compare = False
+        self.analyze = True
+        self.marker_mode = self.view_mode.get()
+        self.marker_results = self._marker_rows()
+        self.show_matches = True
+        self.apply_to_viewer(f'Analyzing {len(rows):,} selected point(s).')
 
     def select_sector_on_globe(self, row):
-        """Select a displayed sector, then prepare the terrain search form."""
-        if not self.is_sector_results():
-            self.status.configure(text='The previous sector results are no longer available.')
-            return
+        """Select the cluster represented by a picked globe cell."""
+        sector = self.is_sector_results()
         self.view_mode.set('Clusters')
-        self.populate_results('Candidate clusters')
+        self.populate_results('Candidate clusters' if sector else 'Matching clusters')
         keys = ('cell_lat_min', 'cell_lat_max', 'cell_lon_min', 'cell_lon_max')
         for index, members in enumerate(self._display_items):
-            if any(all(member.get(key) == row.get(key) for key in keys) for member in members):
+            if any(all(member.get(key) == row.get(key) for key in keys)
+                   and (sector or (member.get('lat'), member.get('lon')) == (row.get('lat'), row.get('lon')))
+                   for member in members):
                 item = str(index)
                 self.table.selection_set(item)
                 self.table.see(item)
-                self.refine_selected_sector()
+                self.status.configure(text='Cluster selected. Use the result controls to inspect it on the globe.')
                 return
         self.status.configure(text='Cluster is outside the displayed rows; use the table or narrow the search.')
 
@@ -1958,18 +1660,6 @@ class SearchDialog:
             self.show_matches = self.clear_markers = self.add_to_compare = self.analyze = False
         if message and not (self.worker is not None and self.worker.is_alive()):
             self.status.configure(text=message)
-        try:
-            self.window.lift()  # the viewer window may have been raised by its redraw
-        except self.tk.TclError:
-            pass
-
-    def export(self):
-        from tkinter import filedialog
-        path = filedialog.asksaveasfilename(parent=self.window, defaultextension='.csv',
-                                            filetypes=[('CSV files', '*.csv')])
-        if not path:
-            return
-        self.export_to(path)
 
     def export_to(self, path):
         """Write results to a path selected by the active desktop interface."""
@@ -2033,18 +1723,3 @@ class SearchDialog:
             self.status.configure(text=f'Saved {len(self.results):,} results to {path}')
         except OSError as error:
             self.status.configure(text=f'Could not save results: {error}')
-
-    def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        self.cancel.set()
-        self._fill_cancel.set()
-        if self.timer is not None:
-            try:
-                self.window.after_cancel(self.timer)
-            except self.tk.TclError:
-                pass
-        self.window.destroy()
-        if self.on_close is not None:
-            self.on_close(self)

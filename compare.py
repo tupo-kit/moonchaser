@@ -50,15 +50,28 @@ def same_point(a, b, tolerance=1e-6):
     return abs(a[0] - b[0]) <= tolerance and dlon <= tolerance
 
 
-def save_points(path, points):
-    """Write only the coordinates: {"points": [[lat, lon], ...]}, one point per line."""
-    rows = ",\n".join(f"  [{float(lat)!r}, {float(lon)!r}]" for lat, lon in points)
+def save_points(path, points, names=None):
+    """Write {"points": [...]}, one point per line: [lat, lon], or {"lat", "lon", "name"} for a named point."""
+    names = names or {}
+    rows = []
+    for point in points:
+        lat, lon = point
+        name = names.get(point)
+        if name:
+            rows.append(f"  {json.dumps({'lat': float(lat), 'lon': float(lon), 'name': name}, ensure_ascii=False)}")
+        else:
+            rows.append(f"  [{float(lat)!r}, {float(lon)!r}]")
     with open(path, "w", encoding="utf-8") as file:
-        file.write('{\n "points": [\n' + rows + '\n ]\n}\n')
+        file.write('{\n "points": [\n' + ",\n".join(rows) + '\n ]\n}\n')
 
 
 def load_points(path):
     """Read a point set. Accepts the JSON written by save_points, or text with one 'lat, lon' per line."""
+    return load_named_points(path)[0]
+
+
+def load_named_points(path):
+    """Like load_points, but returns (points, names) where names maps a point to its optional name."""
     try:
         with open(path, encoding="utf-8-sig") as file:
             text = file.read()
@@ -75,25 +88,30 @@ def load_points(path):
             parts = line.replace(",", " ").replace(";", " ").split()
             if len(parts) != 2:
                 raise ValueError(f"Line {number}: expected 'latitude, longitude'.")
-            raw.append(parts)
+            raw.append((parts, None))
     else:
         items = data.get("points") if isinstance(data, dict) else data
         if not isinstance(items, list):
             raise ValueError('Expected {"points": [[lat, lon], ...]}.')
         for item in items:
+            name = None
             if isinstance(item, dict):
+                name = item.get("name")
                 item = (item.get("lat"), item.get("lon"))
             if not isinstance(item, (list, tuple)) or len(item) != 2:
                 raise ValueError("Each point must be [latitude, longitude].")
-            raw.append(item)
+            raw.append((item, name.strip() if isinstance(name, str) else None))
     points = []
-    for item in raw:
+    names = {}
+    for item, name in raw:
         point = normalize_point(*item)
         if not any(same_point(point, other) for other in points):
             points.append(point)
+            if name:
+                names[point] = name
     if len(points) > MAX_POINTS:
         raise ValueError(f"A set holds at most {MAX_POINTS} points; the file has {len(points)}.")
-    return points
+    return points, names
 
 
 # --------------------------------------------------------------------------- visibility maths
